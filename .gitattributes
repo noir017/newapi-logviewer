@@ -1,0 +1,6 @@
+# Go tooling, shell scripts and Docker builds all assume LF. Without this, a
+# checkout on Windows (core.autocrlf=true) rewrites every file to CRLF and
+# `gofmt -l` then flags the entire tree.
+* text=auto eol=lf
+
+*.png binary
