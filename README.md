@@ -15,7 +15,21 @@ call.
 - **Read-only.** The log directory is mounted `:ro`; the viewer cannot alter the audit trail.
 - **No database, no state, no writes.** It only reads files New API already produces.
 
-![master-detail layout](docs/screenshot.md)
+![master-detail layout](docs/screenshot.png)
+
+*Running against the synthetic `testdata/sample.log`.*
+
+---
+
+## Try it first
+
+No New API instance needed — this serves the bundled sample log:
+
+```bash
+docker compose -f docker-compose.demo.yml up
+```
+
+Then open <http://localhost:7071/logviewer/>.
 
 ---
 

@@ -1,0 +1,22 @@
+# Try it with no New API instance:
+#
+#   docker compose -f docker-compose.demo.yml up
+#   open http://localhost:7071/logviewer/
+#
+# Serves the synthetic fixture in testdata/, so you can see the UI populated
+# before wiring up your own logs.
+
+services:
+  logviewer:
+    build: .
+    image: newapi-logviewer:latest
+    container_name: newapi-logviewer-demo
+    ports:
+      - "7071:7070"
+    volumes:
+      - ./testdata:/logs:ro
+    environment:
+      - TZ=UTC
+      - LOG_DIR=/logs
+      - BASE_PATH=/logviewer
+      - AUTH_MODE=none
