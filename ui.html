@@ -1,0 +1,440 @@
+<!doctype html>
+<html lang="zh"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>New API 调用日志</title>
+<style>
+*{box-sizing:border-box}
+:root{
+  --bg:#0f1115; --panel:#171a21; --panel2:#1c2029; --line:#262b36;
+  --fg:#e6e8eb; --dim:#9aa4b2; --dim2:#5c6675;
+  --acc:#5b9dff; --ok:#3fb950; --err:#f85149; --warn:#d29922;
+  --sys:#a371f7; --usr:#3fb950; --asst:#5b9dff; --tool:#d29922;
+  --hdr:96px;
+}
+html,body{height:100%}
+body{margin:0;font:14px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",sans-serif;
+  background:var(--bg);color:var(--fg);overflow:hidden}
+code,pre,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+a{color:var(--acc);text-decoration:none}
+::-webkit-scrollbar{width:9px;height:9px}
+::-webkit-scrollbar-thumb{background:#2b313d;border-radius:5px}
+::-webkit-scrollbar-thumb:hover{background:#39414f}
+::-webkit-scrollbar-track{background:transparent}
+
+header{height:var(--hdr);background:var(--panel);border-bottom:1px solid var(--line);
+  padding:10px 16px;display:flex;flex-direction:column;gap:8px;justify-content:center}
+.hrow{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+h1{font-size:14px;margin:0;font-weight:600;letter-spacing:.2px;white-space:nowrap}
+.who{color:var(--dim2);font-size:12px;white-space:nowrap}
+.grow{flex:1}
+.filters{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+input,select,button{background:var(--panel2);color:var(--fg);border:1px solid var(--line);
+  border-radius:6px;padding:5px 9px;font-size:12.5px;font-family:inherit}
+input:focus,select:focus{outline:none;border-color:var(--acc)}
+input[type=search]{min-width:200px}
+input[type=datetime-local]{color-scheme:dark;font-size:12px;padding:4px 7px}
+button{cursor:pointer}button:hover{border-color:var(--acc);color:var(--acc)}
+button.on{border-color:var(--acc);color:var(--acc);background:#15203a}
+label.ck{display:flex;align-items:center;gap:4px;color:var(--dim);font-size:12.5px;cursor:pointer;user-select:none}
+label.ck input{width:13px;height:13px;accent-color:var(--acc)}
+.seg{display:flex;border:1px solid var(--line);border-radius:6px;overflow:hidden}
+.seg button{border:none;border-radius:0;border-right:1px solid var(--line);padding:5px 9px}
+.seg button:last-child{border-right:none}
+.sep{width:1px;height:18px;background:var(--line);margin:0 2px}
+
+/* ---- split layout ---- */
+.split{display:flex;height:calc(100vh - var(--hdr));overflow:hidden}
+.left{width:400px;min-width:260px;max-width:70vw;border-right:1px solid var(--line);
+  display:flex;flex-direction:column;background:var(--bg)}
+.drag{width:5px;cursor:col-resize;background:transparent;flex:none;position:relative}
+.drag:hover::after,.drag.act::after{content:"";position:absolute;inset:0 2px;background:var(--acc)}
+.right{flex:1;overflow-y:auto;padding:16px 20px 40px;min-width:0}
+
+.lmeta{padding:7px 12px;color:var(--dim2);font-size:11.5px;border-bottom:1px solid var(--line);
+  display:flex;align-items:center;gap:8px;flex:none}
+.list{flex:1;overflow-y:auto}
+.pager{flex:none;display:flex;gap:6px;align-items:center;justify-content:center;
+  padding:8px;border-top:1px solid var(--line);color:var(--dim);font-size:12px}
+.pager button{padding:4px 10px;font-size:12px}
+.pager button:disabled{opacity:.35;cursor:default;border-color:var(--line);color:var(--dim2)}
+
+.item{padding:9px 12px;border-bottom:1px solid #1e222b;cursor:pointer}
+.item:hover{background:var(--panel)}
+.item.sel{background:#15203a;border-left:3px solid var(--acc);padding-left:9px}
+.i1{display:flex;align-items:center;gap:7px;margin-bottom:3px}
+.i1 .t{color:var(--dim);font-size:11.5px;flex:none}
+.i1 .m{font-weight:600;font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0}
+.i2{color:var(--dim);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-bottom:4px}
+.i3{display:flex;gap:4px;flex-wrap:wrap;align-items:center}
+.tag{font-size:10.5px;padding:1px 6px;border-radius:20px;border:1px solid var(--line);
+  color:var(--dim2);white-space:nowrap}
+.tag.ok{color:var(--ok);border-color:#1c3a24}
+.tag.err{color:var(--err);border-color:#4a1f1f}
+.tag.st{color:var(--acc);border-color:#1e3559}
+.tag.tl{color:var(--tool);border-color:#4a3a12;cursor:pointer}
+.tag.tl:hover{background:#2a2110}
+.tag.cl{color:var(--tool);border-color:#4a3a12;background:#241d0e;cursor:pointer}
+
+/* ---- detail ---- */
+.ph{color:var(--dim2);text-align:center;padding:80px 20px;font-size:13px}
+.dh{display:flex;align-items:center;gap:10px;margin-bottom:12px;flex-wrap:wrap}
+.dh h2{font-size:15px;margin:0;font-weight:600}
+.rid{color:var(--dim2);font-size:11.5px}
+.kv{display:grid;grid-template-columns:repeat(auto-fit,minmax(148px,1fr));gap:8px 14px;
+  background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin-bottom:14px}
+.kv div{font-size:12px;min-width:0}
+.kv b{display:block;color:var(--dim2);font-weight:500;font-size:10.5px;margin-bottom:1px}
+.kv span{word-break:break-all}
+
+section{margin-bottom:14px}
+.st{display:flex;align-items:center;gap:8px;margin-bottom:6px}
+.st h3{font-size:11.5px;margin:0;color:var(--dim);font-weight:600;text-transform:uppercase;letter-spacing:.6px}
+.st .n{color:var(--dim2);font-size:11px}
+
+.msg{border:1px solid var(--line);border-left-width:3px;border-radius:0 7px 7px 0;
+  padding:8px 11px;margin-bottom:6px;background:#12151b}
+.msg.system{border-left-color:var(--sys)}
+.msg.user{border-left-color:var(--usr)}
+.msg.assistant{border-left-color:var(--asst)}
+.msg.tool{border-left-color:var(--tool)}
+.role{font-size:10px;text-transform:uppercase;letter-spacing:.7px;color:var(--dim2);margin-bottom:3px;font-weight:600}
+.msg .txt{white-space:pre-wrap;word-break:break-word;font-size:13px}
+
+pre.j{background:#0d1017;border:1px solid var(--line);border-radius:7px;padding:10px 12px;
+  overflow-x:auto;font-size:12px;margin:0;max-height:400px;overflow-y:auto}
+.tk{color:#7ee787}.tv{color:#a5d6ff}.tn{color:#79c0ff}.tb{color:#ffa657}.tnull{color:var(--dim2)}
+
+.tool-def{background:#12151b;border:1px solid var(--line);border-radius:7px;padding:9px 11px;margin-bottom:6px}
+.tool-def.used{border-color:#4a3a12;background:#171308}
+.tool-def .nm{color:var(--tool);font-weight:600;font-size:13px;display:flex;align-items:center;gap:6px}
+.tool-def .ds{color:var(--dim);font-size:12px;margin:2px 0 5px}
+.params{font-size:12px;color:var(--dim)}
+.params .p{padding:1px 0}
+.params .pn{color:var(--fg)}
+.params .pt{color:var(--acc);font-size:11px}
+.params .rq{color:var(--err);font-size:10px}
+.used-badge{font-size:10px;background:#3a2d0c;color:#e3b341;padding:1px 6px;border-radius:20px;font-weight:500}
+
+.tc{background:#1a1710;border:1px solid #4a3a12;border-radius:7px;padding:9px 11px;margin-bottom:6px}
+.tc .nm{color:var(--tool);font-weight:600;font-size:13px}
+.reason{background:#141019;border:1px solid #2e2440;border-radius:7px;padding:9px 11px;
+  color:#c9b8e8;font-size:12.5px;white-space:pre-wrap;max-height:240px;overflow-y:auto}
+.usage{display:flex;flex-wrap:wrap;border:1px solid var(--line);border-radius:8px;overflow:hidden}
+.usage div{padding:8px 14px;border-right:1px solid var(--line);background:var(--panel2);min-width:84px}
+.usage div:last-child{border-right:none}
+.usage b{display:block;font-size:10px;color:var(--dim2);font-weight:500;text-transform:uppercase;letter-spacing:.4px}
+.usage span{font-size:15px;font-weight:600}
+.usage .hl span{color:var(--warn)}
+.empty{text-align:center;color:var(--dim2);padding:40px 20px;font-size:12.5px}
+.warnbox{background:#2a1f10;border:1px solid #4a3a12;color:#e3b341;padding:8px 11px;
+  border-radius:7px;font-size:12px;margin-bottom:12px}
+.spin{color:var(--dim2);text-align:center;padding:30px;font-size:12.5px}
+@media(max-width:860px){
+  .split{flex-direction:column;height:auto;overflow:visible}
+  body{overflow:auto}
+  .left{width:auto!important;max-width:none;border-right:none;border-bottom:1px solid var(--line);height:46vh}
+  .drag{display:none}
+}
+</style></head><body>
+
+<header>
+  <div class="hrow">
+    <h1>New API 调用日志</h1>
+    <span class="who" id="who"></span>
+    <span class="who" id="authnote" style="color:#d29922"></span>
+    <span class="grow"></span>
+    <label class="ck"><input type="checkbox" id="auto"> 自动刷新</label>
+    <button id="refresh">刷新</button>
+  </div>
+  <div class="filters">
+    <div class="seg" id="quick">
+      <button data-h="0.25">15分钟</button><button data-h="1">1小时</button>
+      <button data-h="6">6小时</button><button data-h="24">24小时</button>
+      <button data-h="168">7天</button><button data-h="" class="on">全部</button>
+    </div>
+    <input type="datetime-local" id="from" title="起始时间">
+    <span style="color:var(--dim2);font-size:12px">→</span>
+    <input type="datetime-local" id="to" title="结束时间">
+    <span class="sep"></span>
+    <input type="search" id="q" placeholder="搜索提示词 / 返回 / request_id">
+    <select id="model"><option value="">全部模型</option></select>
+    <select id="toolsel"><option value="">全部工具</option></select>
+    <select id="status"><option value="">全部状态</option><option value="ok">仅 200</option><option value="err">仅错误</option></select>
+    <select id="stream"><option value="">流式+非流式</option><option value="1">仅流式</option><option value="0">仅非流式</option></select>
+    <label class="ck"><input type="checkbox" id="tools"> 含 tools</label>
+    <label class="ck"><input type="checkbox" id="errors"> 有报错</label>
+    <select id="size"><option value="30">30/页</option><option value="60">60/页</option><option value="100">100/页</option></select>
+    <button id="reset">重置</button>
+  </div>
+</header>
+
+<div class="split">
+  <div class="left" id="left">
+    <div class="lmeta" id="meta"></div>
+    <div class="list" id="list"><div class="spin">加载中…</div></div>
+    <div class="pager">
+      <button id="prev">←</button><span id="pinfo"></span><button id="next">→</button>
+    </div>
+  </div>
+  <div class="drag" id="drag"></div>
+  <div class="right" id="detail"><div class="ph">← 从左侧选择一次调用查看详情</div></div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c =>
+  ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+let page = 1, state = {}, selected = null, timer = null;
+
+function hl(obj){
+  const j = JSON.stringify(obj, null, 2);
+  return esc(j)
+    .replace(/&quot;([^&]+?)&quot;(\s*:)/g, '<span class="tk">&quot;$1&quot;</span>$2')
+    .replace(/:\s*&quot;([^]*?)&quot;/g, ': <span class="tv">&quot;$1&quot;</span>')
+    .replace(/:\s*(-?\d+\.?\d*)/g, ': <span class="tn">$1</span>')
+    .replace(/:\s*(true|false)/g, ': <span class="tb">$1</span>')
+    .replace(/:\s*(null)/g, ': <span class="tnull">$1</span>');
+}
+const fmtQ = q => q == null ? '—' : '$' + (q / 500000).toFixed(6);
+function contentText(c){
+  if (typeof c === 'string') return c;
+  if (Array.isArray(c)) return c.map(p =>
+    p?.type === 'text' ? p.text :
+    p?.type === 'image_url' ? '[image] ' + (p.image_url?.url || '').slice(0, 90) :
+    JSON.stringify(p)).join('\n');
+  return JSON.stringify(c ?? '');
+}
+function safeArgs(a){ try { return JSON.parse(a); } catch { return a; } }
+const toEpoch = v => v ? Math.floor(new Date(v).getTime() / 1000) : '';
+function localISO(d){
+  const p = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+function msgHtml(m){
+  const role = esc(m.role || '?');
+  let extra = '';
+  if (m.tool_calls) extra = m.tool_calls.map(tc => `
+    <div class="tc"><div class="nm">⚒ ${esc(tc.function?.name)}</div>
+    <pre class="j">${hl(safeArgs(tc.function?.arguments))}</pre></div>`).join('');
+  const txt = contentText(m.content);
+  return `<div class="msg ${role}"><div class="role">${role}</div>
+    ${txt ? `<div class="txt">${esc(txt)}</div>` : ''}${extra}</div>`;
+}
+
+function toolsHtml(tools, called){
+  return tools.map(t => {
+    const f = t.function || t, p = f.parameters || {},
+          props = p.properties || {}, req = p.required || [];
+    const used = (called || []).includes(f.name);
+    const rows = Object.entries(props).map(([k, v]) =>
+      `<div class="p"><span class="pn">${esc(k)}</span>
+       <span class="pt">${esc(v.type || '')}</span>
+       ${req.includes(k) ? '<span class="rq">必填</span>' : ''}
+       ${v.description ? ' — ' + esc(v.description) : ''}</div>`).join('');
+    return `<div class="tool-def ${used ? 'used' : ''}">
+      <div class="nm">⚒ ${esc(f.name)}${used ? '<span class="used-badge">本次调用</span>' : ''}</div>
+      ${f.description ? `<div class="ds">${esc(f.description)}</div>` : ''}
+      <div class="params">${rows || '<i>无参数</i>'}</div></div>`;
+  }).join('');
+}
+
+function usageHtml(u){
+  if (!u) return '';
+  const r = u.completion_tokens_details?.reasoning_tokens;
+  const cell = (l, v, cls='') => v == null ? '' :
+    `<div class="${cls}"><b>${l}</b><span>${v}</span></div>`;
+  return `<div class="usage">
+    ${cell('输入', u.prompt_tokens)}${cell('输出', u.completion_tokens)}
+    ${cell('推理', r, 'hl')}${cell('合计', u.total_tokens)}
+    ${cell('缓存', u.prompt_tokens_details?.cached_tokens)}</div>`;
+}
+
+function detail(r){
+  const req = r.request || {}, resp = r.response || {};
+  const msg = resp.choices?.[0]?.message;
+  const content = r.is_stream ? r.stream_content : (msg?.content || '');
+  const reasoning = r.is_stream ? r.stream_reasoning : (msg?.reasoning_content || '');
+  const tcs = (r.is_stream ? r.stream_tool_calls : msg?.tool_calls) || [];
+  const sec = (title, n, inner) => inner ?
+    `<section><div class="st"><h3>${title}</h3>${n ? `<span class="n">${n}</span>` : ''}</div>${inner}</section>` : '';
+  const slim = {...req}; delete slim.messages; delete slim.tools;
+
+  return `
+  <div class="dh">
+    <h2>${esc(r.model || '—')}</h2>
+    <span class="tag ${r.status === 200 ? 'ok' : 'err'}">${r.status ?? '?'}</span>
+    ${r.is_stream ? '<span class="tag st">流式</span>' : ''}
+    <span class="rid mono">${esc(r.request_id)}</span>
+  </div>
+  ${r.incomplete ? '<div class="warnbox">⚠ 该请求的请求体不在当前日志文件中（可能已轮转），仅显示可得字段。</div>' : ''}
+  <div class="kv">
+    <div><b>时间</b><span>${esc(r.ts || '')}</span></div>
+    <div><b>耗时</b><span>${esc(r.latency || '—')}</span></div>
+    <div><b>首字延迟</b><span>${r.frt > 0 ? r.frt + ' ms' : '—'}</span></div>
+    <div><b>渠道 / 令牌</b><span>${r.channel_id ?? '—'} · ${esc(r.token_name || '—')}</span></div>
+    <div><b>计费</b><span>${fmtQ(r.quota)}</span></div>
+    <div><b>倍率</b><span>${r.model_ratio ?? '—'} × ${r.completion_ratio ?? '—'}</span></div>
+    <div><b>客户端 IP</b><span>${esc(r.ip || '—')}</span></div>
+    <div><b>流式结束</b><span>${esc(r.stream_end || '—')}</span></div>
+    <div style="grid-column:1/-1"><b>上游地址</b><span>${esc(r.upstream_url || '—')}</span></div>
+  </div>
+  ${sec('用量', '', usageHtml(r.usage))}
+  ${sec('提示词', (req.messages || []).length + ' 条', (req.messages || []).map(msgHtml).join(''))}
+  ${sec('Tools 定义', (req.tools || []).length + ' 个'
+      + (r.called_tools?.length ? ` · 调用 ${r.called_tools.length}` : ''),
+      req.tools ? toolsHtml(req.tools, r.called_tools) : '')}
+  ${sec('模型返回', '', content
+      ? `<div class="msg assistant"><div class="role">assistant</div><div class="txt">${esc(content)}</div></div>`
+      : (tcs.length ? '' : '<div class="msg assistant"><div class="role">assistant</div><div class="txt" style="color:var(--dim2)">（无文本内容）</div></div>'))}
+  ${sec('工具调用', tcs.length + ' 次', tcs.map(tc =>
+      `<div class="tc"><div class="nm">⚒ ${esc(tc.function?.name)}</div>
+       <pre class="j">${hl(safeArgs(tc.function?.arguments))}</pre></div>`).join(''))}
+  ${sec('推理过程', reasoning ? reasoning.length + ' 字符' : '',
+      reasoning ? `<div class="reason">${esc(reasoning)}</div>` : '')}
+  ${sec('请求参数', '', `<pre class="j">${hl(slim)}</pre>`)}
+  ${sec('原始响应 JSON', '', r.response ? `<pre class="j">${hl(r.response)}</pre>` : '')}
+  ${sec('报错', r.errors?.length || '', r.errors?.length ? `<pre class="j">${hl(r.errors)}</pre>` : '')}
+  `;
+}
+
+function item(r){
+  const tools = (r.tool_names || []).map(t => {
+    const used = (r.called_tools || []).includes(t);
+    return `<span class="tag ${used ? 'cl' : 'tl'}" data-tool="${esc(t)}"
+      title="${used ? '本次被调用' : '已定义'} · 点击筛选">⚒${esc(t)}</span>`;
+  }).join('');
+  return `<div class="item ${selected === r.request_id ? 'sel' : ''}" data-id="${esc(r.request_id)}">
+    <div class="i1">
+      <span class="t">${esc((r.ts || '').slice(5, 16))}</span>
+      <span class="m">${esc(r.model || '—')}</span>
+      <span class="tag ${r.status === 200 ? 'ok' : 'err'}">${r.status ?? '?'}</span>
+    </div>
+    <div class="i2">${esc(r.preview || '（无提示词）')}</div>
+    <div class="i3">
+      ${r.is_stream ? '<span class="tag st">流</span>' : ''}
+      ${r.errors?.length ? '<span class="tag err">报错</span>' : ''}
+      <span class="tag">${fmtQ(r.quota)}</span>
+      ${r.latency ? `<span class="tag">${esc(r.latency)}</span>` : ''}
+      ${tools}
+    </div>
+  </div>`;
+}
+
+function params(){
+  return new URLSearchParams({
+    page, page_size: $('#size').value,
+    search: $('#q').value, model: $('#model').value,
+    tool_name: $('#toolsel').value,
+    status: $('#status').value, stream: $('#stream').value,
+    tools: $('#tools').checked ? '1' : '', errors: $('#errors').checked ? '1' : '',
+    since: toEpoch($('#from').value), until: toEpoch($('#to').value),
+  });
+}
+
+function fillSel(sel, values, label){
+  const cur = sel.value;
+  const sig = JSON.stringify(values || []);
+  if (sel.dataset.sig === sig) return;
+  sel.dataset.sig = sig;
+  sel.innerHTML = `<option value="">${label}</option>`;
+  (values || []).forEach(v => sel.add(new Option(v, v)));
+  if ((values || []).includes(cur)) sel.value = cur;
+}
+
+async function load(keepSel){
+  let d;
+  try {
+    const res = await fetch('api/calls?' + params(), {credentials: 'same-origin'});
+    if (res.status === 401){ location.reload(); return; }
+    d = await res.json();
+  } catch(e){
+    $('#list').innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`; return;
+  }
+  state = d;
+  $('#who').textContent = d.user && d.user.username !== '-'
+    ? `${d.user.username}（role ${d.user.role}）` : '';
+  $('#authnote').textContent = d.auth_mode === 'none' ? '⚠ 未鉴权（内网直连）' : '';
+  fillSel($('#model'), d.models, '全部模型');
+  fillSel($('#toolsel'), d.tools, '全部工具');
+  const pages = Math.max(1, Math.ceil(d.total / d.page_size));
+  $('#meta').textContent = `${d.total} 次调用`;
+  $('#pinfo').textContent = `${d.page} / ${pages}`;
+  $('#prev').disabled = d.page <= 1;
+  $('#next').disabled = d.page >= pages;
+  $('#list').innerHTML = d.items.length ? d.items.map(item).join('')
+    : '<div class="empty">没有匹配的调用记录</div>';
+  if (!keepSel) return;
+  const still = d.items.find(r => r.request_id === selected);
+  if (still) $('#detail').innerHTML = detail(still);
+}
+
+$('#list').addEventListener('click', e => {
+  const tag = e.target.closest('[data-tool]');
+  if (tag){                                    // click a tool chip -> filter by it
+    $('#toolsel').value = tag.dataset.tool;
+    page = 1; load(true); return;
+  }
+  const el = e.target.closest('.item'); if (!el) return;
+  selected = el.dataset.id;
+  document.querySelectorAll('.item.sel').forEach(n => n.classList.remove('sel'));
+  el.classList.add('sel');
+  const rec = state.items.find(r => r.request_id === selected);
+  $('#detail').innerHTML = detail(rec);
+  $('#detail').scrollTop = 0;
+});
+
+$('#quick').addEventListener('click', e => {
+  const b = e.target.closest('button'); if (!b) return;
+  document.querySelectorAll('#quick button').forEach(n => n.classList.remove('on'));
+  b.classList.add('on');
+  if (!b.dataset.h){ $('#from').value = ''; $('#to').value = ''; }
+  else {
+    const now = new Date();
+    $('#from').value = localISO(new Date(now.getTime() - parseFloat(b.dataset.h) * 3600e3));
+    $('#to').value = '';
+  }
+  page = 1; load(true);
+});
+
+let deb;
+$('#q').addEventListener('input', () => { clearTimeout(deb); deb = setTimeout(() => { page = 1; load(true); }, 300); });
+['#model','#toolsel','#status','#stream','#size','#from','#to'].forEach(s =>
+  $(s).addEventListener('change', () => { page = 1; load(true); }));
+['#tools','#errors'].forEach(s => $(s).addEventListener('change', () => { page = 1; load(true); }));
+$('#prev').onclick = () => { if (page > 1) { page--; load(true); } };
+$('#next').onclick = () => { page++; load(true); };
+$('#refresh').onclick = () => load(true);
+$('#reset').onclick = () => {
+  ['#q','#from','#to'].forEach(s => $(s).value = '');
+  ['#model','#toolsel','#status','#stream'].forEach(s => $(s).value = '');
+  ['#tools','#errors'].forEach(s => $(s).checked = false);
+  document.querySelectorAll('#quick button').forEach(n => n.classList.remove('on'));
+  document.querySelector('#quick button:last-child').classList.add('on');
+  page = 1; load(true);
+};
+$('#auto').onchange = e => {
+  clearInterval(timer);
+  if (e.target.checked) timer = setInterval(() => load(true), 5000);
+};
+
+// draggable splitter
+(function(){
+  const d = $('#drag'), l = $('#left');
+  let on = false;
+  d.addEventListener('mousedown', e => { on = true; d.classList.add('act');
+    document.body.style.userSelect = 'none'; e.preventDefault(); });
+  window.addEventListener('mousemove', e => {
+    if (!on) return;
+    l.style.width = Math.max(260, Math.min(e.clientX, window.innerWidth * 0.7)) + 'px';
+  });
+  window.addEventListener('mouseup', () => {
+    if (!on) return;
+    on = false; d.classList.remove('act'); document.body.style.userSelect = '';
+    localStorage.setItem('lv-w', l.style.width);
+  });
+  const saved = localStorage.getItem('lv-w'); if (saved) l.style.width = saved;
+})();
+
+load();
+</script></body></html>

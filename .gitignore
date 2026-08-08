@@ -1,0 +1,16 @@
+# Build artifacts
+/logviewer
+/logviewer.exe
+*.exe
+
+# Local config
+.env
+
+# Local scratch: real logs must never be committed - they contain full
+# prompts, responses and tool arguments in plaintext.
+*.log
+!testdata/sample.log
+/logs/
+/testlogs/
+*.json
+!examples/*.json

@@ -1,0 +1,48 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+      - run: go vet ./...
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "not gofmt'd:"; echo "$unformatted"; exit 1
+          fi
+      # -race needs cgo; it is the point of this job, so do not disable it
+      - run: go test -race ./...
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t newapi-logviewer:ci .
+      - name: Smoke test
+        run: |
+          mkdir -p /tmp/logs
+          cp testdata/sample.log /tmp/logs/
+          docker run -d --name lv -p 7070:7070 \
+            -v /tmp/logs:/logs:ro \
+            -e LOG_DIR=/logs -e BASE_PATH=/logviewer -e TZ=UTC \
+            newapi-logviewer:ci
+          for i in $(seq 1 20); do
+            curl -sf http://localhost:7070/logviewer/healthz && break || sleep 1
+          done
+          # the fixture has 4 real calls; if parsing broke, this returns 0
+          total=$(curl -sf "http://localhost:7070/logviewer/api/calls" | jq .total)
+          echo "calls parsed: $total"
+          [ "$total" = "4" ] || { docker logs lv; exit 1; }
+          curl -sf http://localhost:7070/logviewer/ | grep -q "New API" || exit 1
+          docker rm -f lv

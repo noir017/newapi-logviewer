@@ -1,0 +1,478 @@
+package main
+
+import (
+	"bufio"
+	"encoding/json"
+	"io"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// new-api writes one line per event, all tagged with the request id, e.g.
+//
+//	[DEBUG] 2026/08/08 - 12:16:33 | <rid> | text request body: {...}
+//	[DEBUG] 2026/08/08 - 12:16:36 | <rid> | upstream response body: {...}
+//	[INFO]  2026/08/08 - 12:16:36 | <rid> | record consume log: userId=1, params={...}
+//	[GIN]   2026/08/08 - 12:16:36 | relay | <rid> | 200 | 3.05s | 1.2.3.4 | POST /v1/...
+//
+// Events for one call are interleaved with other calls, so we group by rid.
+// Lines whose id column is SYSTEM (background jobs) carry no rid and are skipped.
+
+var (
+	lineRE = regexp.MustCompile(`^\[([A-Z]+)\]\s+(\d{4}/\d{2}/\d{2})\s+-\s+(\d{2}:\d{2}:\d{2})\s+\|\s+(.*)$`)
+	// a request id is 24+ alphanumerics; "SYSTEM"/"relay"/"api" are not ids
+	ridRE = regexp.MustCompile(`^([A-Za-z0-9]{24,})\s+\|\s+(.*)$`)
+	ginRE = regexp.MustCompile(`^(relay|api)\s+\|\s+([A-Za-z0-9]{24,})\s+\|\s+(\d{3})\s+\|\s+(\S+)\s+\|\s+(\S+)\s+\|\s+([A-Z]+)\s+(\S+)`)
+)
+
+type LogErr struct {
+	TS  string `json:"ts"`
+	Msg string `json:"msg"`
+}
+
+type Usage struct {
+	PromptTokens     *int `json:"prompt_tokens,omitempty"`
+	CompletionTokens *int `json:"completion_tokens,omitempty"`
+	TotalTokens      *int `json:"total_tokens,omitempty"`
+	PromptDetails    *struct {
+		CachedTokens *int `json:"cached_tokens,omitempty"`
+	} `json:"prompt_tokens_details,omitempty"`
+	CompletionDetails *struct {
+		ReasoningTokens *int `json:"reasoning_tokens,omitempty"`
+	} `json:"completion_tokens_details,omitempty"`
+}
+
+type ToolCall struct {
+	Index    *int   `json:"index,omitempty"`
+	ID       string `json:"id,omitempty"`
+	Type     string `json:"type,omitempty"`
+	Function struct {
+		Name      string `json:"name,omitempty"`
+		Arguments string `json:"arguments,omitempty"`
+	} `json:"function"`
+}
+
+// Record is one LLM call, assembled from every log line sharing its request id.
+// Field names and shapes are the wire contract with the browser UI.
+type Record struct {
+	RequestID string `json:"request_id"`
+	TS        string `json:"ts"`
+	Epoch     int64  `json:"epoch"`
+
+	Request  Raw `json:"request"`
+	Response Raw `json:"response"`
+	Billing  Raw `json:"billing"`
+
+	UpstreamURL string   `json:"upstream_url"`
+	Status      *int     `json:"status"`
+	Latency     string   `json:"latency"`
+	IP          string   `json:"ip"`
+	Method      string   `json:"method"`
+	Path        string   `json:"path"`
+	Kind        string   `json:"kind"`
+	StreamEnd   string   `json:"stream_end"`
+	Errors      []LogErr `json:"errors"`
+
+	Model    string `json:"model"`
+	IsStream bool   `json:"is_stream"`
+	HasTools bool   `json:"has_tools"`
+
+	StreamContent   string     `json:"stream_content"`
+	StreamReasoning string     `json:"stream_reasoning"`
+	StreamToolCalls []ToolCall `json:"stream_tool_calls"`
+	Usage           *Usage     `json:"usage"`
+
+	Quota           *int64   `json:"quota"`
+	ModelRatio      *float64 `json:"model_ratio"`
+	CompletionRatio *float64 `json:"completion_ratio"`
+	FRT             *float64 `json:"frt"`
+	ChannelID       *int     `json:"channel_id"`
+	TokenName       string   `json:"token_name"`
+
+	ToolNames   []string `json:"tool_names"`
+	CalledTools []string `json:"called_tools"`
+	Preview     string   `json:"preview"`
+	Incomplete  bool     `json:"incomplete"`
+
+	// searchBlob is the lowercased haystack for ?search=. Built once at parse
+	// time so a query does not re-serialize every record on every keystroke.
+	searchBlob string
+
+	chunks []streamChunk // dropped by finalize
+}
+
+// ---- partial views over the raw bodies -------------------------------------
+
+type reqView struct {
+	Model    string `json:"model"`
+	Stream   bool   `json:"stream"`
+	Messages []struct {
+		Role    string          `json:"role"`
+		Content json.RawMessage `json:"content"`
+	} `json:"messages"`
+	Tools []struct {
+		Function struct {
+			Name string `json:"name"`
+		} `json:"function"`
+		Name string `json:"name"` // bare-schema tools (no "function" wrapper)
+	} `json:"tools"`
+}
+
+type respView struct {
+	Choices []struct {
+		Message struct {
+			ToolCalls []ToolCall `json:"tool_calls"`
+		} `json:"message"`
+	} `json:"choices"`
+	Usage *Usage `json:"usage"`
+}
+
+type billView struct {
+	ModelName        string `json:"model_name"`
+	Quota            *int64 `json:"quota"`
+	ChannelID        *int   `json:"channel_id"`
+	TokenName        string `json:"token_name"`
+	PromptTokens     *int   `json:"prompt_tokens"`
+	CompletionTokens *int   `json:"completion_tokens"`
+	Other            *struct {
+		ModelRatio      *float64 `json:"model_ratio"`
+		CompletionRatio *float64 `json:"completion_ratio"`
+		FRT             *float64 `json:"frt"`
+	} `json:"other"`
+}
+
+type streamChunk struct {
+	Choices []struct {
+		Delta struct {
+			Content          string     `json:"content"`
+			ReasoningContent string     `json:"reasoning_content"`
+			ToolCalls        []ToolCall `json:"tool_calls"`
+		} `json:"delta"`
+	} `json:"choices"`
+	Usage *Usage `json:"usage"`
+}
+
+// ---- parsing ---------------------------------------------------------------
+
+func blank(rid string) *Record {
+	return &Record{RequestID: rid, Errors: []LogErr{}}
+}
+
+// ParseFiles reads each file once, newest content last, and groups by rid.
+// limitBytes tails huge files: full history is rarely needed and reading a
+// multi-GB log would blow up memory.
+func ParseFiles(paths []string, limitBytes int64) map[string]*Record {
+	calls := map[string]*Record{}
+	for _, p := range paths {
+		parseOne(p, limitBytes, calls)
+	}
+	for _, rec := range calls {
+		rec.finalize()
+	}
+	return calls
+}
+
+func parseOne(path string, limitBytes int64, calls map[string]*Record) {
+	fh, err := os.Open(path)
+	if err != nil {
+		return
+	}
+	defer fh.Close()
+
+	if st, err := fh.Stat(); err == nil && limitBytes > 0 && st.Size() > limitBytes {
+		if _, err := fh.Seek(st.Size()-limitBytes, 0); err == nil {
+			br := bufio.NewReader(fh)
+			br.ReadString('\n') // discard the partial line we landed in
+			scanLines(br, calls)
+			return
+		}
+	}
+	scanLines(bufio.NewReaderSize(fh, 1<<16), calls)
+}
+
+func scanLines(r io.Reader, calls map[string]*Record) {
+	sc := bufio.NewScanner(r)
+	// request bodies with long contexts routinely exceed the 64KB default
+	sc.Buffer(make([]byte, 0, 1<<16), 16<<20)
+	for sc.Scan() {
+		handleLine(sc.Text(), calls)
+	}
+}
+
+func handleLine(line string, calls map[string]*Record) {
+	m := lineRE.FindStringSubmatch(line)
+	if m == nil {
+		return
+	}
+	level, rest := m[1], m[4]
+	ts := m[2] + " " + m[3]
+
+	if level == "GIN" {
+		g := ginRE.FindStringSubmatch(rest)
+		if g == nil {
+			return
+		}
+		rec := get(calls, g[2])
+		if n, err := strconv.Atoi(g[3]); err == nil {
+			rec.Status = &n
+		}
+		rec.Kind, rec.Latency, rec.IP, rec.Method, rec.Path = g[1], g[4], g[5], g[6], g[7]
+		if rec.TS == "" {
+			rec.TS = ts
+		}
+		return
+	}
+
+	r := ridRE.FindStringSubmatch(rest)
+	if r == nil {
+		return // SYSTEM / unkeyed background lines
+	}
+	rec := get(calls, r[1])
+	msg := r[2]
+	if rec.TS == "" {
+		rec.TS = ts
+	}
+
+	switch {
+	case strings.HasPrefix(msg, "text request body:"):
+		rec.Request = parseRaw(strings.TrimSpace(msg[len("text request body:"):]))
+	case strings.HasPrefix(msg, "upstream response body:"):
+		rec.Response = parseRaw(strings.TrimSpace(msg[len("upstream response body:"):]))
+	case strings.HasPrefix(msg, "stream scanner data:"):
+		if ch, ok := streamChunkOf(msg[len("stream scanner data:"):]); ok {
+			rec.chunks = append(rec.chunks, ch)
+		}
+	case strings.HasPrefix(msg, "fullRequestURL:"):
+		rec.UpstreamURL = strings.TrimSpace(msg[len("fullRequestURL:"):])
+	case strings.HasPrefix(msg, "record consume log:"):
+		if i := strings.Index(msg, "params="); i >= 0 {
+			rec.Billing = parseRaw(strings.TrimSpace(msg[i+len("params="):]))
+		}
+	case strings.Contains(msg, "stream ended"):
+		if i := strings.LastIndex(msg, "reason="); i >= 0 {
+			rec.StreamEnd = strings.TrimSpace(msg[i+len("reason="):])
+		} else {
+			rec.StreamEnd = strings.TrimSpace(msg)
+		}
+	case level == "ERR" || strings.Contains(strings.ToLower(msg), "error"):
+		rec.Errors = append(rec.Errors, LogErr{TS: ts, Msg: clip(msg, 2000)})
+	}
+}
+
+func get(calls map[string]*Record, rid string) *Record {
+	if r, ok := calls[rid]; ok {
+		return r
+	}
+	r := blank(rid)
+	calls[rid] = r
+	return r
+}
+
+// streamChunkOf extracts a delta payload from one `stream scanner data:` line.
+func streamChunkOf(raw string) (streamChunk, bool) {
+	var ch streamChunk
+	raw = strings.TrimSpace(raw)
+	// ": x-omniroute-..." comment lines and blank keepalives carry no delta
+	if !strings.HasPrefix(raw, "data:") {
+		return ch, false
+	}
+	body := strings.TrimSpace(raw[len("data:"):])
+	if body == "" || body == "[DONE]" {
+		return ch, false
+	}
+	if json.Unmarshal([]byte(body), &ch) != nil {
+		return ch, false
+	}
+	return ch, true
+}
+
+func clip(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n]
+}
+
+// ---- derivation ------------------------------------------------------------
+
+// finalize derives the summary fields the UI lists on, then drops raw chunks.
+func (r *Record) finalize() {
+	var req reqView
+	if !r.Request.empty() {
+		json.Unmarshal(r.Request, &req)
+	}
+	var resp respView
+	if !r.Response.empty() {
+		json.Unmarshal(r.Response, &resp)
+	}
+	var bill billView
+	hasBill := !r.Billing.empty()
+	if hasBill {
+		json.Unmarshal(r.Billing, &bill)
+	}
+
+	r.Model = req.Model
+	if r.Model == "" {
+		r.Model = bill.ModelName
+	}
+	r.IsStream = req.Stream || len(r.chunks) > 0
+	r.HasTools = len(req.Tools) > 0
+
+	// Reassemble streamed output so streaming calls show real content, not a
+	// pile of chunks. Reasoning and visible text are tracked separately.
+	r.StreamToolCalls = []ToolCall{}
+	if len(r.chunks) > 0 {
+		var content, reasoning strings.Builder
+		for _, ch := range r.chunks {
+			for _, c := range ch.Choices {
+				content.WriteString(c.Delta.Content)
+				reasoning.WriteString(c.Delta.ReasoningContent)
+				r.StreamToolCalls = append(r.StreamToolCalls, c.Delta.ToolCalls...)
+			}
+			if ch.Usage != nil {
+				r.Usage = ch.Usage
+			}
+		}
+		r.StreamContent = content.String()
+		r.StreamReasoning = reasoning.String()
+	} else {
+		r.Usage = resp.Usage
+	}
+	if r.Usage == nil && hasBill {
+		r.Usage = &Usage{PromptTokens: bill.PromptTokens, CompletionTokens: bill.CompletionTokens}
+	}
+
+	r.Quota, r.ChannelID, r.TokenName = bill.Quota, bill.ChannelID, bill.TokenName
+	if bill.Other != nil {
+		r.ModelRatio, r.CompletionRatio, r.FRT = bill.Other.ModelRatio, bill.Other.CompletionRatio, bill.Other.FRT
+	}
+
+	// Epoch seconds for time-range filtering (TS is a display string).
+	if t, err := time.ParseInLocation("2006/01/02 15:04:05", r.TS, time.Local); err == nil {
+		r.Epoch = t.Unix()
+	}
+
+	// Tool names surfaced on the list row, so filtering/scanning does not
+	// require opening each call.
+	r.ToolNames = []string{}
+	for _, t := range req.Tools {
+		n := t.Function.Name
+		if n == "" {
+			n = t.Name
+		}
+		if n != "" {
+			r.ToolNames = append(r.ToolNames, n)
+		}
+	}
+	called := r.StreamToolCalls
+	if !r.IsStream && len(resp.Choices) > 0 {
+		called = resp.Choices[0].Message.ToolCalls
+	}
+	r.CalledTools = []string{}
+	for _, tc := range called {
+		n := tc.Function.Name
+		if n != "" && !contains(r.CalledTools, n) {
+			r.CalledTools = append(r.CalledTools, n)
+		}
+	}
+
+	// Preview text for the collapsed row: last user message.
+	for i := len(req.Messages) - 1; i >= 0; i-- {
+		if req.Messages[i].Role == "user" {
+			r.Preview = clipRunes(contentText(req.Messages[i].Content), 200)
+			break
+		}
+	}
+	r.Incomplete = r.Request.empty() // truncated/rotated-out request line
+
+	// Haystack for free-text search, matching the Python version's fields.
+	var sb strings.Builder
+	sb.Write(r.Request)
+	sb.Write(r.Response)
+	sb.WriteString(r.StreamContent)
+	sb.WriteString(r.Preview)
+	sb.WriteString(r.RequestID)
+	r.searchBlob = strings.ToLower(sb.String())
+
+	r.chunks = nil
+}
+
+// contentText flattens a message body, which is either a plain string or a
+// list of multimodal blocks.
+func contentText(c json.RawMessage) string {
+	if len(c) == 0 {
+		return ""
+	}
+	var s string
+	if json.Unmarshal(c, &s) == nil {
+		return s
+	}
+	var parts []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if json.Unmarshal(c, &parts) == nil {
+		out := make([]string, 0, len(parts))
+		for _, p := range parts {
+			// image_url / audio blocks carry no text; joining them in would
+			// pad the row preview with stray separators.
+			if p.Text != "" {
+				out = append(out, p.Text)
+			}
+		}
+		return strings.Join(out, " ")
+	}
+	return string(c)
+}
+
+func clipRunes(s string, n int) string {
+	rs := []rune(s)
+	if len(rs) <= n {
+		return s
+	}
+	return string(rs[:n])
+}
+
+func contains(xs []string, v string) bool {
+	for _, x := range xs {
+		if x == v {
+			return true
+		}
+	}
+	return false
+}
+
+// Load parses every *.log in dir, newest record first.
+func Load(dir string, limitBytes int64) []*Record {
+	files, _ := filepath.Glob(filepath.Join(dir, "*.log"))
+	sort.Slice(files, func(i, j int) bool {
+		return mtime(files[i]).Before(mtime(files[j]))
+	})
+	calls := ParseFiles(files, limitBytes)
+	out := make([]*Record, 0, len(calls))
+	for _, r := range calls {
+		if r.TS != "" {
+			out = append(out, r)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].TS != out[j].TS {
+			return out[i].TS > out[j].TS
+		}
+		return out[i].RequestID > out[j].RequestID
+	})
+	return out
+}
+
+func mtime(p string) time.Time {
+	st, err := os.Stat(p)
+	if err != nil {
+		return time.Time{}
+	}
+	return st.ModTime()
+}

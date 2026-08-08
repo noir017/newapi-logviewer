@@ -1,0 +1,31 @@
+[INFO]  2026/01/15 - 09:00:00 | SYSTEM | starting new-api server
+[INFO]  2026/01/15 - 09:00:01 | SYSTEM | database migrated
+[GIN]   2026/01/15 - 09:00:05 | api | 3fJ7kQmZxR2wLpVnB8sTyHdA | 200 | 1.21ms | 10.0.0.9 | GET /api/status
+[DEBUG] 2026/01/15 - 09:01:10 | 7hKpR3nWqZ4mTxVbY9cLsFgD | fullRequestURL: https://upstream.example.com/v1/chat/completions
+[DEBUG] 2026/01/15 - 09:01:10 | 7hKpR3nWqZ4mTxVbY9cLsFgD | text request body: {"model":"demo/chat-mini","messages":[{"role":"system","content":"You are a helpful assistant."},{"role":"user","content":"What is 2+2?"}],"max_tokens":64}
+[DEBUG] 2026/01/15 - 09:01:12 | 7hKpR3nWqZ4mTxVbY9cLsFgD | upstream response body: {"id":"chatcmpl-a1","object":"chat.completion","created":1768460472,"model":"chat-mini","choices":[{"index":0,"message":{"role":"assistant","content":"2 + 2 = 4."},"finish_reason":"stop"}],"usage":{"prompt_tokens":23,"completion_tokens":8,"total_tokens":31}}
+[INFO]  2026/01/15 - 09:01:12 | 7hKpR3nWqZ4mTxVbY9cLsFgD | record consume log: userId=1, params={"model_name":"demo/chat-mini","quota":4,"channel_id":1,"token_name":"demo-token","prompt_tokens":23,"completion_tokens":8,"other":{"model_ratio":0.05,"completion_ratio":4,"frt":1830}}
+[GIN]   2026/01/15 - 09:01:12 | relay | 7hKpR3nWqZ4mTxVbY9cLsFgD | 200 | 2.01s | 10.0.0.9 | POST /v1/chat/completions
+[DEBUG] 2026/01/15 - 09:02:30 | Qw8ErTyUiOpAsDfGhJkLzXcV | fullRequestURL: https://upstream.example.com/v1/chat/completions
+[DEBUG] 2026/01/15 - 09:02:30 | Qw8ErTyUiOpAsDfGhJkLzXcV | text request body: {"model":"demo/chat-pro","stream":true,"messages":[{"role":"user","content":"Check the weather in Berlin, then email the result."}],"tools":[{"type":"function","function":{"name":"get_weather","description":"Get the current weather for a city","parameters":{"type":"object","properties":{"city":{"type":"string","description":"City name"},"unit":{"type":"string","description":"celsius or fahrenheit"}},"required":["city"]}}},{"type":"function","function":{"name":"send_email","description":"Send an email","parameters":{"type":"object","properties":{"to":{"type":"string","description":"Recipient"},"body":{"type":"string","description":"Message body"}},"required":["to","body"]}}}],"tool_choice":"auto"}
+[DEBUG] 2026/01/15 - 09:02:31 | Qw8ErTyUiOpAsDfGhJkLzXcV | stream scanner data: : upstream-node=edge-3
+[DEBUG] 2026/01/15 - 09:02:31 | Qw8ErTyUiOpAsDfGhJkLzXcV | stream scanner data: data: {"id":"chatcmpl-b2","object":"chat.completion.chunk","created":1768460551,"model":"chat-pro","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}
+[DEBUG] 2026/01/15 - 09:02:31 | Qw8ErTyUiOpAsDfGhJkLzXcV | stream scanner data: data: {"id":"chatcmpl-b2","object":"chat.completion.chunk","created":1768460551,"model":"chat-pro","choices":[{"index":0,"delta":{"reasoning_content":"The user wants weather "},"finish_reason":null}]}
+[DEBUG] 2026/01/15 - 09:02:31 | Qw8ErTyUiOpAsDfGhJkLzXcV | stream scanner data: data: {"id":"chatcmpl-b2","object":"chat.completion.chunk","created":1768460551,"model":"chat-pro","choices":[{"index":0,"delta":{"reasoning_content":"first, so call get_weather."},"finish_reason":null}]}
+[DEBUG] 2026/01/15 - 09:02:32 | Qw8ErTyUiOpAsDfGhJkLzXcV | stream scanner data: data: {"id":"chatcmpl-b2","object":"chat.completion.chunk","created":1768460552,"model":"chat-pro","choices":[{"index":0,"delta":{"content":"Let me look "},"finish_reason":null}]}
+[DEBUG] 2026/01/15 - 09:02:32 | Qw8ErTyUiOpAsDfGhJkLzXcV | stream scanner data: data: {"id":"chatcmpl-b2","object":"chat.completion.chunk","created":1768460552,"model":"chat-pro","choices":[{"index":0,"delta":{"content":"that up."},"finish_reason":null}]}
+[DEBUG] 2026/01/15 - 09:02:33 | Qw8ErTyUiOpAsDfGhJkLzXcV | stream scanner data: data: {"id":"chatcmpl-b2","object":"chat.completion.chunk","created":1768460553,"model":"chat-pro","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_w1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Berlin\"}"}}]},"finish_reason":"tool_calls"}]}
+[DEBUG] 2026/01/15 - 09:02:33 | Qw8ErTyUiOpAsDfGhJkLzXcV | stream scanner data: data: {"id":"chatcmpl-b2","object":"chat.completion.chunk","created":1768460553,"model":"chat-pro","choices":[],"usage":{"prompt_tokens":142,"completion_tokens":37,"total_tokens":179,"completion_tokens_details":{"reasoning_tokens":21}}}
+[DEBUG] 2026/01/15 - 09:02:33 | Qw8ErTyUiOpAsDfGhJkLzXcV | stream scanner data: data: [DONE]
+[DEBUG] 2026/01/15 - 09:02:33 | Qw8ErTyUiOpAsDfGhJkLzXcV | stream ended, reason=done
+[INFO]  2026/01/15 - 09:02:33 | Qw8ErTyUiOpAsDfGhJkLzXcV | record consume log: userId=1, params={"model_name":"demo/chat-pro","quota":41,"channel_id":2,"token_name":"demo-token","prompt_tokens":142,"completion_tokens":37,"other":{"model_ratio":0.25,"completion_ratio":4,"frt":940}}
+[GIN]   2026/01/15 - 09:02:33 | relay | Qw8ErTyUiOpAsDfGhJkLzXcV | 200 | 3.44s | 10.0.0.9 | POST /v1/chat/completions
+[DEBUG] 2026/01/15 - 09:03:40 | ZxCvBnMaSdFgHjKlQwErTyUi | fullRequestURL: https://upstream.example.com/v1/chat/completions
+[DEBUG] 2026/01/15 - 09:03:40 | ZxCvBnMaSdFgHjKlQwErTyUi | text request body: {"model":"demo/vision","messages":[{"role":"user","content":[{"type":"text","text":"Describe this picture."},{"type":"image_url","image_url":{"url":"https://example.com/cat.png"}}]}]}
+[ERR]   2026/01/15 - 09:03:42 | ZxCvBnMaSdFgHjKlQwErTyUi | do request failed: upstream returned error status 502
+[GIN]   2026/01/15 - 09:03:42 | relay | ZxCvBnMaSdFgHjKlQwErTyUi | 502 | 1.88s | 10.0.0.9 | POST /v1/chat/completions
+[DEBUG] 2026/01/15 - 09:04:50 | MnBvCxZaSdFgHjKlPoIuYtRe | text request body: {"model":"demo/chat-mini","messages":[{"role":"user","content":"Say hi"}]
+[GIN]   2026/01/15 - 09:04:50 | relay | MnBvCxZaSdFgHjKlPoIuYtRe | 200 | 0.51s | 10.0.0.9 | POST /v1/chat/completions
+[INFO]  2026/01/15 - 09:04:50 | MnBvCxZaSdFgHjKlPoIuYtRe | record consume log: userId=1, params={"model_name":"demo/chat-mini","quota":2,"channel_id":1,"token_name":"demo-token","prompt_tokens":10,"completion_tokens":3}
+this line is not a log line at all
+[GIN]   2026/01/15 - 09:05:00 | api | 3fJ7kQmZxR2wLpVnB8sTyHdA | 200 | 0.90ms | 10.0.0.9 | GET /api/status

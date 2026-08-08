@@ -1,0 +1,10 @@
+*_test.go
+testdata/
+docs/
+examples/
+.github/
+.git/
+.env
+README*.md
+LICENSE
+docker-compose*.yml

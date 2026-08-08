@@ -1,0 +1,89 @@
+# Example: New API + logviewer in one stack.
+#
+# Trimmed to the parts that matter for wiring the viewer up. Copy the logviewer
+# service into your existing new-api compose file, or run this as-is.
+
+services:
+  new-api:
+    image: calciumion/new-api:latest
+    container_name: new-api
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./data:/data
+      # Shared with the viewer. new-api writes here, the viewer reads.
+      - ./logs:/app/logs
+    environment:
+      - TZ=Asia/Shanghai
+      # Required for the viewer to have anything to show: logs full request and
+      # response bodies. See the README security note before enabling.
+      - DEBUG=true
+      - LOG_DIR=/app/logs
+      - ERROR_LOG_ENABLED=true
+      - SQL_DSN=postgres://newapi:${POSTGRES_PASSWORD}@postgres:5432/new-api
+      - REDIS_CONN_STRING=redis://default:${REDIS_PASSWORD}@redis:6379
+      - SESSION_SECRET=${SESSION_SECRET}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - newapi-net
+
+  logviewer:
+    build: ..
+    image: newapi-logviewer:latest
+    container_name: newapi-logviewer
+    restart: unless-stopped
+    ports:
+      - "7071:7070"
+    volumes:
+      # Read-only: the viewer must not be able to alter the audit trail.
+      - ./logs:/logs:ro
+    environment:
+      # Must match new-api's TZ above, or timestamps and the time filter skew.
+      - TZ=Asia/Shanghai
+      - LOG_DIR=/logs
+      - NEWAPI_URL=http://new-api:3000
+      - BASE_PATH=/logviewer
+      - AUTH_MODE=none
+    networks:
+      - newapi-net
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: newapi-postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=newapi
+      - POSTGRES_DB=new-api
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+    volumes:
+      - ./postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U newapi -d new-api"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - newapi-net
+
+  redis:
+    image: redis:7-alpine
+    container_name: newapi-redis
+    restart: unless-stopped
+    command: redis-server --requirepass ${REDIS_PASSWORD}
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$REDIS_PASSWORD\" ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - newapi-net
+
+networks:
+  newapi-net:
+    name: newapi-net
+    driver: bridge

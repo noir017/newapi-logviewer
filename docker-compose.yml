@@ -1,0 +1,37 @@
+services:
+  logviewer:
+    build: .
+    image: newapi-logviewer:latest
+    container_name: newapi-logviewer
+    restart: unless-stopped
+    ports:
+      - "${LOGVIEWER_PORT:-7071}:7070"
+    volumes:
+      # Read-only on purpose: the viewer must never be able to alter the
+      # audit trail it is displaying. Point this at the directory new-api
+      # writes its .log files to.
+      - ${NEWAPI_LOG_DIR:?set NEWAPI_LOG_DIR to new-api's log directory}:/logs:ro
+    environment:
+      # Timestamps in the log are local wall-clock time with no offset, so
+      # this must match the TZ new-api runs with or time filtering will skew.
+      - TZ=${TZ:-UTC}
+      - LOG_DIR=/logs
+      - NEWAPI_URL=${NEWAPI_URL:-http://new-api:3000}
+      - BASE_PATH=${BASE_PATH:-/logviewer}
+      - PORT=7070
+      # none   = no auth. LAN only - anyone who reaches the URL reads every
+      #          prompt in plaintext.
+      # bearer = require `Authorization: Bearer <new-api access token>`.
+      - AUTH_MODE=${AUTH_MODE:-none}
+      - REQUIRE_ADMIN=${REQUIRE_ADMIN:-true}
+      - LIMIT_MB=${LIMIT_MB:-40}
+      - CACHE_TTL=${CACHE_TTL:-3}
+    networks:
+      - default
+
+# If new-api runs in another compose project, join its network instead:
+#
+# networks:
+#   default:
+#     name: newapi-net
+#     external: true
