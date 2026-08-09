@@ -1,0 +1,36 @@
+# New API with the log viewer baked in: one container, two processes.
+#
+# Trade-off, stated plainly: this couples the two lifecycles. Restarting the
+# viewer restarts your gateway. Prefer the standalone Dockerfile if that
+# matters to you; use this one to avoid managing a second container.
+#
+# Build:
+#   docker build -f Dockerfile.combined -t newapi-with-logviewer .
+#
+# Pin the upstream tag rather than tracking :latest, so a rebuild does not
+# silently move New API versions underneath you.
+ARG NEWAPI_IMAGE=calciumion/new-api:latest
+ARG BUILDER=golang:1.24-alpine
+
+FROM ${BUILDER} AS build
+WORKDIR /src
+COPY go.mod ./
+COPY *.go ui.html ./
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /logviewer .
+
+FROM ${NEWAPI_IMAGE}
+COPY --from=build /logviewer /usr/local/bin/logviewer
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+# chmod here rather than relying on the checkout's mode bits, which do not
+# survive a Windows clone.
+RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/logviewer
+
+# new-api's own defaults, restated because we replace its entrypoint.
+ENV LOG_DIR=/app/logs \
+    LOGVIEWER_PORT=7070 \
+    BASE_PATH=/logviewer \
+    LOGVIEWER_ENABLED=true
+
+EXPOSE 3000 7070
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+CMD ["--log-dir", "/app/logs"]

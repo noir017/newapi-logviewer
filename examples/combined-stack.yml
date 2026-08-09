@@ -1,0 +1,73 @@
+# Example: New API with the log viewer baked into the same container.
+#
+# One container instead of two. See README "Or: one container instead of two"
+# for the trade-off - the two lifecycles are coupled.
+
+services:
+  new-api:
+    build:
+      context: ..
+      dockerfile: Dockerfile.combined
+      args:
+        # Pin the upstream tag so a rebuild does not silently move New API
+        # versions underneath you.
+        NEWAPI_IMAGE: calciumion/new-api:latest
+    image: newapi-with-logviewer:latest
+    container_name: new-api
+    restart: unless-stopped
+    command: --log-dir /app/logs
+    ports:
+      - "3000:3000"
+      # log viewer, same container, reachable at /logviewer/
+      - "7071:7070"
+    volumes:
+      - ./data:/data
+      # Not :ro - new-api writes here. The viewer runs as nobody and only
+      # ever reads, which the 0644 log files enforce.
+      - ./logs:/app/logs
+    environment:
+      - TZ=Asia/Shanghai
+      # Required for the viewer to have anything to show.
+      - DEBUG=true
+      - LOG_DIR=/app/logs
+      - SQL_DSN=postgres://newapi:${POSTGRES_PASSWORD}@postgres:5432/new-api
+      - REDIS_CONN_STRING=redis://default:${REDIS_PASSWORD}@redis:6379
+      - SESSION_SECRET=${SESSION_SECRET}
+      # --- log viewer ---
+      - LOGVIEWER_ENABLED=true
+      - LOGVIEWER_PORT=7070
+      - BASE_PATH=/logviewer
+      - AUTH_MODE=none
+      - LIMIT_MB=40
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: newapi-postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=newapi
+      - POSTGRES_DB=new-api
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+    volumes:
+      - ./postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U newapi -d new-api"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: newapi-redis
+    restart: unless-stopped
+    command: redis-server --requirepass ${REDIS_PASSWORD}
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$REDIS_PASSWORD\" ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5

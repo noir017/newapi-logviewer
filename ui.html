@@ -129,6 +129,28 @@ pre.j{background:#0d1017;border:1px solid var(--line);border-radius:7px;padding:
 .warnbox{background:#2a1f10;border:1px solid #4a3a12;color:#e3b341;padding:8px 11px;
   border-radius:7px;font-size:12px;margin-bottom:12px}
 .spin{color:var(--dim2);text-align:center;padding:30px;font-size:12.5px}
+
+/* ---- collapsible blocks ----
+   Long prompts and tool schemas dominate the pane, so anything past ~4 lines
+   is clamped. Only blocks that actually overflow get a toggle: measured in JS
+   after render, because the height depends on wrapping. */
+.clamp{position:relative;overflow:hidden}
+.clamp.on{max-height:var(--clh,84px)}
+/* fade the cut edge so it reads as truncated rather than as the end */
+.clamp.on::after{content:"";position:absolute;left:0;right:0;bottom:0;height:30px;
+  background:linear-gradient(to bottom,transparent,var(--fadeto,#12151b));pointer-events:none}
+.exp{display:flex;align-items:center;gap:7px;margin-top:5px;cursor:pointer;
+  color:var(--dim2);font-size:11.5px;user-select:none;padding:2px 0}
+.exp:hover{color:var(--acc)}
+.exp .ar{font-size:9px;transition:transform .12s}
+.exp.open .ar{transform:rotate(90deg)}
+.exp .meta{color:var(--dim2)}
+.exp:hover .meta{color:var(--dim)}
+/* section-level toggle sits in the header row, right-aligned */
+.st .grow{flex:1}
+.st .toggle{cursor:pointer;color:var(--dim2);font-size:11px;user-select:none;
+  border:1px solid var(--line);border-radius:5px;padding:1px 7px}
+.st .toggle:hover{color:var(--acc);border-color:var(--acc)}
 @media(max-width:860px){
   .split{flex-direction:column;height:auto;overflow:visible}
   body{overflow:auto}
@@ -197,12 +219,16 @@ function hl(obj){
 }
 const fmtQ = q => q == null ? '—' : '$' + (q / 500000).toFixed(6);
 function contentText(c){
+  // null/undefined content is normal on a tool-call-only assistant turn.
+  // JSON.stringify would turn it into the literal text `""`, which renders as
+  // junk and counts as 2 characters.
+  if (c == null) return '';
   if (typeof c === 'string') return c;
   if (Array.isArray(c)) return c.map(p =>
     p?.type === 'text' ? p.text :
     p?.type === 'image_url' ? '[image] ' + (p.image_url?.url || '').slice(0, 90) :
     JSON.stringify(p)).join('\n');
-  return JSON.stringify(c ?? '');
+  return JSON.stringify(c);
 }
 function safeArgs(a){ try { return JSON.parse(a); } catch { return a; } }
 const toEpoch = v => v ? Math.floor(new Date(v).getTime() / 1000) : '';
@@ -211,15 +237,52 @@ function localISO(d){
   return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
+// ---- collapsing -----------------------------------------------------------
+// Summary shown on a collapsed block. Character count is what you actually
+// want when judging a prompt; line count only when it is multi-line.
+function statOf(s){
+  s = String(s ?? '');
+  const chars = [...s].length;                 // codepoints, so CJK counts as 1
+  const lines = s ? s.split('\n').length : 0;
+  const out = [chars.toLocaleString() + ' 字符'];
+  if (lines > 1) out.push(lines.toLocaleString() + ' 行');
+  return out.join(' · ');
+}
+const statJSON = o => statOf(JSON.stringify(o, null, 2));
+
+// Wrap content in a clamp. `fade` must match the block's own background or the
+// gradient shows as a grey band.
+let clampSeq = 0;
+function clamp(inner, stat, opts){
+  const o = opts || {};
+  const id = 'c' + (++clampSeq);
+  const h = o.h || 84;
+  const fade = o.fade || '#12151b';
+  return `<div class="clampwrap" data-stat="${esc(stat)}">
+    <div class="clamp on" id="${id}" style="--clh:${h}px;--fadeto:${fade}">${inner}</div>
+    <div class="exp" data-for="${id}" hidden>
+      <span class="ar">▶</span><span class="lbl">展开</span>
+      <span class="meta">${esc(stat)}</span>
+    </div></div>`;
+}
+
 function msgHtml(m){
   const role = esc(m.role || '?');
-  let extra = '';
-  if (m.tool_calls) extra = m.tool_calls.map(tc => `
+  const calls = m.tool_calls || [];
+  let extra = calls.map(tc => `
     <div class="tc"><div class="nm">⚒ ${esc(tc.function?.name)}</div>
     <pre class="j">${hl(safeArgs(tc.function?.arguments))}</pre></div>`).join('');
   const txt = contentText(m.content);
+  const body = `${txt ? `<div class="txt">${esc(txt)}</div>` : ''}${extra}`;
+  // An assistant turn is often tool calls with no text at all; reporting
+  // "0 字符" there is worse than useless. Summarize what the block holds.
+  const parts = [];
+  if (txt) parts.push(statOf(txt));
+  if (calls.length) parts.push(`${calls.length} 个工具调用`
+    + ` · ${statOf(calls.map(c => c.function?.arguments || '').join(''))}`);
+  if (!parts.length) parts.push('空');
   return `<div class="msg ${role}"><div class="role">${role}</div>
-    ${txt ? `<div class="txt">${esc(txt)}</div>` : ''}${extra}</div>`;
+    ${clamp(body, parts.join(' · '), {h: 76})}</div>`;
 }
 
 function toolsHtml(tools, called){
@@ -227,15 +290,18 @@ function toolsHtml(tools, called){
     const f = t.function || t, p = f.parameters || {},
           props = p.properties || {}, req = p.required || [];
     const used = (called || []).includes(f.name);
-    const rows = Object.entries(props).map(([k, v]) =>
+    const entries = Object.entries(props);
+    const rows = entries.map(([k, v]) =>
       `<div class="p"><span class="pn">${esc(k)}</span>
        <span class="pt">${esc(v.type || '')}</span>
        ${req.includes(k) ? '<span class="rq">必填</span>' : ''}
        ${v.description ? ' — ' + esc(v.description) : ''}</div>`).join('');
+    const body = `${f.description ? `<div class="ds">${esc(f.description)}</div>` : ''}
+      <div class="params">${rows || '<i>无参数</i>'}</div>`;
+    const stat = `${entries.length} 参数${req.length ? ` · ${req.length} 必填` : ''}`;
     return `<div class="tool-def ${used ? 'used' : ''}">
       <div class="nm">⚒ ${esc(f.name)}${used ? '<span class="used-badge">本次调用</span>' : ''}</div>
-      ${f.description ? `<div class="ds">${esc(f.description)}</div>` : ''}
-      <div class="params">${rows || '<i>无参数</i>'}</div></div>`;
+      ${clamp(body, stat, {h: 66, fade: used ? '#171308' : '#12151b'})}</div>`;
   }).join('');
 }
 
@@ -256,9 +322,20 @@ function detail(r){
   const content = r.is_stream ? r.stream_content : (msg?.content || '');
   const reasoning = r.is_stream ? r.stream_reasoning : (msg?.reasoning_content || '');
   const tcs = (r.is_stream ? r.stream_tool_calls : msg?.tool_calls) || [];
-  const sec = (title, n, inner) => inner ?
-    `<section><div class="st"><h3>${title}</h3>${n ? `<span class="n">${n}</span>` : ''}</div>${inner}</section>` : '';
+  // `all` adds a section-level 展开全部 / 收起全部 control
+  const sec = (title, n, inner, all) => inner ?
+    `<section><div class="st"><h3>${title}</h3>${n ? `<span class="n">${n}</span>` : ''}
+      <span class="grow"></span>
+      ${all ? '<span class="toggle" data-all="1">展开全部</span>' : ''}
+     </div>${inner}</section>` : '';
   const slim = {...req}; delete slim.messages; delete slim.tools;
+
+  const msgs = req.messages || [];
+  // total prompt size across all messages - the number that tells you whether
+  // a request was bloated, without expanding every message to count
+  const promptChars = msgs.reduce((n, m) => n + [...contentText(m.content)].length, 0);
+  const roleCount = msgs.reduce((a, m) => (a[m.role] = (a[m.role] || 0) + 1, a), {});
+  const roleSummary = Object.entries(roleCount).map(([k, v]) => `${k}×${v}`).join(' ');
 
   return `
   <div class="dh">
@@ -280,22 +357,59 @@ function detail(r){
     <div style="grid-column:1/-1"><b>上游地址</b><span>${esc(r.upstream_url || '—')}</span></div>
   </div>
   ${sec('用量', '', usageHtml(r.usage))}
-  ${sec('提示词', (req.messages || []).length + ' 条', (req.messages || []).map(msgHtml).join(''))}
+  ${sec('提示词',
+      `${msgs.length} 条 · ${promptChars.toLocaleString()} 字符${roleSummary ? ' · ' + roleSummary : ''}`,
+      msgs.map(msgHtml).join(''), msgs.length > 0)}
   ${sec('Tools 定义', (req.tools || []).length + ' 个'
       + (r.called_tools?.length ? ` · 调用 ${r.called_tools.length}` : ''),
-      req.tools ? toolsHtml(req.tools, r.called_tools) : '')}
-  ${sec('模型返回', '', content
-      ? `<div class="msg assistant"><div class="role">assistant</div><div class="txt">${esc(content)}</div></div>`
+      req.tools ? toolsHtml(req.tools, r.called_tools) : '', (req.tools || []).length > 0)}
+  ${sec('模型返回', content ? statOf(content) : '', content
+      ? `<div class="msg assistant"><div class="role">assistant</div>
+         ${clamp(`<div class="txt">${esc(content)}</div>`, statOf(content), {h: 84})}</div>`
       : (tcs.length ? '' : '<div class="msg assistant"><div class="role">assistant</div><div class="txt" style="color:var(--dim2)">（无文本内容）</div></div>'))}
-  ${sec('工具调用', tcs.length + ' 次', tcs.map(tc =>
-      `<div class="tc"><div class="nm">⚒ ${esc(tc.function?.name)}</div>
-       <pre class="j">${hl(safeArgs(tc.function?.arguments))}</pre></div>`).join(''))}
-  ${sec('推理过程', reasoning ? reasoning.length + ' 字符' : '',
-      reasoning ? `<div class="reason">${esc(reasoning)}</div>` : '')}
-  ${sec('请求参数', '', `<pre class="j">${hl(slim)}</pre>`)}
-  ${sec('原始响应 JSON', '', r.response ? `<pre class="j">${hl(r.response)}</pre>` : '')}
-  ${sec('报错', r.errors?.length || '', r.errors?.length ? `<pre class="j">${hl(r.errors)}</pre>` : '')}
+  ${sec('工具调用', tcs.length + ' 次', tcs.map(tc => {
+      const args = safeArgs(tc.function?.arguments);
+      return `<div class="tc"><div class="nm">⚒ ${esc(tc.function?.name)}</div>
+       ${clamp(`<pre class="j">${hl(args)}</pre>`, statJSON(args), {h: 84, fade: '#1a1710'})}</div>`;
+    }).join(''), tcs.length > 0)}
+  ${sec('推理过程', reasoning ? statOf(reasoning) : '',
+      reasoning ? clamp(`<div class="reason">${esc(reasoning)}</div>`,
+                        statOf(reasoning), {h: 84, fade: '#141019'}) : '')}
+  ${sec('请求参数', statJSON(slim),
+      clamp(`<pre class="j">${hl(slim)}</pre>`, statJSON(slim), {h: 84, fade: '#0d1017'}))}
+  ${sec('原始响应 JSON', r.response ? statJSON(r.response) : '',
+      r.response ? clamp(`<pre class="j">${hl(r.response)}</pre>`,
+                         statJSON(r.response), {h: 84, fade: '#0d1017'}) : '')}
+  ${sec('报错', r.errors?.length || '', r.errors?.length
+      ? clamp(`<pre class="j">${hl(r.errors)}</pre>`, statJSON(r.errors), {h: 84, fade: '#0d1017'})
+      : '')}
   `;
+}
+
+// Reveal a toggle only on blocks that actually overflow their clamp. Height
+// depends on wrapping, so this has to run against the live DOM after render.
+function wireClamps(root){
+  root.querySelectorAll('.clamp').forEach(el => {
+    const btn = root.querySelector(`.exp[data-for="${el.id}"]`);
+    if (!btn) return;
+    const limit = parseInt(el.style.getPropertyValue('--clh')) || 84;
+    if (el.scrollHeight <= limit + 8){
+      // fits already - drop the clamp entirely rather than showing a
+      // toggle that does nothing
+      el.classList.remove('on');
+      btn.remove();
+    } else {
+      btn.hidden = false;
+    }
+  });
+}
+
+function setExpanded(btn, open){
+  const el = document.getElementById(btn.dataset.for);
+  if (!el) return;
+  el.classList.toggle('on', !open);
+  btn.classList.toggle('open', open);
+  btn.querySelector('.lbl').textContent = open ? '收起' : '展开';
 }
 
 function item(r){
@@ -366,7 +480,15 @@ async function load(keepSel){
     : '<div class="empty">没有匹配的调用记录</div>';
   if (!keepSel) return;
   const still = d.items.find(r => r.request_id === selected);
-  if (still) $('#detail').innerHTML = detail(still);
+  if (still) renderDetail(still);
+}
+
+// Single place that paints the right pane, so clamp wiring can never be
+// forgotten at one of the call sites.
+function renderDetail(rec){
+  const pane = $('#detail');
+  pane.innerHTML = detail(rec);
+  wireClamps(pane);
 }
 
 $('#list').addEventListener('click', e => {
@@ -380,8 +502,22 @@ $('#list').addEventListener('click', e => {
   document.querySelectorAll('.item.sel').forEach(n => n.classList.remove('sel'));
   el.classList.add('sel');
   const rec = state.items.find(r => r.request_id === selected);
-  $('#detail').innerHTML = detail(rec);
+  renderDetail(rec);
   $('#detail').scrollTop = 0;
+});
+
+// expand/collapse: individual blocks, and per-section "expand all"
+$('#detail').addEventListener('click', e => {
+  const btn = e.target.closest('.exp');
+  if (btn){ setExpanded(btn, !btn.classList.contains('open')); return; }
+
+  const all = e.target.closest('.toggle[data-all]');
+  if (!all) return;
+  const sect = all.closest('section');
+  const btns = [...sect.querySelectorAll('.exp')].filter(b => !b.hidden);
+  const open = all.textContent.trim() === '展开全部';
+  btns.forEach(b => setExpanded(b, open));
+  all.textContent = open ? '收起全部' : '展开全部';
 });
 
 $('#quick').addEventListener('click', e => {

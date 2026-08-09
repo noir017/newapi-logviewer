@@ -129,8 +129,8 @@ func TestParseSample(t *testing.T) {
 				t.Error("/api/status health check should not be listed")
 			}
 		}
-		if len(shown) != 4 {
-			t.Errorf("shown = %d, want 4", len(shown))
+		if len(shown) != 5 {
+			t.Errorf("shown = %d, want 5", len(shown))
 		}
 	})
 
@@ -139,19 +139,19 @@ func TestParseSample(t *testing.T) {
 			q    map[string][]string
 			want int
 		}{
-			{map[string][]string{"tools": {"1"}}, 1},
+			{map[string][]string{"tools": {"1"}}, 2},
 			{map[string][]string{"tool_name": {"send_email"}}, 1},
 			{map[string][]string{"tool_name": {"nope"}}, 0},
 			{map[string][]string{"stream": {"1"}}, 1},
-			{map[string][]string{"stream": {"0"}}, 3},
-			{map[string][]string{"status": {"ok"}}, 3},
+			{map[string][]string{"stream": {"0"}}, 4},
+			{map[string][]string{"status": {"ok"}}, 4},
 			{map[string][]string{"status": {"err"}}, 1},
 			{map[string][]string{"errors": {"1"}}, 1},
 			{map[string][]string{"model": {"demo/chat-mini"}}, 2},
 			{map[string][]string{"search": {"berlin"}}, 1},
 			{map[string][]string{"search": {"ZZZ"}}, 0},
 			{map[string][]string{"until": {"1"}}, 0},
-			{map[string][]string{"since": {"1"}}, 4},
+			{map[string][]string{"since": {"1"}}, 5},
 		}
 		for _, c := range cases {
 			if got := len(applyFilters(recs, c.q)); got != c.want {

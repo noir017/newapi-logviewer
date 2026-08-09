@@ -14,3 +14,8 @@
 /testlogs/
 *.json
 !examples/*.json
+
+# browser-test scratch
+node_modules/
+ui_extracted.js
+probe*.js

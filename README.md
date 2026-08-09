@@ -68,6 +68,43 @@ Then open <http://localhost:7071/logviewer/>.
 To run it alongside an existing New API stack, see
 [examples/newapi-stack.yml](examples/newapi-stack.yml).
 
+### Or: one container instead of two
+
+`Dockerfile.combined` bakes the viewer into the New API image and runs both
+processes under a small supervising entrypoint. One container, one port mapping,
+nothing extra to manage:
+
+```bash
+docker build -f Dockerfile.combined -t newapi-with-logviewer .
+```
+
+```yaml
+services:
+  new-api:
+    image: newapi-with-logviewer
+    ports:
+      - "3000:3000"
+      - "7071:7070"     # viewer, same container
+    volumes:
+      - ./logs:/app/logs
+    environment:
+      - DEBUG=true
+      - AUTH_MODE=none
+      - LOGVIEWER_ENABLED=true   # false runs New API alone
+```
+
+See [examples/combined-stack.yml](examples/combined-stack.yml) for a full stack.
+
+The entrypoint forwards SIGTERM to both processes (so `docker stop` takes
+milliseconds, not the 10s SIGKILL timeout), exits the container if *either*
+process dies rather than sitting half-alive, and drops the viewer to `nobody`
+while New API keeps the root it needs for `/data`.
+
+The trade-off is coupling: restarting the viewer restarts your gateway, and a
+viewer crash takes New API down with it (which is why it fails loudly instead of
+silently). Use the separate container if you would rather they fail
+independently.
+
 ### Without Docker
 
 ```bash
@@ -89,6 +126,7 @@ All configuration is environment variables. Only `LOG_DIR` matters for a basic r
 | `NEWAPI_URL` | `http://new-api:3000` | Where to validate tokens (`bearer` mode only) |
 | `REQUIRE_ADMIN` | `true` | In `bearer` mode, also require `role >= 100` |
 | `LIMIT_MB` | `40` | Only parse the last N MB of each log file |
+| `LOGVIEWER_ENABLED` | `true` | Combined image only: `false` runs New API alone |
 | `CACHE_TTL` | `3` | Seconds between disk-change checks |
 | `AUTH_TTL` | `120` | Seconds to cache a token verdict |
 
@@ -180,6 +218,17 @@ the full message list with roles, tool definitions with parameter schemas,
 model output, tool calls with formatted arguments, reasoning traces, request
 parameters, and the raw response JSON.
 
+**Long blocks collapse.** Prompts, tool schemas, model output and raw JSON are
+clamped to a few lines, with a summary of what is hidden — `16,118 字符 · 235 行`
+for text, `9 参数 · 1 必填` for a tool schema, `2 个工具调用 · 93 字符` for an
+assistant turn that only called tools. Click to expand; each section header also
+has a 展开全部 / 收起全部 toggle.
+
+The toggle only appears on blocks that genuinely overflow. Whether something
+overflows depends on wrapping, so it is measured against the real layout after
+render rather than guessed from a character count — a short prompt renders in
+full with no toggle at all.
+
 Streamed responses are reassembled: chunks are merged back into content,
 reasoning, and tool calls, so a streaming call reads the same as a
 non-streaming one.
@@ -264,7 +313,21 @@ go vet ./...
 
 `testdata/sample.log` is synthetic and covers the shapes that matter: a plain
 call, a streaming call with tools and reasoning, a multimodal request, an
-upstream error, a truncated body, and non-call noise.
+upstream error, a truncated body, an assistant turn that only calls tools (no
+text content), and non-call noise.
+
+The collapsing behaviour is layout-dependent, so it is verified in a real
+browser rather than a DOM stub:
+
+```bash
+msedge --headless=new --disable-extensions --remote-debugging-port=9222   --user-data-dir=/tmp/prof about:blank &
+go build -o logviewer . && LOG_DIR=./testdata BASE_PATH=/logviewer ./logviewer &
+npm install ws --no-save
+node clamp_test.js 9222 http://localhost:7070/logviewer/
+```
+
+Run it against a real deployment too — the fixture cannot produce a 16,000-char
+prompt or a 26-message conversation, and both change what overflows.
 
 The UI is a single `ui.html` embedded into the binary with `go:embed` — no build
 step, no bundler, no static-file mount to keep in sync. Edit it and rebuild.
