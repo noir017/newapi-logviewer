@@ -7,15 +7,30 @@ services:
     ports:
       - "${LOGVIEWER_PORT:-7071}:7070"
     volumes:
-      # Read-only on purpose: the viewer must never be able to alter the
-      # audit trail it is displaying. Point this at the directory new-api
-      # writes its .log files to.
-      - ${NEWAPI_LOG_DIR:?set NEWAPI_LOG_DIR to new-api's log directory}:/logs:ro
+      # The spool: where new-api writes its .log files.
+      #
+      # NOT read-only, unlike earlier versions of this file. The viewer folds
+      # each finished call into the archive and then deletes the spool file,
+      # which is what keeps streaming chunks - 76% of log volume, ~98% of it a
+      # repeated envelope around a few characters - off disk entirely.
+      #
+      # The audit trail is still append-only: the viewer only ever writes to
+      # ARCHIVE_DIR, and only ever appends. It cannot alter a record it has
+      # already written.
+      #
+      # Best results come from making this a tmpfs in new-api's own compose
+      # file (see the snippet at the bottom); then the chunks never touch a
+      # disk at all.
+      - ${NEWAPI_LOG_DIR:?set NEWAPI_LOG_DIR to new-api's log directory}:/logs
+      # The archive: folded records, gzipped, one file pair per day. This is
+      # the permanent store - back this up, not the spool.
+      - ${ARCHIVE_DIR:-./archive}:/archive
     environment:
       # Timestamps in the log are local wall-clock time with no offset, so
       # this must match the TZ new-api runs with or time filtering will skew.
       - TZ=${TZ:-UTC}
       - LOG_DIR=/logs
+      - ARCHIVE_DIR=/archive
       - NEWAPI_URL=${NEWAPI_URL:-http://new-api:3000}
       - BASE_PATH=${BASE_PATH:-/logviewer}
       - PORT=7070
@@ -24,8 +39,15 @@ services:
       # bearer = require `Authorization: Bearer <new-api access token>`.
       - AUTH_MODE=${AUTH_MODE:-none}
       - REQUIRE_ADMIN=${REQUIRE_ADMIN:-true}
-      - LIMIT_MB=${LIMIT_MB:-40}
-      - CACHE_TTL=${CACHE_TTL:-3}
+      # How long a fully-archived spool file may linger, and the spool's
+      # high-water mark. One hour covers any single agent session, so a
+      # restart can only lose calls that were still streaming.
+      - SPOOL_KEEP_MIN=${SPOOL_KEEP_MIN:-60}
+      - SPOOL_MAX_MB=${SPOOL_MAX_MB:-256}
+      - INGEST_EVERY_SEC=${INGEST_EVERY_SEC:-2}
+      # Full-text search reads bodies, so it is bounded. Listing and filtering
+      # only read the index and are not affected.
+      - SEARCH_DAYS=${SEARCH_DAYS:-7}
     networks:
       - default
 
@@ -35,3 +57,17 @@ services:
 #   default:
 #     name: newapi-net
 #     external: true
+
+# --- recommended: make new-api's log directory a tmpfs -----------------------
+#
+# In new-api's own compose file:
+#
+#   services:
+#     new-api:
+#       tmpfs:
+#         - /app/logs:size=256m,mode=1777
+#
+# Sizing: the spool only has to hold calls that are still in flight plus
+# whatever has not been ingested in the last couple of seconds. 256MB is far
+# more than that at typical rates; the viewer prunes back to SPOOL_MAX_MB
+# regardless, so the tmpfs is a hard ceiling and not a target.

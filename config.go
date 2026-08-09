@@ -9,14 +9,23 @@ import (
 
 type Config struct {
 	LogDir       string
+	ArchiveDir   string
 	NewAPIURL    string
 	Addr         string
 	Base         string
 	AuthMode     string
 	RequireAdmin bool
-	CacheTTL     time.Duration
 	AuthTTL      time.Duration
-	LimitBytes   int64
+
+	// Spool retention. LogDir is a transient buffer (expected to be tmpfs);
+	// once a call is folded into the archive its raw lines have no further use.
+	SpoolKeep     time.Duration
+	SpoolMaxBytes int64
+	IngestEvery   time.Duration
+
+	// SearchDays bounds how far back a full-text search inflates bodies.
+	// Listing and index-only filters are not affected.
+	SearchDays int
 }
 
 func env(k, def string) string {
@@ -56,14 +65,18 @@ func loadConfig() Config {
 	}
 	return Config{
 		LogDir:       env("LOG_DIR", "/logs"),
+		ArchiveDir:   env("ARCHIVE_DIR", "/archive"),
 		NewAPIURL:    env("NEWAPI_URL", "http://new-api:3000"),
 		Addr:         ":" + env("PORT", "7070"),
 		Base:         base,
 		AuthMode:     strings.ToLower(env("AUTH_MODE", "none")),
 		RequireAdmin: envBool("REQUIRE_ADMIN", true),
-		CacheTTL:     time.Duration(envFloat("CACHE_TTL", 3) * float64(time.Second)),
 		AuthTTL:      time.Duration(envFloat("AUTH_TTL", 120) * float64(time.Second)),
-		// tail bound per file; MB in, bytes out
-		LimitBytes: envInt64("LIMIT_MB", 40) * 1024 * 1024,
+		// One hour of spool covers any single agent session, so a restart can
+		// only lose calls that were still in flight.
+		SpoolKeep:     time.Duration(envFloat("SPOOL_KEEP_MIN", 60) * float64(time.Minute)),
+		SpoolMaxBytes: envInt64("SPOOL_MAX_MB", 256) * 1024 * 1024,
+		IngestEvery:   time.Duration(envFloat("INGEST_EVERY_SEC", 2) * float64(time.Second)),
+		SearchDays:    int(envInt64("SEARCH_DAYS", 7)),
 	}
 }

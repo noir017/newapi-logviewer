@@ -87,6 +87,24 @@ type Record struct {
 	StreamToolCalls []ToolCall `json:"stream_tool_calls"`
 	Usage           *Usage     `json:"usage"`
 
+	// Streaming shape, kept after the chunk lines themselves are folded away.
+	// Measured on production, chunk lines are 76% of all log bytes and ~98% of
+	// each one is a repeated envelope, so the archive stores the concatenated
+	// text plus these two numbers instead of the chunks. ChunkCount is what
+	// makes "did this stream at all, and how finely" answerable afterwards;
+	// FirstChunkMS is time-to-first-token, the one latency number the envelope
+	// timestamps were actually good for.
+	ChunkCount   int `json:"chunk_count"`
+	FirstChunkMS int `json:"first_chunk_ms,omitempty"`
+
+	// UnknownChunks samples stream lines the parser could not interpret, with
+	// UnknownCount recording how many there were. Folding is lossy by design,
+	// so an unrecognised provider format must leave evidence rather than
+	// disappear: a non-zero UnknownCount with empty StreamContent is the
+	// signature of a shape this parser has not learned yet.
+	UnknownChunks []string `json:"unknown_chunks,omitempty"`
+	UnknownCount  int      `json:"unknown_count,omitempty"`
+
 	Quota           *int64   `json:"quota"`
 	ModelRatio      *float64 `json:"model_ratio"`
 	CompletionRatio *float64 `json:"completion_ratio"`
@@ -99,6 +117,12 @@ type Record struct {
 	Preview     string   `json:"preview"`
 	Incomplete  bool     `json:"incomplete"`
 
+	// Stalled marks a call archived without its GIN line: the client
+	// disconnected, the gateway restarted, or the response never finished.
+	// Distinct from Incomplete, which means the request body itself was
+	// missing from the log - the two need different words in the UI.
+	Stalled bool `json:"stalled,omitempty"`
+
 	// Agent transcripts arrive as one call carrying the whole conversation, so
 	// the list row needs to say how big it is. Turns = assistant messages,
 	// which is the number of model round-trips the transcript represents.
@@ -106,13 +130,13 @@ type Record struct {
 	Turns     int `json:"turns"`
 	ToolCount int `json:"tool_count"`
 
-	// searchBlob is the lowercased haystack for ?search=. Built once at parse
-	// time so a query does not re-serialize every record on every keystroke.
-	searchBlob string
-
 	// sawChunks records that this call streamed, even after chunks have been
 	// drained by a previous finalize pass.
 	sawChunks bool
+
+	// lastSeen is when a line for this call was last read, used by the
+	// ingester to decide a call has stalled and will never complete.
+	lastSeen time.Time
 
 	chunks []streamChunk // dropped by finalize
 }
@@ -166,6 +190,73 @@ type streamChunk struct {
 		} `json:"delta"`
 	} `json:"choices"`
 	Usage *Usage `json:"usage"`
+
+	// Gemini's native streaming shape, which New API logs verbatim for
+	// Google-family channels rather than translating to OpenAI's.
+	//
+	// This matters far more here than it did when the raw log was kept: folding
+	// discards the chunk lines, so a shape we cannot parse is not merely
+	// displayed oddly, it is lost. Found in production - a gemma-4-31b-it call
+	// archived 17 chunks and 338 completion tokens with an empty body.
+	Candidates []struct {
+		Content struct {
+			Parts []struct {
+				Text string `json:"text"`
+				// Gemini marks chain-of-thought parts; they belong in the
+				// reasoning field, not mixed into the answer.
+				Thought bool `json:"thought"`
+			} `json:"parts"`
+		} `json:"content"`
+	} `json:"candidates"`
+	UsageMetadata *struct {
+		PromptTokenCount     *int `json:"promptTokenCount"`
+		CandidatesTokenCount *int `json:"candidatesTokenCount"`
+		TotalTokenCount      *int `json:"totalTokenCount"`
+		ThoughtsTokenCount   *int `json:"thoughtsTokenCount"`
+	} `json:"usageMetadata"`
+}
+
+// text pulls the visible and reasoning text out of a chunk, whichever wire
+// format it arrived in.
+func (ch *streamChunk) text() (content, reasoning string, tools []ToolCall) {
+	var c, r strings.Builder
+	for _, ci := range ch.Choices {
+		c.WriteString(ci.Delta.Content)
+		r.WriteString(ci.Delta.ReasoningContent)
+		tools = append(tools, ci.Delta.ToolCalls...)
+	}
+	for _, cand := range ch.Candidates {
+		for _, p := range cand.Content.Parts {
+			if p.Thought {
+				r.WriteString(p.Text)
+			} else {
+				c.WriteString(p.Text)
+			}
+		}
+	}
+	return c.String(), r.String(), tools
+}
+
+// usage normalises whichever usage block the chunk carried.
+func (ch *streamChunk) usage() *Usage {
+	if ch.Usage != nil {
+		return ch.Usage
+	}
+	if ch.UsageMetadata == nil {
+		return nil
+	}
+	u := &Usage{
+		PromptTokens:     ch.UsageMetadata.PromptTokenCount,
+		CompletionTokens: ch.UsageMetadata.CandidatesTokenCount,
+		TotalTokens:      ch.UsageMetadata.TotalTokenCount,
+	}
+	return u
+}
+
+// hasPayload reports whether the chunk carried anything worth counting.
+// Keepalives and comment lines decode fine but say nothing.
+func (ch *streamChunk) hasPayload() bool {
+	return len(ch.Choices) > 0 || len(ch.Candidates) > 0 || ch.Usage != nil || ch.UsageMetadata != nil
 }
 
 // ---- parsing ---------------------------------------------------------------
@@ -240,8 +331,10 @@ func parseRange(path string, from int64, partial bool, calls map[string]*Record)
 			touched[rid] = true
 		}
 	}
+	now := time.Now()
 	for rid := range touched {
 		if rec := calls[rid]; rec != nil {
+			rec.lastSeen = now
 			rec.finalize()
 		}
 	}
@@ -300,9 +393,35 @@ func handleLine(line string, calls map[string]*Record) string {
 	case strings.HasPrefix(msg, "upstream response body:"):
 		rec.Response = parseRaw(strings.TrimSpace(msg[len("upstream response body:"):]))
 	case strings.HasPrefix(msg, "stream scanner data:"):
-		if ch, ok := streamChunkOf(msg[len("stream scanner data:"):]); ok {
+		ch, body, ok := streamChunkOf(msg[len("stream scanner data:"):])
+		switch {
+		case ok && ch.hasPayload():
 			rec.chunks = append(rec.chunks, ch)
+		case body != "":
+			// Parsed but empty of anything we recognise, or not JSON at all.
+			// Folding throws the raw lines away, so an unknown provider shape
+			// would vanish without trace - keep a bounded sample instead, which
+			// is enough to see what happened and to teach the parser later.
+			if len(rec.UnknownChunks) < 20 {
+				rec.UnknownChunks = append(rec.UnknownChunks, clip(body, 4000))
+			}
+			rec.UnknownCount++
+			return r[1]
+		default:
+			return r[1] // blank keepalive or [DONE]
 		}
+		// Time-to-first-token, measured before the chunks are folded away.
+		// Second resolution is all the log line carries.
+		if rec.ChunkCount == 0 && rec.TS != "" {
+			if t0, e0 := time.ParseInLocation("2006/01/02 15:04:05", rec.TS, time.Local); e0 == nil {
+				if t1, e1 := time.ParseInLocation("2006/01/02 15:04:05", ts, time.Local); e1 == nil {
+					if d := t1.Sub(t0); d >= 0 {
+						rec.FirstChunkMS = int(d / time.Millisecond)
+					}
+				}
+			}
+		}
+		rec.ChunkCount++
 	case strings.HasPrefix(msg, "fullRequestURL:"):
 		rec.UpstreamURL = strings.TrimSpace(msg[len("fullRequestURL:"):])
 	case strings.HasPrefix(msg, "record consume log:"):
@@ -331,21 +450,23 @@ func get(calls map[string]*Record, rid string) *Record {
 }
 
 // streamChunkOf extracts a delta payload from one `stream scanner data:` line.
-func streamChunkOf(raw string) (streamChunk, bool) {
+// The raw body is returned alongside so a shape we do not understand can still
+// be preserved rather than silently dropped.
+func streamChunkOf(raw string) (streamChunk, string, bool) {
 	var ch streamChunk
 	raw = strings.TrimSpace(raw)
 	// ": x-omniroute-..." comment lines and blank keepalives carry no delta
 	if !strings.HasPrefix(raw, "data:") {
-		return ch, false
+		return ch, "", false
 	}
 	body := strings.TrimSpace(raw[len("data:"):])
 	if body == "" || body == "[DONE]" {
-		return ch, false
+		return ch, "", false
 	}
 	if json.Unmarshal([]byte(body), &ch) != nil {
-		return ch, false
+		return ch, body, false
 	}
-	return ch, true
+	return ch, body, true
 }
 
 func clip(s string, n int) string {
@@ -393,13 +514,12 @@ func (r *Record) finalize() {
 	if len(r.chunks) > 0 {
 		var content, reasoning strings.Builder
 		for _, ch := range r.chunks {
-			for _, c := range ch.Choices {
-				content.WriteString(c.Delta.Content)
-				reasoning.WriteString(c.Delta.ReasoningContent)
-				r.StreamToolCalls = append(r.StreamToolCalls, c.Delta.ToolCalls...)
-			}
-			if ch.Usage != nil {
-				r.Usage = ch.Usage
+			c, rs, tools := ch.text()
+			content.WriteString(c)
+			reasoning.WriteString(rs)
+			r.StreamToolCalls = append(r.StreamToolCalls, tools...)
+			if u := ch.usage(); u != nil {
+				r.Usage = u
 			}
 		}
 		r.StreamContent += content.String()
@@ -465,14 +585,10 @@ func (r *Record) finalize() {
 	}
 	r.Incomplete = r.Request.empty() // truncated/rotated-out request line
 
-	// Haystack for free-text search, matching the Python version's fields.
-	var sb strings.Builder
-	sb.Write(r.Request)
-	sb.Write(r.Response)
-	sb.WriteString(r.StreamContent)
-	sb.WriteString(r.Preview)
-	sb.WriteString(r.RequestID)
-	r.searchBlob = strings.ToLower(sb.String())
+	// No search index is built here. Search reads bodies on demand from the
+	// archive instead: keeping a lowercased copy of every request and response
+	// resident doubled the memory cost of every record, to speed up a query
+	// this viewer serves a few times a day.
 
 	r.chunks = nil
 }
