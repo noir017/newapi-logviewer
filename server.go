@@ -11,13 +11,19 @@ import (
 
 type server struct {
 	cfg   Config
-	st    *store
+	q     *query
+	ing   *ingester
 	auth  *authenticator
 	index []byte
 }
 
 func newServer(cfg Config) *server {
-	return &server{cfg: cfg, st: newStore(cfg), auth: newAuthenticator(cfg), index: indexHTML}
+	arc := newArchive(cfg.ArchiveDir)
+	ing := newIngester(cfg.LogDir, arc, cfg.SpoolKeep, cfg.SpoolMaxBytes)
+	return &server{
+		cfg: cfg, q: newQuery(arc, cfg.SearchDays), ing: ing,
+		auth: newAuthenticator(cfg), index: indexHTML,
+	}
 }
 
 func (s *server) writeJSON(w http.ResponseWriter, code int, v any) {
@@ -42,7 +48,7 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if path == "/healthz" {
-		s.writeJSON(w, 200, map[string]any{"ok": true})
+		s.writeJSON(w, 200, map[string]any{"ok": true, "pending": s.ing.pendingCount()})
 		return
 	}
 
@@ -107,9 +113,6 @@ func toListItem(r *Record) listItem {
 
 func (s *server) handleCalls(w http.ResponseWriter, r *http.Request, user authUser) {
 	q := r.URL.Query()
-	records := s.st.records(q.Get("refresh") == "1")
-	filtered := applyFilters(records, q)
-
 	page := atoiDef(q.Get("page"), 1)
 	if page < 1 {
 		page = 1
@@ -121,38 +124,23 @@ func (s *server) handleCalls(w http.ResponseWriter, r *http.Request, user authUs
 	if size > 200 {
 		size = 200
 	}
-	start := (page - 1) * size
-	if start > len(filtered) {
-		start = len(filtered)
-	}
-	end := start + size
-	if end > len(filtered) {
-		end = len(filtered)
-	}
 
-	models := map[string]bool{}
-	tools := map[string]bool{}
-	for _, rec := range records {
-		if rec.Model != "" {
-			models[rec.Model] = true
-		}
-		for _, t := range rec.ToolNames {
-			tools[t] = true
-		}
+	f := listFilter{
+		Model: q.Get("model"), Status: q.Get("status"), Stream: q.Get("stream"),
+		Tools: q.Get("tools"), ToolName: q.Get("tool_name"), Search: q.Get("search"),
+		ErrorsOnly: q.Get("errors") == "1",
+		Since:      int64(atoiDef(q.Get("since"), 0)),
+		Until:      int64(atoiDef(q.Get("until"), 0)),
 	}
-
-	items := make([]listItem, 0, end-start)
-	for _, rec := range filtered[start:end] {
-		items = append(items, toListItem(rec))
-	}
+	items, total, models, tools := s.q.list(f, page, size)
 
 	s.writeJSON(w, 200, map[string]any{
 		"success":   true,
-		"total":     len(filtered),
+		"total":     total,
 		"page":      page,
 		"page_size": size,
-		"models":    sortedKeys(models),
-		"tools":     sortedKeys(tools),
+		"models":    models,
+		"tools":     tools,
 		"user":      map[string]any{"username": user.Username, "role": user.Role},
 		"auth_mode": s.cfg.AuthMode,
 		"items":     items,
@@ -160,72 +148,11 @@ func (s *server) handleCalls(w http.ResponseWriter, r *http.Request, user authUs
 }
 
 func (s *server) handleCall(w http.ResponseWriter, r *http.Request) {
-	rid := r.URL.Query().Get("id")
-	for _, rec := range s.st.records(false) {
-		if rec.RequestID == rid {
-			s.writeJSON(w, 200, map[string]any{"success": true, "data": rec})
-			return
-		}
+	if rec := s.q.get(r.URL.Query().Get("id")); rec != nil {
+		s.writeJSON(w, 200, map[string]any{"success": true, "data": rec})
+		return
 	}
 	s.writeJSON(w, 404, map[string]any{"success": false, "message": "not found"})
-}
-
-func applyFilters(records []*Record, q map[string][]string) []*Record {
-	get := func(k string) string {
-		if v, ok := q[k]; ok && len(v) > 0 {
-			return v[0]
-		}
-		return ""
-	}
-	model, status, stream := get("model"), get("status"), get("stream")
-	tools, toolName := get("tools"), get("tool_name")
-	search := strings.ToLower(get("search"))
-	errorsOnly := get("errors") == "1"
-	since := int64(atoiDef(get("since"), 0))
-	until := int64(atoiDef(get("until"), 0))
-
-	out := make([]*Record, 0, len(records))
-	for _, r := range records {
-		// only real LLM calls; /api/* health checks have neither body nor billing
-		if r.Request.empty() && r.Billing.empty() {
-			continue
-		}
-		if model != "" && r.Model != model {
-			continue
-		}
-		if status == "ok" && (r.Status == nil || *r.Status != 200) {
-			continue
-		}
-		if status == "err" && (r.Status == nil || *r.Status == 200) {
-			continue
-		}
-		if stream == "1" && !r.IsStream {
-			continue
-		}
-		if stream == "0" && r.IsStream {
-			continue
-		}
-		if tools == "1" && !r.HasTools {
-			continue
-		}
-		if toolName != "" && !contains(r.ToolNames, toolName) {
-			continue
-		}
-		if since > 0 && r.Epoch > 0 && r.Epoch < since {
-			continue
-		}
-		if until > 0 && r.Epoch > 0 && r.Epoch > until {
-			continue
-		}
-		if errorsOnly && len(r.Errors) == 0 {
-			continue
-		}
-		if search != "" && !strings.Contains(r.searchBlob, search) {
-			continue
-		}
-		out = append(out, r)
-	}
-	return out
 }
 
 func atoiDef(s string, def int) int {

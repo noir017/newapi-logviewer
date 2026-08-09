@@ -123,39 +123,43 @@ func TestParseSample(t *testing.T) {
 	})
 
 	t.Run("health checks excluded from the list", func(t *testing.T) {
-		shown := applyFilters(recs, map[string][]string{})
+		q := archivedQuery(t, recs)
+		shown, total, _, _ := q.list(listFilter{}, 1, 100)
 		for _, r := range shown {
 			if r.RequestID == "3fJ7kQmZxR2wLpVnB8sTyHdA" {
 				t.Error("/api/status health check should not be listed")
 			}
 		}
-		if len(shown) != 5 {
-			t.Errorf("shown = %d, want 5", len(shown))
+		if total != 5 {
+			t.Errorf("shown = %d, want 5", total)
 		}
 	})
 
 	t.Run("filters", func(t *testing.T) {
+		q := archivedQuery(t, recs)
 		cases := []struct {
-			q    map[string][]string
+			name string
+			f    listFilter
 			want int
 		}{
-			{map[string][]string{"tools": {"1"}}, 2},
-			{map[string][]string{"tool_name": {"send_email"}}, 1},
-			{map[string][]string{"tool_name": {"nope"}}, 0},
-			{map[string][]string{"stream": {"1"}}, 1},
-			{map[string][]string{"stream": {"0"}}, 4},
-			{map[string][]string{"status": {"ok"}}, 4},
-			{map[string][]string{"status": {"err"}}, 1},
-			{map[string][]string{"errors": {"1"}}, 1},
-			{map[string][]string{"model": {"demo/chat-mini"}}, 2},
-			{map[string][]string{"search": {"berlin"}}, 1},
-			{map[string][]string{"search": {"ZZZ"}}, 0},
-			{map[string][]string{"until": {"1"}}, 0},
-			{map[string][]string{"since": {"1"}}, 5},
+			{"tools", listFilter{Tools: "1"}, 2},
+			{"tool_name", listFilter{ToolName: "send_email"}, 1},
+			{"tool_name missing", listFilter{ToolName: "nope"}, 0},
+			{"stream", listFilter{Stream: "1"}, 1},
+			{"non-stream", listFilter{Stream: "0"}, 4},
+			{"ok", listFilter{Status: "ok"}, 4},
+			{"err", listFilter{Status: "err"}, 1},
+			{"errors", listFilter{ErrorsOnly: true}, 1},
+			{"model", listFilter{Model: "demo/chat-mini"}, 2},
+			{"search hit", listFilter{Search: "berlin"}, 1},
+			{"search miss", listFilter{Search: "ZZZ"}, 0},
+			{"until", listFilter{Until: 1}, 0},
+			{"since", listFilter{Since: 1}, 5},
 		}
 		for _, c := range cases {
-			if got := len(applyFilters(recs, c.q)); got != c.want {
-				t.Errorf("filter %v = %d, want %d", c.q, got, c.want)
+			_, got, _, _ := q.list(c.f, 1, 100)
+			if got != c.want {
+				t.Errorf("filter %s = %d, want %d", c.name, got, c.want)
 			}
 		}
 	})

@@ -118,17 +118,89 @@ All configuration is environment variables. Only `LOG_DIR` matters for a basic r
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `LOG_DIR` | `/logs` | Directory containing New API's `*.log` files |
+| `LOG_DIR` | `/logs` | New API's log **spool**. Disposable; put it on tmpfs |
+| `ARCHIVE_DIR` | `/archive` | Where folded records are kept. **This is the permanent store — back it up** |
 | `PORT` | `7070` | Listen port |
 | `BASE_PATH` | `/logviewer` | URL prefix. Use `/` to serve at the root |
 | `TZ` | container default | **Must match New API's timezone** — see below |
 | `AUTH_MODE` | `none` | `none` or `bearer` |
 | `NEWAPI_URL` | `http://new-api:3000` | Where to validate tokens (`bearer` mode only) |
 | `REQUIRE_ADMIN` | `true` | In `bearer` mode, also require `role >= 100` |
-| `LIMIT_MB` | `40` | Only parse the last N MB of each log file |
+| `SPOOL_KEEP_MIN` | `60` | Minutes an already-archived spool file may linger |
+| `SPOOL_MAX_MB` | `256` | Spool high-water mark; consumed files are dropped oldest-first past it |
+| `INGEST_EVERY_SEC` | `2` | How often the spool is checked for new lines |
+| `SEARCH_DAYS` | `7` | How far back full-text search reads bodies. Listing is unbounded |
 | `LOGVIEWER_ENABLED` | `true` | Combined image only: `false` runs New API alone |
-| `CACHE_TTL` | `3` | Seconds between disk-change checks |
 | `AUTH_TTL` | `120` | Seconds to cache a token verdict |
+
+## Storage
+
+New API with `DEBUG=true` writes a lot, and almost none of it is information.
+Measured on a real gateway (347MB of log):
+
+| Line type | Lines | Bytes | Share |
+|---|---|---|---|
+| streaming chunks | 1,112,619 | 273 MB | **76%** |
+| request bodies | 642 | 85 MB | 24% |
+| everything else | 30,733 | 3.9 MB | <1% |
+
+Each chunk line repeats a ~250-byte envelope around a couple of characters:
+
+```
+... | stream scanner data: data: {"id":"chatcmpl-313b…","choices":[{"index":0,
+"delta":{"content":"第一百","role":"assistant"},"finish_reason":null,…}],
+"created":1786257871,"model":"deepseek…","service_tier":null,
+"system_fingerprint":null,"object":"chat.completion.chunk"}
+```
+
+A further 18% of all bytes are blank keepalive lines carrying nothing.
+
+So the viewer treats `LOG_DIR` as a **spool** and `ARCHIVE_DIR` as the record.
+A finished call's chunks are concatenated into one record — keeping the text,
+the chunk count and time-to-first-token, discarding the repeated envelope — and
+the spool file is deleted. Nothing the UI can display is lost.
+
+Put the spool on tmpfs and those 273MB never reach a disk at all:
+
+```yaml
+services:
+  new-api:
+    tmpfs:
+      - /app/logs:size=256m,mode=1777
+```
+
+Measured end to end on that same gateway: **363MB of raw log → 36MB of archive**,
+and resident memory went from 196MB to 12MB.
+
+### Archive format
+
+One file pair per day, in `ARCHIVE_DIR`:
+
+```
+arc-20260809.jsonl.gz   concatenated gzip members, one per record
+arc-20260809.idx        one JSON line per record: list metadata + offset/length
+```
+
+Both properties matter:
+
+- **Readable without this tool.** gzip members concatenate, and each record ends
+  with a newline inside its member, so `gunzip -c arc-DAY.jsonl.gz | jq -c .`
+  works on the whole day.
+- **Randomly accessible.** The `.idx` carries each member's byte offset, so
+  opening one record inflates that record alone. Per-record framing costs ~16%
+  versus compressing the day as one stream — cheap for O(1) detail reads.
+
+The archive is append-only. Correcting a record means appending a new version of
+it; the reader takes the last one. That is what `-reingest` does after a parser
+fix:
+
+```bash
+# re-parse raw logs into a scratch archive, then graft the fixes onto the live one
+logviewer -reingest -src /scratch/archive -day 20260809 [-only <request-id>,…]
+```
+
+Existing bytes are never rewritten, so a failure part-way leaves every
+previously-readable record exactly as readable as before.
 
 ### Timezone
 

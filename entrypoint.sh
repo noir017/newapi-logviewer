@@ -10,14 +10,18 @@
 #   2. Fail-fast. If either process dies the container must exit, so the
 #      restart policy applies. A plain `a & b & wait` keeps the container
 #      "up" with half of it dead, and the healthcheck is the only hint.
-#   3. Least privilege. new-api needs root (it writes /data and the log dir);
-#      the viewer only ever reads, so it drops to nobody.
+#   3. Least privilege. new-api needs root (it writes /data); the viewer needs
+#      to read the spool and delete files from it once they are archived, so it
+#      owns the spool directory rather than running as root.
 set -uo pipefail
 
 : "${LOGVIEWER_ENABLED:=true}"
 : "${LOG_DIR:=/app/logs}"
+: "${ARCHIVE_DIR:=/app/archive}"
 : "${LOGVIEWER_PORT:=7070}"
 : "${BASE_PATH:=/logviewer}"
+: "${VIEWER_UID:=65534}"
+: "${VIEWER_GID:=65534}"
 
 newapi_pid=""
 viewer_pid=""
@@ -43,20 +47,34 @@ terminate() {
 }
 trap terminate TERM INT
 
-# The viewer reads the log directory, so it has to exist before it starts;
-# new-api would otherwise create it on first write.
-mkdir -p "$LOG_DIR"
+# LOG_DIR is a spool, not the record of what happened. new-api writes every
+# streaming chunk there - 76% of its log volume, ~98% of it a repeated envelope
+# around a few characters - and the viewer folds finished calls into ARCHIVE_DIR
+# and deletes the spool file. Mount LOG_DIR on tmpfs so that traffic never
+# reaches a disk; ARCHIVE_DIR is the part that must be persistent.
+mkdir -p "$LOG_DIR" "$ARCHIVE_DIR"
 
 if [ "$LOGVIEWER_ENABLED" = "true" ]; then
+  # The viewer deletes spool files it has archived, so it needs write access to
+  # both directories. Granting ownership is narrower than running it as root:
+  # it still cannot touch /data or anything else new-api owns.
+  #
+  # new-api runs as root and creates its log file 0644, which a non-owner can
+  # read but not unlink - unlinking is a directory permission, so owning the
+  # DIRECTORY is what matters and the files themselves stay root's.
+  chown "$VIEWER_UID:$VIEWER_GID" "$LOG_DIR" "$ARCHIVE_DIR" 2>/dev/null || \
+    log "WARNING: could not chown $LOG_DIR/$ARCHIVE_DIR; spool pruning will fail"
+
   # setpriv, not su: no PAM, no intermediate shell, so the viewer is a direct
   # child of this script and `wait -n` sees it exit.
   # --init-groups would need a valid supplementary group set; nobody has one
-  # group and read-only access is all it needs.
-  LOG_DIR="$LOG_DIR" PORT="$LOGVIEWER_PORT" BASE_PATH="$BASE_PATH" \
-    setpriv --reuid=65534 --regid=65534 --clear-groups \
+  # group and this is all the access it needs.
+  LOG_DIR="$LOG_DIR" ARCHIVE_DIR="$ARCHIVE_DIR" PORT="$LOGVIEWER_PORT" BASE_PATH="$BASE_PATH" \
+    setpriv --reuid="$VIEWER_UID" --regid="$VIEWER_GID" --clear-groups \
     /usr/local/bin/logviewer &
   viewer_pid=$!
-  log "log viewer started (pid $viewer_pid, uid 65534) on :$LOGVIEWER_PORT$BASE_PATH"
+  log "log viewer started (pid $viewer_pid, uid $VIEWER_UID) on :$LOGVIEWER_PORT$BASE_PATH"
+  log "spool=$LOG_DIR archive=$ARCHIVE_DIR"
 else
   log "log viewer disabled (LOGVIEWER_ENABLED=$LOGVIEWER_ENABLED)"
 fi

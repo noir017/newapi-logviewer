@@ -22,18 +22,32 @@ var indexHTML []byte
 
 func main() {
 	cfg := loadConfig()
+	log.SetOutput(os.Stdout)
+	log.SetFlags(0)
+
+	// Maintenance mode: apply a parser fix to already-archived records and
+	// exit, without starting a server.
+	if runReingest(cfg) {
+		return
+	}
+
+	handler := newServer(cfg)
 	srv := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           newServer(cfg),
+		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      120 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
-	log.SetOutput(os.Stdout)
-	log.SetFlags(0)
-	log.Printf("log viewer on %s base=%s logs=%s newapi=%s auth=%s",
-		cfg.Addr, cfg.Base, cfg.LogDir, cfg.NewAPIURL, cfg.AuthMode)
+
+	// The ingester is the only thing that reads New API's raw log. It folds
+	// finished calls into the archive and lets the spool be discarded, which is
+	// what keeps the streaming chunks - 76% of log volume - off disk entirely.
+	go handler.ing.Run(cfg.IngestEvery)
+
+	log.Printf("log viewer on %s base=%s spool=%s archive=%s auth=%s",
+		cfg.Addr, cfg.Base, cfg.LogDir, cfg.ArchiveDir, cfg.AuthMode)
 	if err := srv.ListenAndServe(); err != nil {
 		log.Fatal(err)
 	}

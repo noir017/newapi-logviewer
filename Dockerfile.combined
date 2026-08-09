@@ -26,7 +26,12 @@ COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/logviewer
 
 # new-api's own defaults, restated because we replace its entrypoint.
+#
+# LOG_DIR is a spool and belongs on tmpfs (see docker-compose.yml): streaming
+# chunk lines are 76% of what new-api writes and never need to reach a disk.
+# ARCHIVE_DIR holds the folded records and is the only path that must persist.
 ENV LOG_DIR=/app/logs \
+    ARCHIVE_DIR=/app/archive \
     LOGVIEWER_PORT=7070 \
     BASE_PATH=/logviewer \
     LOGVIEWER_ENABLED=true

@@ -441,6 +441,7 @@ function detail(r){
     <span class="rid mono">${esc(r.request_id)}</span>
   </div>
   ${r.incomplete ? '<div class="warnbox">⚠ 该请求的请求体不在当前日志文件中（可能已轮转），仅显示可得字段。</div>' : ''}
+  ${r.stalled ? '<div class="warnbox">⚠ 该调用没有收到结束记录，可能是客户端断开或网关重启。以下为已捕获的部分内容。</div>' : ''}
   <div class="kv">
     <div><b>时间</b><span>${esc(r.ts || '')}</span></div>
     <div><b>耗时</b><span>${esc(r.latency || '—')}</span></div>

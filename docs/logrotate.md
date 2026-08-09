@@ -1,83 +1,82 @@
-# Rotating New API's debug logs
+# Log retention
 
-`DEBUG=true` is what makes this viewer useful, and also what makes New API's log
-directory grow without bound. New API does not rotate these files itself.
+Read [Storage](../README.md#storage) first: with the folding archive in place,
+New API's `*.log` directory is a **spool**, not a record. The permanent copy is
+`ARCHIVE_DIR`, and it is ~10x smaller than the raw log it came from.
 
-The content is not incidental: every prompt, every response, every tool argument,
-in plaintext. Treat the directory as sensitive and cap its size.
+That changes what rotation is for.
 
-## logrotate
+## You probably do not need logrotate
+
+If `LOG_DIR` is on tmpfs and the viewer is running, the spool manages itself:
+each finished call is folded into the archive and its spool file is deleted once
+consumed (`SPOOL_KEEP_MIN`, `SPOOL_MAX_MB`). Nothing accumulates.
+
+Check it is working:
+
+```bash
+docker exec <container> df -h /app/logs      # should stay near-empty
+curl -s localhost:7071/logviewer/healthz     # "pending" = calls still in flight
+```
+
+A spool that keeps growing means ingest has stopped. The usual cause is
+permissions: the viewer runs as `nobody` and needs to unlink files from the
+spool directory, which is a permission on the *directory*, not the files. The
+combined image's entrypoint chowns it for exactly this reason.
+
+## If you keep the raw logs on disk
+
+Some people want the untouched log as well — the archive is lossy by design
+(chunk envelopes are discarded), so byte-level fidelity means keeping the
+original.
+
+Compress it; do not delete it. The raw log compresses ~41x with gzip and ~73x
+with xz, because it is overwhelmingly repeated envelope:
+
+```bash
+# hourly: compress every log New API is no longer writing to
+0 * * * * cd /path/to/logs && \
+  newest=$(ls -t *.log 2>/dev/null | head -1); \
+  for f in *.log; do \
+    [ "$f" = "$newest" ] && continue; \
+    gzip -6 "$f"; \
+  done
+```
+
+Skipping the newest file matters: New API holds it open and does not reopen on
+`SIGHUP`, so compressing (or renaming) it under the process leaves it writing to
+a deleted inode and the log silently stops.
+
+For a `logrotate` rule, the same constraint applies — and note there is no
+`rotate N`, deliberately:
 
 ```
-# /etc/logrotate.d/new-api
 /path/to/new-api/logs/*.log {
     daily
-    rotate 7
     maxsize 200M
     missingok
     notifempty
     compress
     delaycompress
     copytruncate
+    # no `rotate`/`maxage`: nothing here should ever be deleted
 }
 ```
 
-`copytruncate` matters: New API holds the file open and does not reopen on
-`SIGHUP`, so a plain `create` rotation leaves it writing to a deleted inode and
-the log silently stops.
+`copytruncate` for the open-file-handle reason above.
 
-Test the rule before trusting it:
-
-```bash
-logrotate -d /etc/logrotate.d/new-api    # dry run, prints what it would do
-logrotate -f /etc/logrotate.d/new-api    # force one rotation
-```
-
-## Interaction with the viewer
-
-The viewer globs `*.log`, so it stops seeing rotated files once they are renamed
-to `.log.1` or compressed. That is usually what you want — but it means
-**rotation is also retention**: whatever rotates out disappears from the UI.
-
-Size the rotation to the window you actually want to browse.
-
-`LIMIT_MB` (default 40) separately caps how much of *each* file is parsed, from
-the end. If a single log exceeds it, older entries in that file are invisible
-even before rotation. Raise it if you rotate infrequently:
-
-```yaml
-environment:
-  - LIMIT_MB=200
-```
-
-Parsing is linear in bytes read, so this trades startup and refresh latency for
-history.
-
-## Hosts without logrotate
-
-A cron job is enough:
-
-```bash
-# keep the last 3 files, rotate when the active log passes 200MB
-0 * * * * cd /path/to/new-api/logs && \
-  for f in *.log; do \
-    [ $(stat -c%s "$f") -gt 209715200 ] && cp "$f" "$f.$(date +%s).old" && : > "$f"; \
-  done; \
-  ls -t *.old 2>/dev/null | tail -n +4 | xargs -r rm
-```
-
-`: > "$f"` truncates in place rather than deleting, for the same open-file-handle
-reason as `copytruncate`.
+Compressed files are invisible to the viewer, which globs `*.log`. That is fine:
+the records are already in the archive. If you ever need one back, decompress it
+into a scratch directory and point a second viewer at it, or use `-reingest` to
+graft its records onto the live archive.
 
 ## Disabling body logging
 
-If you only need this occasionally, leave `DEBUG=false` normally and flip it on
-when debugging:
+`DEBUG=true` is what makes this viewer useful. If you only want it occasionally,
+leave it off and flip it on when debugging — nothing is captured retroactively.
 
-```bash
-docker compose exec new-api sh -c 'echo restart with DEBUG=true'
-# edit compose, then:
-docker compose up -d new-api
-```
+## Sensitivity
 
-Nothing is logged retroactively — you only capture calls made while it was on.
+The content is every prompt, every response, every tool argument, in plaintext.
+Both the spool and the archive deserve the same care as a database backup, and
+`AUTH_MODE=none` means anyone who reaches the URL reads all of it.
