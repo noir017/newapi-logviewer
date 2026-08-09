@@ -57,7 +57,14 @@ async function main(){
     }
   })()`);
   check('selected a call to inspect', !!picked, String(picked).replace(/\s+/g,' ').slice(0, 50));
-  await new Promise(r => setTimeout(r, 1000));
+  await new Promise(r => setTimeout(r, 2000));
+  // Content now lives inside collapsible cards. Open them all so the clamp
+  // assertions below see real layout rather than a display:none subtree.
+  await evalJS(`(() => {
+    document.querySelectorAll('#detail .card:not(.open) .chd').forEach(h => h.click());
+    return true;
+  })()`);
+  await new Promise(r => setTimeout(r, 900));
 
   const state1 = await evalJS(`(() => {
     const clamps = [...document.querySelectorAll('#detail .clamp')];
@@ -122,8 +129,12 @@ async function main(){
 
   // --- expand all in a section ---
   const all = await evalJS(`(() => {
-    const t = document.querySelector('#detail .toggle[data-all]');
-    const sect = t.closest('section');
+    // pick a scope that actually contains overflowing blocks
+    const t = [...document.querySelectorAll('#detail .toggle[data-all]')].find(x => {
+      const sc = x.closest('.card') || x.closest('section');
+      return [...sc.querySelectorAll('.exp')].some(b => !b.hidden);
+    }) || document.querySelector('#detail .toggle[data-all]');
+    const sect = t.closest('.card') || t.closest('section');
     t.click();
     const btns = [...sect.querySelectorAll('.exp')].filter(b => !b.hidden);
     return {label: t.textContent.trim(), total: btns.length,
@@ -134,8 +145,9 @@ async function main(){
   check('expand-all label flips to 收起全部', all.label === '收起全部', all.label);
 
   const collapseAll = await evalJS(`(() => {
-    const t = document.querySelector('#detail .toggle[data-all]');
-    const sect = t.closest('section');
+    const t = [...document.querySelectorAll('#detail .toggle[data-all]')].find(x =>
+      x.textContent.trim() === '收起全部') || document.querySelector('#detail .toggle[data-all]');
+    const sect = t.closest('.card') || t.closest('section');
     t.click();
     const btns = [...sect.querySelectorAll('.exp')].filter(b => !b.hidden);
     return {label: t.textContent.trim(), open: btns.filter(b => b.classList.contains('open')).length};
@@ -145,23 +157,32 @@ async function main(){
         `${collapseAll.open} open, label "${collapseAll.label}"`);
 
   // --- short content must NOT get a toggle ---
+  // Pick the smallest row that actually HAS a conversation: a record whose
+  // request body was truncated renders no message cards at all, which would
+  // make this assertion vacuous rather than meaningful.
   await evalJS(`(() => {
-    // smallest row = shortest prompt; its prompt section must not clamp
     const rows = [...document.querySelectorAll('.item')];
-    const target = rows.map(r => [r.textContent.length, r]).sort((a,b) => a[0]-b[0])[0][1];
-    target.click(); return true;
+    const scored = rows.map(r => [r.textContent.length, r]).sort((a,b) => a[0]-b[0]);
+    for (const [, r] of scored){
+      r.click();
+      if (document.querySelectorAll('#detail .card').length) return true;
+    }
+    return false;
   })()`);
-  await new Promise(r => setTimeout(r, 400));
+  await new Promise(r => setTimeout(r, 1500));
+  await evalJS(`(() => {
+    document.querySelectorAll('#detail .card:not(.open) .chd').forEach(h => h.click());
+    return true;
+  })()`);
+  await new Promise(r => setTimeout(r, 600));
   const short = await evalJS(`(() => {
-    // Assert on the shortest MESSAGE, not the shortest row: a row can be
-    // short overall while still containing one long message.
-    const msgs = [...document.querySelectorAll('#detail section')]
-      .find(s => s.querySelector('h3')?.textContent === '提示词')
-      ?.querySelectorAll('.msg') || [];
+    // Assert on the shortest MESSAGE: a row can be short overall while still
+    // containing one long message.
+    const msgs = [...document.querySelectorAll('#detail .msg')];
     let best = null;
     for (const m of msgs){
       const c = m.querySelector('.clamp');
-      if (!c) continue;
+      if (!c || !c.scrollHeight) continue;
       if (!best || c.scrollHeight < best.h) best = {h: c.scrollHeight, m, c};
     }
     if (!best) return null;
@@ -173,7 +194,7 @@ async function main(){
   check('the shortest message is not clamped',
         short && !short.clamped && !short.hasToggle,
         short ? `${short.h}px clamped=${short.clamped} toggle=${short.hasToggle}` : 'no message found');
-  check('short message still renders text', short && (short.text || '').length > 0,
+  check('short message still renders text', !!(short && (short.text || '').length > 0),
         String(short && short.text).slice(0, 40));
 
   // --- no console errors anywhere ---

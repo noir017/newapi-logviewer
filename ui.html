@@ -125,6 +125,36 @@ pre.j{background:#0d1017;border:1px solid var(--line);border-radius:7px;padding:
 .usage b{display:block;font-size:10px;color:var(--dim2);font-weight:500;text-transform:uppercase;letter-spacing:.4px}
 .usage span{font-size:15px;font-weight:600}
 .usage .hl span{color:var(--warn)}
+/* ---- top-level cards ----
+   An agent transcript is one call carrying 130+ messages. Flat rendering is
+   unreadable, so the conversation is grouped into per-turn cards and the tool
+   catalogue into one collapsible card, both collapsible as a unit. */
+.card{border:1px solid var(--line);border-radius:9px;margin-bottom:8px;
+  background:var(--panel);overflow:hidden}
+.card>.chd{display:flex;align-items:center;gap:9px;padding:8px 11px;cursor:pointer;
+  user-select:none;background:var(--panel2);border-bottom:1px solid transparent}
+.card>.chd:hover{background:#20252f}
+.card.open>.chd{border-bottom-color:var(--line)}
+.card>.chd .ar{font-size:9px;color:var(--dim2);transition:transform .12s;flex:none}
+.card.open>.chd .ar{transform:rotate(90deg)}
+.card>.chd .ct{font-weight:600;font-size:12.5px;white-space:nowrap}
+.card>.chd .cs{color:var(--dim2);font-size:11.5px;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap;min-width:0;flex:1}
+.card>.cbd{padding:10px 11px;display:none}
+.card.open>.cbd{display:block}
+/* turn cards nest one level in; tint the rail by what the turn did */
+.card.turn>.chd{background:#161a22}
+.card.turn{border-color:#222732}
+.turn .idx{color:var(--dim2);font-size:11px;font-variant-numeric:tabular-nums;flex:none}
+.turn .tt{display:flex;gap:4px;flex-wrap:wrap;min-width:0}
+.turn .tt .tag{cursor:default}
+.card.sysmsg{border-left:3px solid var(--sys)}
+.card.usermsg{border-left:3px solid var(--usr)}
+.card.turn{border-left:3px solid var(--asst)}
+.cardgroup{margin-bottom:6px}
+.tools-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:6px}
+.exp-all{margin-left:auto;flex:none}
+
 .empty{text-align:center;color:var(--dim2);padding:40px 20px;font-size:12.5px}
 .warnbox{background:#2a1f10;border:1px solid #4a3a12;color:#e3b341;padding:8px 11px;
   border-radius:7px;font-size:12px;margin-bottom:12px}
@@ -206,7 +236,7 @@ pre.j{background:#0d1017;border:1px solid var(--line);border-radius:7px;padding:
 const $ = s => document.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c =>
   ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-let page = 1, state = {}, selected = null, timer = null;
+let page = 1, state = {}, selected = null, timer = null, detailCache = null;
 
 function hl(obj){
   const j = JSON.stringify(obj, null, 2);
@@ -266,25 +296,6 @@ function clamp(inner, stat, opts){
     </div></div>`;
 }
 
-function msgHtml(m){
-  const role = esc(m.role || '?');
-  const calls = m.tool_calls || [];
-  let extra = calls.map(tc => `
-    <div class="tc"><div class="nm">⚒ ${esc(tc.function?.name)}</div>
-    <pre class="j">${hl(safeArgs(tc.function?.arguments))}</pre></div>`).join('');
-  const txt = contentText(m.content);
-  const body = `${txt ? `<div class="txt">${esc(txt)}</div>` : ''}${extra}`;
-  // An assistant turn is often tool calls with no text at all; reporting
-  // "0 字符" there is worse than useless. Summarize what the block holds.
-  const parts = [];
-  if (txt) parts.push(statOf(txt));
-  if (calls.length) parts.push(`${calls.length} 个工具调用`
-    + ` · ${statOf(calls.map(c => c.function?.arguments || '').join(''))}`);
-  if (!parts.length) parts.push('空');
-  return `<div class="msg ${role}"><div class="role">${role}</div>
-    ${clamp(body, parts.join(' · '), {h: 76})}</div>`;
-}
-
 function toolsHtml(tools, called){
   return tools.map(t => {
     const f = t.function || t, p = f.parameters || {},
@@ -303,6 +314,75 @@ function toolsHtml(tools, called){
       <div class="nm">⚒ ${esc(f.name)}${used ? '<span class="used-badge">本次调用</span>' : ''}</div>
       ${clamp(body, stat, {h: 66, fade: used ? '#171308' : '#12151b'})}</div>`;
   }).join('');
+}
+
+// ---- cards ----------------------------------------------------------------
+// A collapsible top-level container. `open` decides the initial state: the
+// tool catalogue and the long middle of a transcript start closed, because on
+// a 130-message agent call they are what makes the page unreadable.
+let cardSeq = 0;
+function card(title, summary, body, opts){
+  const o = opts || {};
+  const id = 'k' + (++cardSeq);
+  return `<div class="card ${o.cls || ''} ${o.open ? 'open' : ''}" id="${id}">
+    <div class="chd" data-card="${id}">
+      <span class="ar">▶</span>
+      <span class="ct">${title}</span>
+      <span class="cs">${summary}</span>
+      ${o.right || ''}
+    </div>
+    <div class="cbd">${body}</div>
+  </div>`;
+}
+
+// Group a flat message list into turns: an assistant message plus the tool
+// results it triggered. system/user messages stand alone as their own cards.
+function groupTurns(msgs){
+  const out = [];
+  let cur = null;
+  for (const m of msgs){
+    if (m.role === 'assistant'){
+      cur = {kind: 'turn', assistant: m, results: []};
+      out.push(cur);
+    } else if (m.role === 'tool' && cur){
+      cur.results.push(m);
+    } else {
+      cur = null;
+      out.push({kind: 'msg', msg: m});
+    }
+  }
+  return out;
+}
+
+function turnCard(t, n){
+  const a = t.assistant;
+  const calls = a.tool_calls || [];
+  const txt = contentText(a.content);
+  const names = {};
+  calls.forEach(c => { const k = c.function?.name || '?'; names[k] = (names[k] || 0) + 1; });
+  const chips = Object.entries(names).map(([k, v]) =>
+    `<span class="tag tl">⚒${esc(k)}${v > 1 ? ' ×' + v : ''}</span>`).join('');
+  const resChars = t.results.reduce((s, r) => s + [...contentText(r.content)].length, 0);
+  const summary = `<span class="tt">${chips}</span>`;
+  const right = `<span class="cs" style="flex:none;text-align:right">${
+    (txt ? statOf(txt) + ' · ' : '')}${t.results.length} 结果 · ${resChars.toLocaleString()} 字符</span>`;
+
+  const body = `
+    ${txt ? `<div class="msg assistant"><div class="role">assistant</div>
+      ${clamp(`<div class="txt">${esc(txt)}</div>`, statOf(txt), {h: 76})}</div>` : ''}
+    ${calls.map(tc => {
+      const args = safeArgs(tc.function?.arguments);
+      return `<div class="tc"><div class="nm">⚒ ${esc(tc.function?.name)}</div>
+        ${clamp(`<pre class="j">${hl(args)}</pre>`, statJSON(args), {h: 76, fade: '#1a1710'})}</div>`;
+    }).join('')}
+    ${t.results.map(r => {
+      const rt = contentText(r.content);
+      return `<div class="msg tool"><div class="role">tool result</div>
+        ${clamp(`<div class="txt">${esc(rt)}</div>`, statOf(rt), {h: 76})}</div>`;
+    }).join('')}`;
+
+  return card(`<span class="idx">#${n}</span> 调用`, summary, body,
+              {cls: 'turn', right});
 }
 
 function usageHtml(u){
@@ -334,8 +414,24 @@ function detail(r){
   // total prompt size across all messages - the number that tells you whether
   // a request was bloated, without expanding every message to count
   const promptChars = msgs.reduce((n, m) => n + [...contentText(m.content)].length, 0);
-  const roleCount = msgs.reduce((a, m) => (a[m.role] = (a[m.role] || 0) + 1, a), {});
-  const roleSummary = Object.entries(roleCount).map(([k, v]) => `${k}×${v}`).join(' ');
+
+  // Group the transcript into cards. system/user messages stand alone; each
+  // assistant message and the tool results it produced form one turn card.
+  const groups = groupTurns(msgs);
+  const turns = groups.filter(g => g.kind === 'turn');
+  let turnNo = 0;
+  // A 16k-char system prompt open by default fills the screen before the
+  // first turn is even visible, so only short standalone messages start open.
+  const OPEN_CHARS = 400;
+  const convHtml = groups.map(g => {
+    if (g.kind === 'turn') return turnCard(g, ++turnNo);
+    const m = g.msg, t = contentText(m.content);
+    const cls = m.role === 'system' ? 'sysmsg' : m.role === 'user' ? 'usermsg' : '';
+    return card(esc(m.role), statOf(t),
+      `<div class="msg ${esc(m.role)}">${clamp(`<div class="txt">${esc(t)}</div>`,
+        statOf(t), {h: 84})}</div>`,
+      {cls, open: [...t].length <= OPEN_CHARS});
+  }).join('');
 
   return `
   <div class="dh">
@@ -357,17 +453,20 @@ function detail(r){
     <div style="grid-column:1/-1"><b>上游地址</b><span>${esc(r.upstream_url || '—')}</span></div>
   </div>
   ${sec('用量', '', usageHtml(r.usage))}
-  ${sec('提示词',
-      `${msgs.length} 条 · ${promptChars.toLocaleString()} 字符${roleSummary ? ' · ' + roleSummary : ''}`,
-      msgs.map(msgHtml).join(''), msgs.length > 0)}
-  ${sec('Tools 定义', (req.tools || []).length + ' 个'
-      + (r.called_tools?.length ? ` · 调用 ${r.called_tools.length}` : ''),
-      req.tools ? toolsHtml(req.tools, r.called_tools) : '', (req.tools || []).length > 0)}
-  ${sec('模型返回', content ? statOf(content) : '', content
+  ${(req.tools || []).length ? sec('可用工具', '', card('Tools 定义',
+      `${req.tools.length} 个可用${r.called_tools?.length ? ` · 本次调用 ${r.called_tools.length}` : ''}`,
+      `<div class="tools-grid">${toolsHtml(req.tools, r.called_tools)}</div>`,
+      // closed by default: 20 tool schemas ahead of the conversation is the
+      // main thing that buries the actual content
+      {open: false, right: '<span class="toggle exp-all" data-all="1">展开全部</span>'})) : ''}
+  ${msgs.length ? sec('会话',
+      `${msgs.length} 条消息 · ${turns.length} 次调用 · ${promptChars.toLocaleString()} 字符`,
+      convHtml, true) : ''}
+  ${sec('本次模型返回', content ? statOf(content) : '', content
       ? `<div class="msg assistant"><div class="role">assistant</div>
          ${clamp(`<div class="txt">${esc(content)}</div>`, statOf(content), {h: 84})}</div>`
       : (tcs.length ? '' : '<div class="msg assistant"><div class="role">assistant</div><div class="txt" style="color:var(--dim2)">（无文本内容）</div></div>'))}
-  ${sec('工具调用', tcs.length + ' 次', tcs.map(tc => {
+  ${sec('本次工具调用', tcs.length + ' 次', tcs.map(tc => {
       const args = safeArgs(tc.function?.arguments);
       return `<div class="tc"><div class="nm">⚒ ${esc(tc.function?.name)}</div>
        ${clamp(`<pre class="j">${hl(args)}</pre>`, statJSON(args), {h: 84, fade: '#1a1710'})}</div>`;
@@ -392,6 +491,11 @@ function wireClamps(root){
   root.querySelectorAll('.clamp').forEach(el => {
     const btn = root.querySelector(`.exp[data-for="${el.id}"]`);
     if (!btn) return;
+    // A collapsed card's children have no layout: scrollHeight reads 0 and we
+    // would delete a toggle the content actually needs. Those are measured
+    // when the card is first opened instead.
+    const hidden = el.closest('.card:not(.open)');
+    if (hidden) return;
     const limit = parseInt(el.style.getPropertyValue('--clh')) || 84;
     if (el.scrollHeight <= limit + 8){
       // fits already - drop the clamp entirely rather than showing a
@@ -413,11 +517,17 @@ function setExpanded(btn, open){
 }
 
 function item(r){
-  const tools = (r.tool_names || []).map(t => {
-    const used = (r.called_tools || []).includes(t);
-    return `<span class="tag ${used ? 'cl' : 'tl'}" data-tool="${esc(t)}"
-      title="${used ? '本次被调用' : '已定义'} · 点击筛选">⚒${esc(t)}</span>`;
-  }).join('');
+  // Tool NAMES are not shown here any more: an agent request defines 20 of
+  // them and the chips swamped the row. The count is the useful signal; the
+  // detail pane lists the names.
+  const nTools = r.tool_count || (r.tool_names || []).length;
+  const toolTag = nTools
+    ? `<span class="tag tl" data-tools="1" title="含 ${nTools} 个工具定义 · 点击筛选">⚒${nTools}</span>`
+    : '';
+  // A single call can carry a whole agent transcript, so say how many model
+  // round-trips are in it.
+  const turnTag = (r.turns || 0) > 1
+    ? `<span class="tag st" title="${r.msg_count} 条消息">↻${r.turns} 次调用</span>` : '';
   return `<div class="item ${selected === r.request_id ? 'sel' : ''}" data-id="${esc(r.request_id)}">
     <div class="i1">
       <span class="t">${esc((r.ts || '').slice(5, 16))}</span>
@@ -426,11 +536,12 @@ function item(r){
     </div>
     <div class="i2">${esc(r.preview || '（无提示词）')}</div>
     <div class="i3">
+      ${turnTag}
       ${r.is_stream ? '<span class="tag st">流</span>' : ''}
       ${r.errors?.length ? '<span class="tag err">报错</span>' : ''}
       <span class="tag">${fmtQ(r.quota)}</span>
       ${r.latency ? `<span class="tag">${esc(r.latency)}</span>` : ''}
-      ${tools}
+      ${toolTag}
     </div>
   </div>`;
 }
@@ -479,8 +590,11 @@ async function load(keepSel){
   $('#list').innerHTML = d.items.length ? d.items.map(item).join('')
     : '<div class="empty">没有匹配的调用记录</div>';
   if (!keepSel) return;
+  // Keep the open record on screen across refreshes. The list carries only
+  // summaries now, so re-render from the cached full record rather than
+  // trying (and failing) to find the bodies in d.items.
   const still = d.items.find(r => r.request_id === selected);
-  if (still) renderDetail(still);
+  if (still && detailCache && detailCache.request_id === selected) renderDetail(detailCache);
 }
 
 // Single place that paints the right pane, so clamp wiring can never be
@@ -489,34 +603,76 @@ function renderDetail(rec){
   const pane = $('#detail');
   pane.innerHTML = detail(rec);
   wireClamps(pane);
+  // Cards rendered open were measurable just now; mark them so opening and
+  // re-closing does not re-measure (and re-hide) their toggles.
+  pane.querySelectorAll('.card.open').forEach(c => c.dataset.wired = '1');
 }
 
-$('#list').addEventListener('click', e => {
-  const tag = e.target.closest('[data-tool]');
-  if (tag){                                    // click a tool chip -> filter by it
-    $('#toolsel').value = tag.dataset.tool;
+$('#list').addEventListener('click', async e => {
+  const tag = e.target.closest('[data-tools]');
+  if (tag){                       // click the ⚒N chip -> filter to calls with tools
+    $('#tools').checked = true;
     page = 1; load(true); return;
   }
   const el = e.target.closest('.item'); if (!el) return;
   selected = el.dataset.id;
   document.querySelectorAll('.item.sel').forEach(n => n.classList.remove('sel'));
   el.classList.add('sel');
-  const rec = state.items.find(r => r.request_id === selected);
-  renderDetail(rec);
-  $('#detail').scrollTop = 0;
+  // The list only carries summaries - one agent record is ~1MB of bodies, so
+  // shipping 30 of them per page made the list unusable. Fetch on demand.
+  await showDetail(selected);
 });
 
-// expand/collapse: individual blocks, and per-section "expand all"
+async function showDetail(rid){
+  const pane = $('#detail');
+  pane.innerHTML = '<div class="spin">加载中…</div>';
+  let rec;
+  try {
+    const res = await fetch('api/call?id=' + encodeURIComponent(rid), {credentials: 'same-origin'});
+    const d = await res.json();
+    if (!d.success) throw new Error(d.message || '加载失败');
+    rec = d.data;
+  } catch(err){
+    pane.innerHTML = `<div class="empty">加载失败：${esc(err.message)}</div>`;
+    return;
+  }
+  if (selected !== rid) return;   // a newer click won while this was in flight
+  detailCache = rec;
+  renderDetail(rec);
+  pane.scrollTop = 0;
+}
+
+// expand/collapse: cards, individual clamped blocks, and per-section "all"
 $('#detail').addEventListener('click', e => {
+  // card header toggles the whole card. Clamps inside are measured lazily,
+  // the first time the card actually becomes visible - measuring a display:none
+  // subtree returns 0 and every toggle would be wrongly hidden.
+  const chd = e.target.closest('.chd');
+  if (chd && !e.target.closest('[data-all]')){
+    const c = document.getElementById(chd.dataset.card);
+    c.classList.toggle('open');
+    if (c.classList.contains('open') && !c.dataset.wired){
+      c.dataset.wired = '1';
+      wireClamps(c);
+    }
+    return;
+  }
+
   const btn = e.target.closest('.exp');
   if (btn){ setExpanded(btn, !btn.classList.contains('open')); return; }
 
   const all = e.target.closest('.toggle[data-all]');
   if (!all) return;
-  const sect = all.closest('section');
-  const btns = [...sect.querySelectorAll('.exp')].filter(b => !b.hidden);
+  const scope = all.closest('.card') || all.closest('section');
   const open = all.textContent.trim() === '展开全部';
-  btns.forEach(b => setExpanded(b, open));
+  // Opening a section means opening its cards first, otherwise the clamps
+  // inside are still hidden and cannot be measured.
+  scope.querySelectorAll('.card').forEach(c => {
+    c.classList.toggle('open', open);
+    if (open && !c.dataset.wired){ c.dataset.wired = '1'; wireClamps(c); }
+  });
+  [...scope.querySelectorAll('.exp')].filter(b => !b.hidden)
+    .forEach(b => setExpanded(b, open));
   all.textContent = open ? '收起全部' : '展开全部';
 });
 

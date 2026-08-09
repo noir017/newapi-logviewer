@@ -72,6 +72,39 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// listItem is the row-sized projection of a Record.
+//
+// The full Record carries the entire request and response bodies. On agent
+// traffic one record is ~1MB, so returning 30 of them made /api/calls a 25MB,
+// 20-second response just to draw a list. The browser fetches the full record
+// from /api/call only when a row is opened.
+type listItem struct {
+	RequestID string `json:"request_id"`
+	TS        string `json:"ts"`
+	Epoch     int64  `json:"epoch"`
+	Model     string `json:"model"`
+	Status    *int   `json:"status"`
+	Latency   string `json:"latency"`
+	IsStream  bool   `json:"is_stream"`
+	HasTools  bool   `json:"has_tools"`
+	Quota     *int64 `json:"quota"`
+	Preview   string `json:"preview"`
+	Errors    int    `json:"errors"`
+	MsgCount  int    `json:"msg_count"`
+	Turns     int    `json:"turns"`
+	ToolCount int    `json:"tool_count"`
+}
+
+func toListItem(r *Record) listItem {
+	return listItem{
+		RequestID: r.RequestID, TS: r.TS, Epoch: r.Epoch,
+		Model: r.Model, Status: r.Status, Latency: r.Latency,
+		IsStream: r.IsStream, HasTools: r.HasTools, Quota: r.Quota,
+		Preview: r.Preview, Errors: len(r.Errors),
+		MsgCount: r.MsgCount, Turns: r.Turns, ToolCount: r.ToolCount,
+	}
+}
+
 func (s *server) handleCalls(w http.ResponseWriter, r *http.Request, user authUser) {
 	q := r.URL.Query()
 	records := s.st.records(q.Get("refresh") == "1")
@@ -108,6 +141,11 @@ func (s *server) handleCalls(w http.ResponseWriter, r *http.Request, user authUs
 		}
 	}
 
+	items := make([]listItem, 0, end-start)
+	for _, rec := range filtered[start:end] {
+		items = append(items, toListItem(rec))
+	}
+
 	s.writeJSON(w, 200, map[string]any{
 		"success":   true,
 		"total":     len(filtered),
@@ -117,7 +155,7 @@ func (s *server) handleCalls(w http.ResponseWriter, r *http.Request, user authUs
 		"tools":     sortedKeys(tools),
 		"user":      map[string]any{"username": user.Username, "role": user.Role},
 		"auth_mode": s.cfg.AuthMode,
-		"items":     filtered[start:end],
+		"items":     items,
 	})
 }
 

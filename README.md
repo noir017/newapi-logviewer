@@ -218,6 +218,19 @@ the full message list with roles, tool definitions with parameter schemas,
 model output, tool calls with formatted arguments, reasoning traces, request
 parameters, and the raw response JSON.
 
+**Agent transcripts are grouped into cards.** A single call can carry a
+130-message conversation with 20 tool definitions — one API call, dozens of
+model round-trips already in its `messages` array. Rendering that flat is
+unreadable, so:
+
+- the **tool catalogue** is one collapsed card at the top (`20 个可用 · 本次调用 1`),
+- the **conversation** becomes one card per turn — an assistant message plus the
+  tool results it produced — with a header line showing which tools ran and how
+  much output came back (`#7 调用 ⚒read ⚒grep · 3 结果 · 14,814 字符`),
+- long standalone messages (a 16k-char system prompt) start collapsed too.
+
+Default view is ~4 screens instead of ~37 for the same call.
+
 **Long blocks collapse.** Prompts, tool schemas, model output and raw JSON are
 clamped to a few lines, with a summary of what is hidden — `16,118 字符 · 235 行`
 for text, `9 参数 · 1 必填` for a tool schema, `2 个工具调用 · 93 字符` for an
@@ -298,8 +311,16 @@ derives per-call summaries. Some deliberate choices:
   most of the memory difference versus a naive implementation.
 - **The search haystack is built once at parse time**, so a keystroke in the
   search box does not re-serialize every record.
-- **The cache invalidates on mtime+size**, not on a timer. An idle tab with
-  auto-refresh on costs a few `stat` calls instead of re-parsing the log.
+- **Parsing is incremental.** The store remembers the byte offset reached in
+  each file and reads only what was appended. This matters more than it sounds:
+  on a busy gateway the active log grows continuously, so a mtime check never
+  says "unchanged" and a naive implementation re-parses the whole directory on
+  every request. Measured on a 330MB log directory: 8s on the first request,
+  then ~30ms.
+- **The list endpoint sends summaries, not bodies.** One agent record is ~1MB of
+  request/response JSON; returning 30 per page made `/api/calls` a 25MB,
+  20-second response just to draw a list. Full records come from `/api/call`
+  when a row is opened.
 - **Truncated or rotated-out bodies do not drop a record.** It is flagged
   `incomplete` and rendered with whatever fields survive.
 

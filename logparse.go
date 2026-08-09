@@ -99,9 +99,20 @@ type Record struct {
 	Preview     string   `json:"preview"`
 	Incomplete  bool     `json:"incomplete"`
 
+	// Agent transcripts arrive as one call carrying the whole conversation, so
+	// the list row needs to say how big it is. Turns = assistant messages,
+	// which is the number of model round-trips the transcript represents.
+	MsgCount  int `json:"msg_count"`
+	Turns     int `json:"turns"`
+	ToolCount int `json:"tool_count"`
+
 	// searchBlob is the lowercased haystack for ?search=. Built once at parse
 	// time so a query does not re-serialize every record on every keystroke.
 	searchBlob string
+
+	// sawChunks records that this call streamed, even after chunks have been
+	// drained by a previous finalize pass.
+	sawChunks bool
 
 	chunks []streamChunk // dropped by finalize
 }
@@ -195,6 +206,48 @@ func parseOne(path string, limitBytes int64, calls map[string]*Record) {
 	scanLines(bufio.NewReaderSize(fh, 1<<16), calls)
 }
 
+// parseRange reads path from byte offset `from` to EOF, merging events into
+// calls. Records it touched are re-finalized, so derived fields stay correct
+// when a call's lines arrive across several reads (request now, response and
+// billing seconds later).
+//
+// Returns true if any record was created or changed.
+func parseRange(path string, from int64, partial bool, calls map[string]*Record) bool {
+	fh, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer fh.Close()
+
+	if from > 0 {
+		if _, err := fh.Seek(from, 0); err != nil {
+			return false
+		}
+	}
+	br := bufio.NewReaderSize(fh, 1<<16)
+	if partial {
+		// Only when we deliberately jumped into the middle of the file (the
+		// LIMIT_MB tail). A resumed read starts exactly at a line boundary -
+		// discarding a line there would drop a real event.
+		br.ReadString('\n')
+	}
+
+	touched := map[string]bool{}
+	sc := bufio.NewScanner(br)
+	sc.Buffer(make([]byte, 0, 1<<16), 16<<20)
+	for sc.Scan() {
+		if rid := handleLine(sc.Text(), calls); rid != "" {
+			touched[rid] = true
+		}
+	}
+	for rid := range touched {
+		if rec := calls[rid]; rec != nil {
+			rec.finalize()
+		}
+	}
+	return len(touched) > 0
+}
+
 func scanLines(r io.Reader, calls map[string]*Record) {
 	sc := bufio.NewScanner(r)
 	// request bodies with long contexts routinely exceed the 64KB default
@@ -204,10 +257,13 @@ func scanLines(r io.Reader, calls map[string]*Record) {
 	}
 }
 
-func handleLine(line string, calls map[string]*Record) {
+// handleLine merges one log line into calls and returns the request id it
+// touched (empty when the line carries none), so an incremental read knows
+// which records need re-deriving.
+func handleLine(line string, calls map[string]*Record) string {
 	m := lineRE.FindStringSubmatch(line)
 	if m == nil {
-		return
+		return ""
 	}
 	level, rest := m[1], m[4]
 	ts := m[2] + " " + m[3]
@@ -215,7 +271,7 @@ func handleLine(line string, calls map[string]*Record) {
 	if level == "GIN" {
 		g := ginRE.FindStringSubmatch(rest)
 		if g == nil {
-			return
+			return ""
 		}
 		rec := get(calls, g[2])
 		if n, err := strconv.Atoi(g[3]); err == nil {
@@ -225,12 +281,12 @@ func handleLine(line string, calls map[string]*Record) {
 		if rec.TS == "" {
 			rec.TS = ts
 		}
-		return
+		return g[2]
 	}
 
 	r := ridRE.FindStringSubmatch(rest)
 	if r == nil {
-		return // SYSTEM / unkeyed background lines
+		return "" // SYSTEM / unkeyed background lines
 	}
 	rec := get(calls, r[1])
 	msg := r[2]
@@ -262,6 +318,7 @@ func handleLine(line string, calls map[string]*Record) {
 	case level == "ERR" || strings.Contains(strings.ToLower(msg), "error"):
 		rec.Errors = append(rec.Errors, LogErr{TS: ts, Msg: clip(msg, 2000)})
 	}
+	return r[1]
 }
 
 func get(calls map[string]*Record, rid string) *Record {
@@ -320,12 +377,19 @@ func (r *Record) finalize() {
 	if r.Model == "" {
 		r.Model = bill.ModelName
 	}
-	r.IsStream = req.Stream || len(r.chunks) > 0
+	r.IsStream = req.Stream || len(r.chunks) > 0 || r.sawChunks
 	r.HasTools = len(req.Tools) > 0
 
 	// Reassemble streamed output so streaming calls show real content, not a
 	// pile of chunks. Reasoning and visible text are tracked separately.
-	r.StreamToolCalls = []ToolCall{}
+	//
+	// finalize can run several times for one record: an incremental read sees
+	// a call's chunks across multiple passes. So APPEND newly-seen chunks to
+	// what was already assembled rather than rebuilding from r.chunks, which
+	// is drained at the end of every pass.
+	if r.StreamToolCalls == nil {
+		r.StreamToolCalls = []ToolCall{}
+	}
 	if len(r.chunks) > 0 {
 		var content, reasoning strings.Builder
 		for _, ch := range r.chunks {
@@ -338,9 +402,10 @@ func (r *Record) finalize() {
 				r.Usage = ch.Usage
 			}
 		}
-		r.StreamContent = content.String()
-		r.StreamReasoning = reasoning.String()
-	} else {
+		r.StreamContent += content.String()
+		r.StreamReasoning += reasoning.String()
+		r.sawChunks = true
+	} else if !r.sawChunks {
 		r.Usage = resp.Usage
 	}
 	if r.Usage == nil && hasBill {
@@ -378,6 +443,16 @@ func (r *Record) finalize() {
 		n := tc.Function.Name
 		if n != "" && !contains(r.CalledTools, n) {
 			r.CalledTools = append(r.CalledTools, n)
+		}
+	}
+
+	// Conversation size. An agent transcript is a single call carrying dozens
+	// of prior turns, so counts belong on the list row.
+	r.MsgCount = len(req.Messages)
+	r.ToolCount = len(r.ToolNames)
+	for _, m := range req.Messages {
+		if m.Role == "assistant" {
+			r.Turns++
 		}
 	}
 
@@ -467,12 +542,4 @@ func Load(dir string, limitBytes int64) []*Record {
 		return out[i].RequestID > out[j].RequestID
 	})
 	return out
-}
-
-func mtime(p string) time.Time {
-	st, err := os.Stat(p)
-	if err != nil {
-		return time.Time{}
-	}
-	return st.ModTime()
 }

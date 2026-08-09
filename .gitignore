@@ -19,3 +19,8 @@
 node_modules/
 ui_extracted.js
 probe*.js
+
+# browser-test scratch
+height*.js
+shot*.js
+cards*.png
