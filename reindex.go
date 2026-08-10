@@ -33,6 +33,14 @@ func reindexDay(dir, day string) (int, error) {
 	}
 
 	_, ip := a.paths(day)
+	// The replacement must end up with the original's owner and mode. rename
+	// gives the temp file's, and a root-run reindex against a nobody-owned
+	// archive would leave the running ingester unable to append - a failure
+	// that reads right through, because only writes need the permission.
+	orig, err := os.Stat(ip)
+	if err != nil {
+		return 0, err
+	}
 	tmp := ip + ".rebuild"
 	f, err := os.Create(tmp)
 	if err != nil {
@@ -65,6 +73,12 @@ func reindexDay(dir, day string) (int, error) {
 		return n, err
 	}
 	if err := f.Close(); err != nil {
+		return n, err
+	}
+	if err := os.Chmod(tmp, orig.Mode().Perm()); err != nil {
+		return n, err
+	}
+	if err := preserveOwner(tmp, orig); err != nil {
 		return n, err
 	}
 	return n, os.Rename(tmp, ip)
