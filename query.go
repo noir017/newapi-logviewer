@@ -23,10 +23,18 @@ type query struct {
 	// searchDays caps how far back a full-text search will read bodies. Listing
 	// and filtering stay unbounded - those only read the index.
 	searchDays int
+	// ch resolves channel ids to names. Optional and nil-safe: without it the
+	// list falls back to the upstream host recorded in the index.
+	ch *channelResolver
 }
 
 func newQuery(arc *archive, searchDays int) *query {
 	return &query{arc: arc, searchDays: searchDays}
+}
+
+func (q *query) withChannels(c *channelResolver) *query {
+	q.ch = c
+	return q
 }
 
 // listFilter is the subset of the UI's filters that the index alone can answer.
@@ -190,7 +198,7 @@ func (q *query) list(f listFilter, page, size int) ([]listItem, int, []string, [
 
 	items := make([]listItem, 0, end-start)
 	for _, c := range matched[start:end] {
-		items = append(items, entryToItem(c.e))
+		items = append(items, q.entryToItem(c.e))
 	}
 	return items, total, sortedKeys(models), sortedKeys(tools)
 }
@@ -214,14 +222,21 @@ func containsFold(raw Raw, needle string) bool {
 	return strings.Contains(strings.ToLower(string(raw)), needle)
 }
 
-func entryToItem(e idxEntry) listItem {
-	return listItem{
+func (q *query) entryToItem(e idxEntry) listItem {
+	it := listItem{
 		RequestID: e.RID, TS: e.TS, Epoch: e.Epoch,
 		Model: e.Model, Status: e.Status, Latency: e.Latency,
 		IsStream: e.IsStream, HasTools: e.HasTools, Quota: e.Quota,
 		Preview: e.Preview, Errors: e.Errors,
 		MsgCount: e.MsgCount, Turns: e.Turns, ToolCount: e.ToolCnt,
+		ChannelID: e.Chan, Upstream: e.Up,
 	}
+	// Resolution happens here rather than at ingest so a renamed or newly
+	// labelled channel is reflected on records already archived.
+	if e.Chan != nil {
+		it.Channel = q.ch.name(*e.Chan)
+	}
+	return it
 }
 
 // get fetches one full record by request id.

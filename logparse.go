@@ -112,6 +112,12 @@ type Record struct {
 	ChannelID       *int     `json:"channel_id"`
 	TokenName       string   `json:"token_name"`
 
+	// ChannelName is resolved at serve time from New API's admin API, not from
+	// the log, which never carries it. It is deliberately never persisted:
+	// omitempty keeps it out of the archive, so a renamed channel shows its
+	// current name on old records rather than a stale one.
+	ChannelName string `json:"channel_name,omitempty"`
+
 	ToolNames   []string `json:"tool_names"`
 	CalledTools []string `json:"called_tools"`
 	Preview     string   `json:"preview"`

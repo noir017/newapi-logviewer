@@ -30,6 +30,10 @@ func main() {
 	if runReingest(cfg) {
 		return
 	}
+	// Maintenance mode: rebuild the derived index after a new list column.
+	if runReindex(cfg) {
+		return
+	}
 
 	handler := newServer(cfg)
 	srv := &http.Server{

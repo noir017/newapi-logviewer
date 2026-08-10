@@ -73,6 +73,10 @@ label.ck input{width:13px;height:13px;accent-color:var(--acc)}
 .tag.st{color:var(--acc);border-color:#1e3559}
 .tag.tl{color:var(--tool);border-color:#4a3a12;cursor:pointer}
 .tag.tl:hover{background:#2a2110}
+/* channel chip: names run long ("nvidia-nim-3682 (2177271479@qq.com)"), and a
+   wrapped row is harder to scan than a clipped one. Full text is in the title. */
+.tag.ch{color:#93a4c8;border-color:#2c3654;max-width:190px;overflow:hidden;
+  text-overflow:ellipsis;display:inline-block;vertical-align:bottom}
 .tag.cl{color:var(--tool);border-color:#4a3a12;background:#241d0e;cursor:pointer}
 
 /* ---- detail ---- */
@@ -446,7 +450,7 @@ function detail(r){
     <div><b>时间</b><span>${esc(r.ts || '')}</span></div>
     <div><b>耗时</b><span>${esc(r.latency || '—')}</span></div>
     <div><b>首字延迟</b><span>${r.frt > 0 ? r.frt + ' ms' : '—'}</span></div>
-    <div><b>渠道 / 令牌</b><span>${r.channel_id ?? '—'} · ${esc(r.token_name || '—')}</span></div>
+    <div><b>渠道 / 令牌</b><span>${esc(chanLabel(r))} · ${esc(r.token_name || '—')}</span></div>
     <div><b>计费</b><span>${fmtQ(r.quota)}</span></div>
     <div><b>倍率</b><span>${r.model_ratio ?? '—'} × ${r.completion_ratio ?? '—'}</span></div>
     <div><b>客户端 IP</b><span>${esc(r.ip || '—')}</span></div>
@@ -529,6 +533,10 @@ function item(r){
   // round-trips are in it.
   const turnTag = (r.turns || 0) > 1
     ? `<span class="tag st" title="${r.msg_count} 条消息">↻${r.turns} 次调用</span>` : '';
+  // New API logs the channel id but never its name, so the name is resolved
+  // from its admin API when a token is configured. Falling back to the upstream
+  // host keeps the column useful without one.
+  const chTag = chanChip(r);
   return `<div class="item ${selected === r.request_id ? 'sel' : ''}" data-id="${esc(r.request_id)}">
     <div class="i1">
       <span class="t">${esc((r.ts || '').slice(5, 16))}</span>
@@ -537,6 +545,7 @@ function item(r){
     </div>
     <div class="i2">${esc(r.preview || '（无提示词）')}</div>
     <div class="i3">
+      ${chTag}
       ${turnTag}
       ${r.is_stream ? '<span class="tag st">流</span>' : ''}
       ${r.errors?.length ? '<span class="tag err">报错</span>' : ''}
@@ -545,6 +554,26 @@ function item(r){
       ${toolTag}
     </div>
   </div>`;
+}
+
+// chanLabel is the detail-pane form: the id is always shown because it is what
+// New API's own console and error messages refer to; the name is an addition.
+function chanLabel(r){
+  return [r.channel_id != null ? '#' + r.channel_id : '', r.channel_name]
+    .filter(Boolean).join(' ') || '—';
+}
+
+// chanChip renders the channel column: name if resolvable, else the upstream
+// address, else the bare id. Empty when the call never reached a channel — a
+// request rejected by the distributor has no channel at all.
+function chanChip(r){
+  const label = r.channel || r.upstream || (r.channel_id != null ? '#' + r.channel_id : '');
+  if (!label) return '';
+  const title = [
+    r.channel_id != null ? '渠道 #' + r.channel_id : '',
+    r.channel, r.upstream,
+  ].filter(Boolean).join(' · ');
+  return `<span class="tag ch" title="${esc(title)}">${esc(label)}</span>`;
 }
 
 function params(){
