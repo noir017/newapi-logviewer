@@ -14,15 +14,17 @@ type server struct {
 	q     *query
 	ing   *ingester
 	auth  *authenticator
+	ch    *channelResolver
 	index []byte
 }
 
 func newServer(cfg Config) *server {
 	arc := newArchive(cfg.ArchiveDir)
 	ing := newIngester(cfg.LogDir, arc, cfg.SpoolKeep, cfg.SpoolMaxBytes)
+	ch := newChannelResolver(cfg.NewAPIURL, cfg.NewAPIToken)
 	return &server{
-		cfg: cfg, q: newQuery(arc, cfg.SearchDays), ing: ing,
-		auth: newAuthenticator(cfg), index: indexHTML,
+		cfg: cfg, q: newQuery(arc, cfg.SearchDays).withChannels(ch), ing: ing,
+		auth: newAuthenticator(cfg), ch: ch, index: indexHTML,
 	}
 }
 
@@ -99,6 +101,12 @@ type listItem struct {
 	MsgCount  int    `json:"msg_count"`
 	Turns     int    `json:"turns"`
 	ToolCount int    `json:"tool_count"`
+
+	// Which channel served the call. Channel is the resolved name and may be
+	// empty; Upstream is the host from the log and is the fallback label.
+	ChannelID *int   `json:"channel_id,omitempty"`
+	Channel   string `json:"channel,omitempty"`
+	Upstream  string `json:"upstream,omitempty"`
 }
 
 func toListItem(r *Record) listItem {
@@ -149,6 +157,10 @@ func (s *server) handleCalls(w http.ResponseWriter, r *http.Request, user authUs
 
 func (s *server) handleCall(w http.ResponseWriter, r *http.Request) {
 	if rec := s.q.get(r.URL.Query().Get("id")); rec != nil {
+		// Safe to mutate: this is a freshly inflated copy, not the archived one.
+		if rec.ChannelID != nil {
+			rec.ChannelName = s.ch.name(*rec.ChannelID)
+		}
 		s.writeJSON(w, 200, map[string]any{"success": true, "data": rec})
 		return
 	}

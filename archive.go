@@ -79,6 +79,26 @@ type idxEntry struct {
 	MsgCount int    `json:"mc,omitempty"`
 	Turns    int    `json:"tn,omitempty"`
 	ToolCnt  int    `json:"tc,omitempty"`
+
+	// Which channel served the call. The id is what the log carries; the host
+	// is derived from fullRequestURL and is the fallback label when no name can
+	// be resolved. Only the host is kept - the full URL is in the record.
+	Chan *int   `json:"c,omitempty"`
+	Up   string `json:"u,omitempty"`
+}
+
+// makeIdxEntry is the single definition of the list-row projection. reindex
+// calls it too, so a rebuilt index is byte-identical to one Append would have
+// written.
+func makeIdxEntry(r *Record, off, n int64) idxEntry {
+	return idxEntry{
+		RID: r.RequestID, TS: r.TS, Epoch: r.Epoch, Off: off, Len: n,
+		Model: r.Model, Status: r.Status, Latency: r.Latency,
+		IsStream: r.IsStream, HasTools: r.HasTools, Quota: r.Quota,
+		Preview: r.Preview, Errors: len(r.Errors),
+		MsgCount: r.MsgCount, Turns: r.Turns, ToolCnt: r.ToolCount,
+		Chan: r.ChannelID, Up: hostOf(r.UpstreamURL),
+	}
 }
 
 func newArchive(dir string) *archive { return &archive{dir: dir} }
@@ -188,13 +208,7 @@ func (a *archive) Append(r *Record) error {
 		return err
 	}
 
-	e := idxEntry{
-		RID: r.RequestID, TS: r.TS, Epoch: r.Epoch, Off: a.off, Len: int64(n),
-		Model: r.Model, Status: r.Status, Latency: r.Latency,
-		IsStream: r.IsStream, HasTools: r.HasTools, Quota: r.Quota,
-		Preview: r.Preview, Errors: len(r.Errors),
-		MsgCount: r.MsgCount, Turns: r.Turns, ToolCnt: r.ToolCount,
-	}
+	e := makeIdxEntry(r, a.off, int64(n))
 	line, err := json.Marshal(e)
 	if err != nil {
 		return err

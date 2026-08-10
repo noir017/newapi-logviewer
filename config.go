@@ -17,6 +17,12 @@ type Config struct {
 	RequireAdmin bool
 	AuthTTL      time.Duration
 
+	// NewAPIToken is an admin access token used only to resolve channel ids to
+	// channel names for the list view. New API does not log the name, and the
+	// upstream address cannot stand in for it when many channels share a host.
+	// Optional: without it the list shows the address.
+	NewAPIToken string
+
 	// Spool retention. LogDir is a transient buffer (expected to be tmpfs);
 	// once a call is folded into the archive its raw lines have no further use.
 	SpoolKeep     time.Duration
@@ -72,6 +78,7 @@ func loadConfig() Config {
 		AuthMode:     strings.ToLower(env("AUTH_MODE", "none")),
 		RequireAdmin: envBool("REQUIRE_ADMIN", true),
 		AuthTTL:      time.Duration(envFloat("AUTH_TTL", 120) * float64(time.Second)),
+		NewAPIToken:  env("NEWAPI_TOKEN", ""),
 		// One hour of spool covers any single agent session, so a restart can
 		// only lose calls that were still in flight.
 		SpoolKeep:     time.Duration(envFloat("SPOOL_KEEP_MIN", 60) * float64(time.Minute)),

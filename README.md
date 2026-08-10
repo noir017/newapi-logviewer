@@ -124,7 +124,8 @@ All configuration is environment variables. Only `LOG_DIR` matters for a basic r
 | `BASE_PATH` | `/logviewer` | URL prefix. Use `/` to serve at the root |
 | `TZ` | container default | **Must match New API's timezone** — see below |
 | `AUTH_MODE` | `none` | `none` or `bearer` |
-| `NEWAPI_URL` | `http://new-api:3000` | Where to validate tokens (`bearer` mode only) |
+| `NEWAPI_URL` | `http://new-api:3000` | Where to validate tokens (`bearer` mode only) and resolve channel names |
+| `NEWAPI_TOKEN` | *(unset)* | Admin access token, used only to show **channel names** in the list. Without it the list shows the upstream address |
 | `REQUIRE_ADMIN` | `true` | In `bearer` mode, also require `role >= 100` |
 | `SPOOL_KEEP_MIN` | `60` | Minutes an already-archived spool file may linger |
 | `SPOOL_MAX_MB` | `256` | Spool high-water mark; consumed files are dropped oldest-first past it |
@@ -201,6 +202,45 @@ logviewer -reingest -src /scratch/archive -day 20260809 [-only <request-id>,…]
 
 Existing bytes are never rewritten, so a failure part-way leaves every
 previously-readable record exactly as readable as before.
+
+The `.idx` is *derived* — every field in it also exists inside the record it
+points at. So a new list column can be backfilled onto history without the raw
+logs, which by then have usually been rotated away:
+
+```bash
+logviewer -reindex [-day 20260809]     # rebuild arc-DAY.idx from arc-DAY.jsonl.gz
+```
+
+Run it with the server stopped: a live ingester holds the `.idx` open in append
+mode, and swapping the file under it would send its appends to the replaced
+inode. Only the index is rewritten — via a temp file and a rename, so a failure
+leaves the previous one in place.
+
+### Which channel served a call
+
+The list shows the channel per row, because on a real gateway the model name is
+not enough — the same model is usually served by several keys with different
+quotas and failure modes.
+
+New API logs the channel **id**, never its name, and the upstream address
+often can't stand in: measured here, 22 of 33 channels share
+`integrate.api.nvidia.com`. So the name is fetched from New API's own admin API
+and cached (5 min), which is the one thing in this service that reads anything
+other than a file:
+
+```yaml
+environment:
+  - NEWAPI_TOKEN=<admin access token>
+```
+
+It is optional and degrades in order: **name** → **upstream host** → **`#id`**.
+With no token nothing is fetched and no request is made. A call rejected before
+channel selection — `No available channel for model X` — has no channel at all
+and shows none.
+
+> The token is an *admin* access token: it grants full administrative access to
+> New API, not just channel reads. Leave it unset if that trade is not worth a
+> name in a list.
 
 ### Timezone
 
@@ -402,6 +442,7 @@ derives per-call summaries. Some deliberate choices:
 go test ./...                       # golden tests over testdata/sample.log
 go test -race ./...                 # concurrency (needs CGO_ENABLED=1)
 go vet ./...
+node channel_test.js                # channel column fallback chain, no browser
 ```
 
 `testdata/sample.log` is synthetic and covers the shapes that matter: a plain
@@ -417,6 +458,7 @@ msedge --headless=new --disable-extensions --remote-debugging-port=9222   --user
 go build -o logviewer . && LOG_DIR=./testdata BASE_PATH=/logviewer ./logviewer &
 npm install ws --no-save
 node clamp_test.js 9222 http://localhost:7070/logviewer/
+node channel_render.js 9222 http://localhost:7070/logviewer/   # channel chips
 ```
 
 Run it against a real deployment too — the fixture cannot produce a 16,000-char
