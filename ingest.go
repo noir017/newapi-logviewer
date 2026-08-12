@@ -18,11 +18,20 @@ import (
 // the record is persisted. The spool then only has to be large enough to hold
 // calls that are still in flight.
 //
-// Completion is decided by the GIN access-log line. New API emits it once the
-// response is fully written, and it is genuinely last: across 3,645 real
-// records, zero had any further line after their GIN line. A call without one
-// is still running (or was interrupted), so it stays in the spool and is
-// retried on the next pass.
+// Completion is decided by the GIN access-log line where there is one, and by
+// the billing line otherwise. New API emits the GIN line once the response is
+// fully written, and it is genuinely last: across 3,645 real records, zero had
+// any further line after their GIN line.
+//
+// But it does not always reach the log FILE. gin's access logger writes to
+// gin.DefaultWriter, a different sink from the file New API opens for its own
+// logger, and on this deployment the file contains 347,863 DEBUG lines and zero
+// GIN lines while `docker logs` shows them on stdout throughout. So the billing
+// line - which is written after delivery and always lands in the file - is
+// accepted as a completion marker too, after a short quiet period.
+//
+// A call with neither is still running (or was interrupted), so it stays in the
+// spool and is retried on the next pass.
 type ingester struct {
 	dir      string // spool directory (tmpfs)
 	arc      *archive
@@ -32,22 +41,39 @@ type ingester struct {
 	// archived as incomplete. Must exceed the longest plausible gap between
 	// streaming chunks, or a slow model gets filed as truncated.
 	stallAfter time.Duration
+	// settleAfter is how long a billed call must be quiet before it is archived
+	// without a GIN line. Short: it only has to outlast the few trailing chunks
+	// that can follow the billing line, not a whole inter-chunk gap.
+	settleAfter time.Duration
 
 	mu       sync.Mutex
 	offsets  map[string]int64    // spool file -> bytes consumed
 	pending  map[string]*Record  // in-flight calls, keyed by request id
 	archived map[string]struct{} // ids already written, so a retry cannot double-write
 	stop     chan struct{}
+
+	// Write-side health, for /healthz. Both outages this code has had were
+	// invisible from outside: the container was healthy, pages were fast, and
+	// pending was 0, while the archive recorded nothing for hours. `pending`
+	// cannot detect it - a stalled call is archived-or-dropped by the deadline
+	// in flushFinished either way, so the counter reads clean whether writes
+	// are landing or failing. What has to be reported is whether an append has
+	// SUCCEEDED recently, and whether one is currently failing.
+	lastAppend  time.Time // last successful Append
+	lastErr     string    // last append error, empty once one succeeds
+	appendFails int       // consecutive failures
+	appends     int64     // successful appends since start
 }
 
 func newIngester(spoolDir string, arc *archive, keep time.Duration, maxBytes int64) *ingester {
 	return &ingester{
 		dir: spoolDir, arc: arc, keep: keep, maxBytes: maxBytes,
-		stallAfter: 10 * time.Minute,
-		offsets:    map[string]int64{},
-		pending:    map[string]*Record{},
-		archived:   map[string]struct{}{},
-		stop:       make(chan struct{}),
+		stallAfter:  10 * time.Minute,
+		settleAfter: 15 * time.Second,
+		offsets:     map[string]int64{},
+		pending:     map[string]*Record{},
+		archived:    map[string]struct{}{},
+		stop:        make(chan struct{}),
 	}
 }
 
@@ -115,6 +141,21 @@ func (i *ingester) flushFinished() {
 	now := time.Now()
 	for rid, rec := range i.pending {
 		done := rec.Status != nil && rec.TS != ""
+		if !done && rec.billingSeen && !rec.lastSeen.IsZero() &&
+			now.Sub(rec.lastSeen) >= i.settleAfter {
+			// No GIN line, but billing arrived - the response was delivered and
+			// charged. gin's access logger writes to a different sink than the
+			// file New API logs to, so on this deployment the GIN line never
+			// reaches the spool at all and every call would otherwise wait out
+			// stallAfter and be filed as Stalled.
+			//
+			// settleAfter, not immediately: billing is emitted around the end of
+			// the response, and a few trailing chunks can still follow it in the
+			// file. Archiving the moment billing lands truncated real content.
+			// A short quiet period costs nothing - the record is only written
+			// once, and it is written correct.
+			done = true
+		}
 		if !done {
 			// A call with no GIN line is normally still streaming. But some
 			// never get one: the client disconnects, the gateway restarts
@@ -142,8 +183,13 @@ func (i *ingester) flushFinished() {
 			// Leave it pending: a failed append (disk full, permissions) must
 			// not silently drop the call. It retries next pass.
 			log.Printf("archive append %s: %v", rid, err)
+			i.appendFails++
+			i.lastErr = err.Error()
 			continue
 		}
+		i.appends++
+		i.lastAppend = now
+		i.appendFails, i.lastErr = 0, ""
 		i.archived[rid] = struct{}{}
 		delete(i.pending, rid)
 	}
@@ -182,14 +228,17 @@ func worthArchiving(r *Record) bool {
 //
 // Deleting is safe here in a way it would not be for the log directory itself:
 // everything in the spool has already been folded into the archive, which is
-// permanent. A file is only removed once its bytes have been read, and the
-// file New API is currently writing is never touched.
+// permanent. A file is only removed once its bytes have been read.
 //
 // The size sweep is the one that actually protects the gateway: the spool is a
 // fixed-size tmpfs, and a full tmpfs makes New API's log writes fail. Age alone
 // cannot bound it - a burst of traffic can fill the spool well inside the
 // retention window - so once the high-water mark is crossed, consumed files are
 // dropped oldest-first regardless of age.
+//
+// The file New API is still writing is never deleted, but it can be truncated -
+// see truncateLive, and the incident note there. Skipping it entirely is what
+// let the spool reach 100% of its tmpfs and take the gateway's logging down.
 func (i *ingester) prune(files []string) {
 	newest := ""
 	if len(files) > 0 {
@@ -240,7 +289,67 @@ func (i *ingester) prune(files []string) {
 			}
 			drop(fi)
 		}
+		// Still over after dropping every older file. With New API's actual
+		// rotation behaviour - one log file per process start, never rotated -
+		// that is the normal case and not an edge one: there ARE no older
+		// files, so every sweep above was a no-op and the single live file grew
+		// to fill the tmpfs unopposed.
+		if total > i.maxBytes && newest != "" {
+			if freed := i.truncateLive(newest); freed > 0 {
+				total -= freed
+			}
+		}
 	}
+}
+
+// truncateLive reclaims a fully-consumed spool file that New API still holds
+// open, by truncating it rather than unlinking it.
+//
+// Unlinking would be worse than doing nothing: New API keeps writing to the
+// open descriptor, so the inode's blocks are never freed while the directory
+// entry is gone - the space stays consumed and the log becomes unreadable. Only
+// truncation returns the pages while leaving the descriptor valid. This is the
+// copytruncate pattern, and it is safe here precisely because the bytes have
+// already been folded into the archive.
+//
+// Returns the number of bytes freed.
+//
+// This exists because of a real outage: a 256MB tmpfs at 100%, a single
+// never-rotated log file that prune refused to touch, and ~22 hours during
+// which New API's log writes failed while the container stayed healthy and the
+// viewer served pages normally.
+func (i *ingester) truncateLive(path string) int64 {
+	// Re-stat immediately before truncating and require the file to be fully
+	// consumed as of this instant. Anything New API appends between this stat
+	// and the truncate is lost; that window is microseconds against a poll
+	// interval of seconds, and the alternative is the gateway losing all
+	// logging once the tmpfs fills.
+	st, err := os.Stat(path)
+	if err != nil {
+		return 0
+	}
+	size := st.Size()
+	if size == 0 || i.offsets[path] < size {
+		return 0 // unread bytes: dropping them would lose calls
+	}
+	if err := os.Truncate(path, 0); err != nil {
+		log.Printf("spool truncate %s: %v", path, err)
+		return 0
+	}
+
+	// Resume from wherever the file now ends, which is NOT always zero. If New
+	// API opened the log with O_APPEND its next write lands at 0 and the stat
+	// below reports 0. Without O_APPEND the descriptor keeps its old offset and
+	// the next write recreates a sparse file that still reports the old size -
+	// the pages are freed either way, but reading from 0 would then scan
+	// hundreds of megabytes of holes on every pass.
+	if st2, err := os.Stat(path); err == nil {
+		i.offsets[path] = st2.Size()
+	} else {
+		i.offsets[path] = 0
+	}
+	log.Printf("spool: truncated live file %s, freed %d bytes (spool was over SPOOL_MAX_MB)", path, size)
+	return size
 }
 
 // pendingCount reports in-flight calls, for the health endpoint.
@@ -248,6 +357,80 @@ func (i *ingester) pendingCount() int {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	return len(i.pending)
+}
+
+// health reports whether ingest is actually working, not merely running.
+//
+// The distinction matters because reads need no write permission: a viewer that
+// cannot write its archive still serves fast, correct pages and a green
+// pending-only health check while recording nothing. That happened twice here -
+// once from a root-run -reindex leaving the .idx owned by root, once from the
+// spool filling and New API's writes failing.
+//
+// Unhealthy means one of:
+//   - an append is currently failing (permissions, disk full, bad ownership)
+//   - the spool is over its high-water mark, which means bytes are arriving
+//     faster than they are being folded, or not being folded at all
+//   - calls are waiting to be archived and none has been written for a while
+//
+// Staleness alone is deliberately NOT a failure: an idle gateway legitimately
+// archives nothing for hours, and a health check that goes red overnight is one
+// that gets ignored by morning. It only counts as a failure when there is work
+// waiting - pending > 0 with no successful append - which is the shape both real
+// incidents had.
+func (i *ingester) health() map[string]any {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	var spool int64
+	files, _ := filepath.Glob(filepath.Join(i.dir, "*.log"))
+	for _, f := range files {
+		if st, err := os.Stat(f); err == nil {
+			spool += st.Size()
+		}
+	}
+
+	h := map[string]any{
+		"pending":      len(i.pending),
+		"appends":      i.appends,
+		"spool_bytes":  spool,
+		"spool_files":  len(files),
+		"archive_ok":   true,
+		"append_fails": i.appendFails,
+	}
+	if !i.lastAppend.IsZero() {
+		h["last_append"] = i.lastAppend.Format(time.RFC3339)
+		h["last_append_age_sec"] = int(time.Since(i.lastAppend).Seconds())
+	}
+	if i.lastErr != "" {
+		h["last_error"] = i.lastErr
+	}
+
+	ok := true
+	var why []string
+	if i.appendFails > 0 {
+		ok = false
+		why = append(why, "archive appends are failing")
+	}
+	if i.maxBytes > 0 && spool > i.maxBytes {
+		ok = false
+		why = append(why, "spool over SPOOL_MAX_MB")
+	}
+	// Work waiting and nothing written recently. The window is generous
+	// relative to stallAfter: below it, calls legitimately sit in pending while
+	// they stream, and every one of them is archived or dropped by the deadline.
+	if len(i.pending) > 0 {
+		idle := 2 * i.stallAfter
+		if i.lastAppend.IsZero() || time.Since(i.lastAppend) > idle {
+			ok = false
+			why = append(why, "calls pending but nothing archived recently")
+		}
+	}
+	h["archive_ok"] = ok
+	if len(why) > 0 {
+		h["degraded"] = why
+	}
+	return h
 }
 
 func mtime(p string) time.Time {

@@ -16,8 +16,13 @@ Check it is working:
 
 ```bash
 docker exec <container> df -h /app/logs      # should stay near-empty
-curl -s localhost:7071/logviewer/healthz     # "pending" = calls still in flight
+curl -s localhost:7071/logviewer/healthz     # archive_ok, last_append_age_sec, spool_bytes
 ```
+
+Read `archive_ok` and `last_append_age_sec`, not `pending`. A stalled archive
+leaves `pending` at 0 — the stall deadline drains it whether writes are landing
+or failing — so `pending` alone was green through both real outages. The
+endpoint returns 503 when ingest is actually broken.
 
 A spool that keeps growing means ingest has stopped. The usual cause is
 permissions: the viewer runs as `nobody` and needs to unlink files from the
