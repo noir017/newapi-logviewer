@@ -64,3 +64,22 @@ this line is not a log line at all
 [DEBUG] 2026/01/15 - 12:00:03 | AnthropicNativeCallAaaaBbbb | stream scanner data: data: {"type":"message_stop"}
 [INFO]  2026/01/15 - 12:00:03 | AnthropicNativeCallAaaaBbbb | record consume log: userId=1, params={"model_name":"claude-opus-5","quota":499008,"channel_id":2,"token_name":"demo-token","prompt_tokens":2,"completion_tokens":248,"other":{"model_ratio":2.5,"completion_ratio":5,"frt":2953}}
 [GIN]   2026/01/15 - 12:00:03 | relay | AnthropicNativeCallAaaaBbbb | 200 | 3.05s | 10.0.0.9 | POST /v1/messages
+
+# --- OpenAI-shaped STREAMING tool call, arguments split across deltas -------
+# The other tool-call fixture above delivers its arguments whole in one chunk,
+# which is not how any real provider streams them. Here the opener carries
+# id+name+index and each later delta carries only index + a slice of the JSON -
+# the shape that made one call render as one nameless call per fragment.
+#
+# The transcript also has 3 assistant messages, so `turns` is checked against a
+# record finalized over several read passes.
+[DEBUG] 2026/01/15 - 13:00:00 | StreamFragmentToolsAaaaBbbb | text request body: {"model": "chat-pro", "stream": true, "messages": [{"role": "user", "content": "Write the build script."}, {"role": "assistant", "content": "Checking the tree first."}, {"role": "tool", "tool_call_id": "c0", "content": "ok"}, {"role": "assistant", "content": "Now writing it."}, {"role": "user", "content": "Go ahead."}, {"role": "assistant", "content": "Done."}], "tools": [{"type": "function", "function": {"name": "write", "description": "Write a file"}}, {"type": "function", "function": {"name": "read", "description": "Read a file"}}]}
+[DEBUG] 2026/01/15 - 13:00:01 | StreamFragmentToolsAaaaBbbb | stream scanner data: data: {"choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_frag1","type":"function","function":{"name":"write","arguments":""},"index":0}]}}]}
+[DEBUG] 2026/01/15 - 13:00:01 | StreamFragmentToolsAaaaBbbb | stream scanner data: data: {"choices":[{"index":0,"delta":{"tool_calls":[{"function":{"arguments":"{\""},"index":0}]}}]}
+[DEBUG] 2026/01/15 - 13:00:01 | StreamFragmentToolsAaaaBbbb | stream scanner data: data: {"choices":[{"index":0,"delta":{"tool_calls":[{"function":{"arguments":"path"},"index":0}]}}]}
+[DEBUG] 2026/01/15 - 13:00:01 | StreamFragmentToolsAaaaBbbb | stream scanner data: data: {"choices":[{"index":0,"delta":{"tool_calls":[{"function":{"arguments":"\":\"b.sh\"}"},"index":0}]}}]}
+[DEBUG] 2026/01/15 - 13:00:02 | StreamFragmentToolsAaaaBbbb | stream scanner data: data: {"choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_frag2","type":"function","function":{"name":"read","arguments":""},"index":1}]}}]}
+[DEBUG] 2026/01/15 - 13:00:02 | StreamFragmentToolsAaaaBbbb | stream scanner data: data: {"choices":[{"index":0,"delta":{"tool_calls":[{"function":{"arguments":"{\"p\":1}"},"index":1}]}}]}
+[DEBUG] 2026/01/15 - 13:00:02 | StreamFragmentToolsAaaaBbbb | stream scanner data: data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+[INFO]  2026/01/15 - 13:00:02 | StreamFragmentToolsAaaaBbbb | record consume log: userId=1, params={"model_name":"chat-pro","quota":120,"channel_id":2,"token_name":"demo-token","prompt_tokens":40,"completion_tokens":18,"other":{"model_ratio":1,"completion_ratio":1,"frt":900}}
+[GIN]   2026/01/15 - 13:00:02 | relay | StreamFragmentToolsAaaaBbbb | 200 | 2.01s | 10.0.0.9 | POST /v1/chat/completions

@@ -216,6 +216,30 @@ mode, and swapping the file under it would send its appends to the replaced
 inode. Only the index is rewritten — via a temp file and a rename, so a failure
 leaves the previous one in place.
 
+There is a third case the other two cannot reach: the record itself is wrong, but
+the raw log is long gone. `-reindex` can only propagate what the record already
+holds, and `-reingest` needs the log. When a bug damaged a *derived* field while
+leaving its source intact, the fix is computable from the archive alone:
+
+```bash
+logviewer -repair -dry-run          # report what would change, write nothing
+logviewer -repair [-day 20260812]   # append corrected versions
+```
+
+This is what fixed two arithmetic bugs after the fact — turn counts multiplied by
+the number of read passes, and streaming tool-call fragments stored as separate
+calls. Both were recomputable because the request body and the fragments were
+stored verbatim and in order. It corrects only records it can prove are damaged
+(`fragmented()`), skips anything it cannot read rather than aborting the day, and
+is idempotent: a second run reports 0. Run it stopped and as the archive's owner,
+like `-reindex`.
+
+Measured on the damaged production archive: 18,145 tool calls collapsed to 580,
+16,621 unparseable argument strings to 8, and the largest turn count from 18,432
+to 256. The 8 that remain end mid-value with no second copy in the log — a real
+limit, and `-repair` deliberately leaves visibly broken arguments alone rather
+than guessing.
+
 ### Which channel served a call
 
 The list shows the channel per row, because on a real gateway the model name is
@@ -300,9 +324,20 @@ cannot write its archive still serves fast, correct pages and a green liveness
 check while recording nothing. A `pending`-only check was green through two real
 outages here, because the stall deadline drains `pending` whether writes land or
 fail. `archive_ok` goes false when appends are failing, when the spool is over
-`SPOOL_MAX_MB`, or when calls are waiting and nothing has been archived — but
-*not* merely because the archive is idle, since a check that goes red overnight
-is one that gets ignored by morning.
+`SPOOL_MAX_MB`, when the live spool file cannot be truncated, or when calls are
+waiting and nothing has been archived — but *not* merely because the archive is
+idle, since a check that goes red overnight is one that gets ignored by morning.
+
+`spool_truncate_error` is the field that says *why* a spool is over its limit.
+Reclaiming the live file is a `truncate`, which is a permission on the **file** —
+unlike pruning a rotated one, which is a permission on the directory. new-api
+creates its log `0644` as root, so owning the directory is not enough: the viewer
+logged `permission denied` on every sweep while the tmpfs climbed to 93%, with
+`archive_ok` reporting only "spool over SPOOL_MAX_MB". The combined image's
+entrypoint launches new-api under `umask 0111` so the log lands `0666`; the umask
+is scoped to that subshell, because applying it globally would also widen the
+archive files, which are the permanent record rather than a transient copy.
+
 
 ### Recommended: put it behind your reverse proxy's auth
 
@@ -466,6 +501,20 @@ that identify only a block index. Its usage is also split across two events —
 `message_start` carries input and cache tokens, the closing `message_delta`
 carries `output_tokens` and repeats `input_tokens` *without* the cache counts, so
 usage must be merged rather than replaced or a 520k-token cache read becomes 94.
+
+**OpenAI needs the same joining, for the same reason.** A streaming tool call is
+one opening delta with `id`+`name`+`index`, then one delta per slice of the
+arguments JSON carrying only the index. Appending those verbatim turns one call
+into one call per delta: a single `write` whose argument was a file body was
+stored as 540 nameless calls holding a character or two each. Both formats
+accumulate by index in state that outlives a read pass — the opener and its
+arguments routinely land in different passes.
+
+Anything derived from the request body must be **assigned, not accumulated**, for
+that same reason. `finalize()` runs once per read pass and re-decodes the body
+each time, so `Turns++` multiplied the count by the number of passes — a
+256-message transcript read across 13 passes reported 3,328 turns. Both classes of
+bug are repairable after the fact; see `-repair`.
 
 Events from concurrent calls interleave, so the parser groups by request id and
 derives per-call summaries. Some deliberate choices:

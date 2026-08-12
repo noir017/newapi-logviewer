@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"testing"
 )
 
@@ -130,8 +131,8 @@ func TestParseSample(t *testing.T) {
 				t.Error("/api/status health check should not be listed")
 			}
 		}
-		if total != 6 {
-			t.Errorf("shown = %d, want 6", total)
+		if total != 7 {
+			t.Errorf("shown = %d, want 7", total)
 		}
 	})
 
@@ -142,19 +143,19 @@ func TestParseSample(t *testing.T) {
 			f    listFilter
 			want int
 		}{
-			{"tools", listFilter{Tools: "1"}, 3},
+			{"tools", listFilter{Tools: "1"}, 4},
 			{"tool_name", listFilter{ToolName: "send_email"}, 1},
 			{"tool_name missing", listFilter{ToolName: "nope"}, 0},
-			{"stream", listFilter{Stream: "1"}, 2},
+			{"stream", listFilter{Stream: "1"}, 3},
 			{"non-stream", listFilter{Stream: "0"}, 4},
-			{"ok", listFilter{Status: "ok"}, 5},
+			{"ok", listFilter{Status: "ok"}, 6},
 			{"err", listFilter{Status: "err"}, 1},
 			{"errors", listFilter{ErrorsOnly: true}, 1},
 			{"model", listFilter{Model: "demo/chat-mini"}, 2},
 			{"search hit", listFilter{Search: "berlin"}, 1},
 			{"search miss", listFilter{Search: "ZZZ"}, 0},
 			{"until", listFilter{Until: 1}, 0},
-			{"since", listFilter{Since: 1}, 6},
+			{"since", listFilter{Since: 1}, 7},
 		}
 		for _, c := range cases {
 			_, got, _, _ := q.list(c.f, 1, 100)
@@ -283,4 +284,146 @@ func TestAnthropicNative(t *testing.T) {
 			t.Errorf("total_tokens = %v, want 520740", r.Usage.TotalTokens)
 		}
 	})
+}
+
+// findRec is a small helper: these tests care about one fixture record each.
+func findRec(t *testing.T, rid string) *Record {
+	t.Helper()
+	for _, rec := range Load("./testdata", 0) {
+		if rec.RequestID == rid {
+			return rec
+		}
+	}
+	t.Fatalf("record %s missing from fixtures", rid)
+	return nil
+}
+
+// A streaming tool call arrives as an opener carrying id+name+index followed by
+// deltas carrying only index and a slice of the arguments JSON. They have to be
+// joined by index; appending each fragment turned one call into one call per
+// delta. Production showed a single `write` as 540 nameless calls.
+func TestStreamToolCallFragmentsAreJoined(t *testing.T) {
+	r := findRec(t, "StreamFragmentToolsAaaaBbbb")
+
+	if n := len(r.StreamToolCalls); n != 2 {
+		t.Fatalf("stream_tool_calls = %d, want 2 (one per index, not one per delta)", n)
+	}
+	for i, want := range []struct{ id, name, args string }{
+		{"call_frag1", "write", `{"path":"b.sh"}`},
+		{"call_frag2", "read", `{"p":1}`},
+	} {
+		got := r.StreamToolCalls[i]
+		if got.ID != want.id {
+			t.Errorf("call %d id = %q, want %q - the opener's id must survive later fragments", i, got.ID, want.id)
+		}
+		if got.Function.Name != want.name {
+			t.Errorf("call %d name = %q, want %q", i, got.Function.Name, want.name)
+		}
+		// The whole point: fragments concatenate into parseable JSON.
+		if got.Function.Arguments != want.args {
+			t.Errorf("call %d arguments = %q, want %q", i, got.Function.Arguments, want.args)
+		}
+		if !json.Valid([]byte(got.Function.Arguments)) {
+			t.Errorf("call %d arguments are not valid JSON: %q", i, got.Function.Arguments)
+		}
+	}
+	// And the derived list-row field stays a set of names, not a pile.
+	if len(r.CalledTools) != 2 {
+		t.Errorf("called_tools = %v, want 2 entries", r.CalledTools)
+	}
+}
+
+// Turns/MsgCount/ToolCount are derived wholly from the request body, which is
+// re-decoded on every finalize pass. finalize runs once per read pass, so
+// accumulating instead of assigning multiplied them by the number of passes -
+// a 256-message transcript read across 13 passes reported 3,328 turns.
+func TestDerivedCountsSurviveRepeatedFinalize(t *testing.T) {
+	r := findRec(t, "StreamFragmentToolsAaaaBbbb")
+
+	const (
+		wantTurns = 3 // assistant messages in the fixture
+		wantMsgs  = 6
+		wantTools = 2
+	)
+	if r.Turns != wantTurns || r.MsgCount != wantMsgs || r.ToolCount != wantTools {
+		t.Fatalf("after parse: turns=%d msgs=%d tools=%d, want %d/%d/%d",
+			r.Turns, r.MsgCount, r.ToolCount, wantTurns, wantMsgs, wantTools)
+	}
+
+	// Ten more passes must not move them. This is the actual regression: one
+	// pass looks correct, which is why it shipped.
+	for i := 0; i < 10; i++ {
+		r.finalize()
+	}
+	if r.Turns != wantTurns {
+		t.Errorf("turns = %d after 11 finalize passes, want %d (accumulated instead of assigned)", r.Turns, wantTurns)
+	}
+	if r.MsgCount != wantMsgs {
+		t.Errorf("msg_count = %d, want %d", r.MsgCount, wantMsgs)
+	}
+	if r.ToolCount != wantTools {
+		t.Errorf("tool_count = %d, want %d", r.ToolCount, wantTools)
+	}
+	// Tool calls are assembled from cumulative state, so they must also be
+	// assigned rather than appended across passes.
+	if n := len(r.StreamToolCalls); n != wantTools {
+		t.Errorf("stream_tool_calls = %d after repeated finalize, want %d", n, wantTools)
+	}
+}
+
+// The fragments for one call can land in different read passes: the opener in
+// one, the arguments in the next. Joining has to happen in state that outlives
+// a pass, since finalize drains r.chunks at the end of each one.
+func TestStreamToolCallsJoinAcrossReadPasses(t *testing.T) {
+	const rid = "SplitPassToolsAaaaBbbbCcc"
+	calls := map[string]*Record{}
+
+	pass := func(lines ...string) {
+		for _, l := range lines {
+			handleLine(l, calls)
+		}
+		calls[rid].finalize()
+	}
+
+	pass(`[DEBUG] 2026/01/15 - 14:00:00 | `+rid+` | text request body: {"model":"chat-pro","stream":true,"messages":[{"role":"user","content":"go"},{"role":"assistant","content":"ok"}]}`,
+		`[DEBUG] 2026/01/15 - 14:00:01 | `+rid+` | stream scanner data: data: {"choices":[{"delta":{"tool_calls":[{"id":"call_x","type":"function","function":{"name":"write","arguments":"{\"a\""},"index":0}]}}]}`)
+	pass(`[DEBUG] 2026/01/15 - 14:00:02 | ` + rid + ` | stream scanner data: data: {"choices":[{"delta":{"tool_calls":[{"function":{"arguments":":1}"},"index":0}]}}]}`)
+
+	r := calls[rid]
+	if n := len(r.StreamToolCalls); n != 1 {
+		t.Fatalf("stream_tool_calls = %d, want 1 - fragments split across passes must still join", n)
+	}
+	tc := r.StreamToolCalls[0]
+	if tc.Function.Name != "write" || tc.Function.Arguments != `{"a":1}` {
+		t.Errorf("call = %q %q, want write {\"a\":1}", tc.Function.Name, tc.Function.Arguments)
+	}
+	if r.Turns != 1 {
+		t.Errorf("turns = %d after 2 passes, want 1", r.Turns)
+	}
+}
+
+// Some providers omit the index and stream one call at a time. Those fragments
+// must still concatenate rather than each becoming its own call - and a new
+// tool name is the only signal that the next call has begun.
+func TestStreamToolCallsWithoutIndex(t *testing.T) {
+	var ta toolAcc
+	frag := func(name, args string) ToolCall {
+		var tc ToolCall
+		tc.Function.Name, tc.Function.Arguments = name, args
+		return tc
+	}
+	ta.add(frag("write", `{"p"`))
+	ta.add(frag("", `:1}`))
+	ta.add(frag("read", `{"q":2}`))
+
+	got := ta.calls()
+	if len(got) != 2 {
+		t.Fatalf("calls = %d, want 2", len(got))
+	}
+	if got[0].Function.Name != "write" || got[0].Function.Arguments != `{"p":1}` {
+		t.Errorf("call 0 = %q %q", got[0].Function.Name, got[0].Function.Arguments)
+	}
+	if got[1].Function.Name != "read" || got[1].Function.Arguments != `{"q":2}` {
+		t.Errorf("call 1 = %q %q", got[1].Function.Name, got[1].Function.Arguments)
+	}
 }
