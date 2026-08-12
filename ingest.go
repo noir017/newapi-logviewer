@@ -334,16 +334,29 @@ func (i *ingester) truncateLive(path string) int64 {
 		return 0 // unread bytes: dropping them would lose calls
 	}
 	if err := os.Truncate(path, 0); err != nil {
-		// Worth surfacing on /healthz rather than only in the log: this is the
-		// one reclaim path that protects the gateway, and when it fails the
-		// spool fills to 100% of its tmpfs and New API's writes start failing.
-		// It failed silently in production for exactly this reason - new-api
-		// creates the log 0644 as root, and truncating is a permission on the
-		// FILE, not the directory the viewer owns. The spool-over-max signal
-		// alone did not say why it was over.
-		i.truncErr = err.Error()
-		log.Printf("spool truncate %s: %v", path, err)
-		return 0
+		// Truncating is a permission on the FILE, unlike unlinking a rotated one,
+		// which is a permission on the directory the viewer owns. New API creates
+		// its log 0644 as root and passes that mode explicitly, so a umask cannot
+		// widen it and owning the directory is not enough.
+		//
+		// Owning the directory IS enough to chmod a file inside it, though, so
+		// widen the file and retry once. This is the difference between the
+		// gateway losing all logging when the tmpfs fills and a spool that
+		// manages itself; the spool is a transient tmpfs copy of data already in
+		// the archive, so group/world write on it costs nothing that matters.
+		if cherr := os.Chmod(path, 0o666); cherr == nil {
+			err = os.Truncate(path, 0)
+		}
+		if err != nil {
+			// Worth surfacing on /healthz rather than only in the log: this is
+			// the one reclaim path that protects the gateway, and when it fails
+			// the spool fills to 100% of its tmpfs and New API's writes start
+			// failing. It failed silently in production for exactly this reason,
+			// and the spool-over-max signal alone did not say why.
+			i.truncErr = err.Error()
+			log.Printf("spool truncate %s: %v", path, err)
+			return 0
+		}
 	}
 	i.truncErr = ""
 

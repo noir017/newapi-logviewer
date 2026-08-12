@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -1031,5 +1032,54 @@ func TestIngestWaitsForChunksAfterBilling(t *testing.T) {
 	}
 	if got.StreamContent != "trailing" {
 		t.Errorf("stream_content = %q, want trailing: a chunk after billing was lost", got.StreamContent)
+	}
+}
+
+// A read-only spool file must still be reclaimable.
+//
+// This is the case every other truncate test missed: they create the file as the
+// test user, who can truncate it whatever its mode. In production new-api creates
+// the log 0644 as root and the viewer runs as 65534, so truncate returns EPERM -
+// and a umask cannot help, because new-api passes the mode explicitly. Verified
+// on the running container: /proc/<pid>/status showed Umask 0111 and the file was
+// still 0644.
+//
+// Owning the directory does permit chmod on a file inside it, which is what makes
+// the recovery possible.
+func TestSpoolTruncatesReadOnlyLiveFile(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix file modes")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores the write bit, so this cannot fail as intended")
+	}
+	spool, arcDir := t.TempDir(), t.TempDir()
+	arc := newArchive(arcDir)
+	defer arc.Close()
+
+	only := filepath.Join(spool, "oneapi-20260811204357.log")
+	if err := os.WriteFile(only, make([]byte, 4000), 0o444); err != nil {
+		t.Fatal(err)
+	}
+	// Confirm the setup actually denies writes, so a passing test means the
+	// chmod-and-retry worked rather than that the mode never mattered.
+	if f, err := os.OpenFile(only, os.O_WRONLY, 0); err == nil {
+		f.Close()
+		t.Skip("filesystem does not enforce the write bit here")
+	}
+
+	ing := newIngester(spool, arc, time.Hour, 2500)
+	ing.offsets[only] = 4000 // every byte already folded into the archive
+	ing.prune([]string{only})
+
+	st, err := os.Stat(only)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Size() != 0 {
+		t.Errorf("size = %d, want 0: a read-only spool file must still be reclaimed", st.Size())
+	}
+	if ing.truncErr != "" {
+		t.Errorf("truncErr = %q, want empty after a successful retry", ing.truncErr)
 	}
 }
