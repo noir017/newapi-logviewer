@@ -140,9 +140,19 @@ type Record struct {
 	// drained by a previous finalize pass.
 	sawChunks bool
 
+	// billingSeen records that the billing line arrived. It is a completion
+	// marker independent of the GIN line, which does not reach the log file on
+	// every deployment - see the comment at the `record consume log:` arm.
+	billingSeen bool
+
 	// lastSeen is when a line for this call was last read, used by the
 	// ingester to decide a call has stalled and will never complete.
 	lastSeen time.Time
+
+	// anth accumulates Anthropic tool calls across chunk lines and across
+	// incremental read passes, since a tool's name and its arguments arrive on
+	// different lines that may land in different passes.
+	anth anthropicState
 
 	chunks []streamChunk // dropped by finalize
 }
@@ -220,6 +230,109 @@ type streamChunk struct {
 		TotalTokenCount      *int `json:"totalTokenCount"`
 		ThoughtsTokenCount   *int `json:"thoughtsTokenCount"`
 	} `json:"usageMetadata"`
+
+	// Anthropic's native streaming shape, logged verbatim for Claude-family
+	// channels on the /v1/messages path. Same lesson as Gemini above, learned
+	// the same way: claude-opus-5 calls archived 69 unparsed chunks with an
+	// empty body, because these decode as valid JSON with no `choices` at all -
+	// so unlike a malformed line they were not even obviously broken.
+	//
+	// One event per line, discriminated by Type:
+	//   message_start        - usage (input/cache tokens)
+	//   content_block_start  - opens block Index; carries the tool name+id
+	//   content_block_delta  - text_delta | thinking_delta | input_json_delta
+	//   message_delta        - final usage (output_tokens)
+	// Blocks are addressed by index, and a tool call's name arrives in its
+	// _start while its arguments dribble in as input_json_delta fragments that
+	// name only the index - so assembly needs state across lines, which is what
+	// anthropicState below carries.
+	Type  string `json:"type"`
+	Index *int   `json:"index"`
+	Delta *struct {
+		Type        string `json:"type"`
+		Text        string `json:"text"`
+		Thinking    string `json:"thinking"`
+		PartialJSON string `json:"partial_json"`
+	} `json:"delta"`
+	ContentBlock *struct {
+		Type string `json:"type"`
+		ID   string `json:"id"`
+		Name string `json:"name"`
+	} `json:"content_block"`
+	Message *struct {
+		Usage *anthropicUsage `json:"usage"`
+	} `json:"message"`
+
+	// raw is the undecoded chunk body, not a wire field. Anthropic's final
+	// usage sits at the top-level "usage" key - the same key OpenAI uses, but
+	// with different member names - and two struct fields cannot share one json
+	// tag: encoding/json silently drops BOTH on conflict. So message_delta
+	// usage is decoded from raw on demand rather than bound to a second field.
+	raw string
+}
+
+// anthropicUsage is Anthropic's token accounting. Cache reads and writes are
+// billed differently from fresh input, and for a cached agent transcript they
+// dwarf it - 519,620 cache-read against 94 input tokens on a real call here -
+// so prompt_tokens must include them or the number is meaningless.
+type anthropicUsage struct {
+	InputTokens         *int `json:"input_tokens"`
+	OutputTokens        *int `json:"output_tokens"`
+	CacheCreationTokens *int `json:"cache_creation_input_tokens"`
+	CacheReadTokens     *int `json:"cache_read_input_tokens"`
+}
+
+// toUsage normalises Anthropic's counts onto the OpenAI-shaped Usage the UI
+// renders. Cached tokens are surfaced separately as well as folded into the
+// prompt total, matching what prompt_tokens_details.cached_tokens means.
+func (a *anthropicUsage) toUsage() *Usage {
+	if a == nil {
+		return nil
+	}
+	var u Usage
+	in := 0
+	if a.InputTokens != nil {
+		in = *a.InputTokens
+	}
+	cached := 0
+	if a.CacheReadTokens != nil {
+		cached += *a.CacheReadTokens
+	}
+	if a.CacheCreationTokens != nil {
+		cached += *a.CacheCreationTokens
+	}
+	total := in + cached
+	u.PromptTokens = &total
+	if cached > 0 {
+		u.PromptDetails = &struct {
+			CachedTokens *int `json:"cached_tokens,omitempty"`
+		}{CachedTokens: &cached}
+	}
+	if a.OutputTokens != nil {
+		out := *a.OutputTokens
+		u.CompletionTokens = &out
+		sum := total + out
+		u.TotalTokens = &sum
+	}
+	return &u
+}
+
+// anthropicState carries the cross-line state Anthropic's format needs: which
+// block index is which tool, so input_json_delta fragments (which name only an
+// index) can be attributed. Held per-record by the parser.
+type anthropicState struct {
+	tools map[int]*ToolCall // block index -> accumulating tool call
+	order []int             // first-seen order, so output is deterministic
+}
+
+// isAnthropic reports whether this chunk is an Anthropic-native event.
+func (ch *streamChunk) isAnthropic() bool {
+	switch ch.Type {
+	case "message_start", "content_block_start", "content_block_delta",
+		"content_block_stop", "message_delta", "message_stop":
+		return true
+	}
+	return false
 }
 
 // text pulls the visible and reasoning text out of a chunk, whichever wire
@@ -240,11 +353,42 @@ func (ch *streamChunk) text() (content, reasoning string, tools []ToolCall) {
 			}
 		}
 	}
+	// Anthropic: text and thinking deltas. Tool calls are NOT returned here -
+	// their arguments span many lines and are assembled by anthropicState, so
+	// emitting them per-chunk would produce one fragment-sized call per line.
+	if ch.Type == "content_block_delta" && ch.Delta != nil {
+		switch ch.Delta.Type {
+		case "text_delta":
+			c.WriteString(ch.Delta.Text)
+		case "thinking_delta":
+			r.WriteString(ch.Delta.Thinking)
+		}
+	}
 	return c.String(), r.String(), tools
 }
 
 // usage normalises whichever usage block the chunk carried.
 func (ch *streamChunk) usage() *Usage {
+	// Anthropic reports usage twice: input and cache counts in message_start,
+	// output_tokens in the closing message_delta. Both are decoded from raw
+	// (see the field comment) and merged by the caller.
+	//
+	// This must be tested BEFORE ch.Usage. Anthropic's message_delta puts its
+	// usage at the top-level "usage" key - the same key OpenAI uses - so the
+	// OpenAI-shaped ch.Usage decodes to a non-nil struct with every member nil.
+	// Checking ch.Usage first therefore returned an empty usage and threw away
+	// output_tokens entirely.
+	if ch.Type == "message_start" && ch.Message != nil {
+		return ch.Message.Usage.toUsage()
+	}
+	if ch.Type == "message_delta" && ch.raw != "" {
+		var v struct {
+			Usage *anthropicUsage `json:"usage"`
+		}
+		if json.Unmarshal([]byte(ch.raw), &v) == nil {
+			return v.Usage.toUsage()
+		}
+	}
 	if ch.Usage != nil {
 		return ch.Usage
 	}
@@ -261,8 +405,90 @@ func (ch *streamChunk) usage() *Usage {
 
 // hasPayload reports whether the chunk carried anything worth counting.
 // Keepalives and comment lines decode fine but say nothing.
+//
+// The Anthropic arm is why this is not just a nil-check on Choices: a
+// content_block_delta is valid JSON with no choices, so it read as "unknown
+// shape" and its text went to UnknownChunks - which meant a bounded 20-line
+// sample survived and the rest of the response was destroyed by folding.
 func (ch *streamChunk) hasPayload() bool {
-	return len(ch.Choices) > 0 || len(ch.Candidates) > 0 || ch.Usage != nil || ch.UsageMetadata != nil
+	if len(ch.Choices) > 0 || len(ch.Candidates) > 0 || ch.Usage != nil || ch.UsageMetadata != nil {
+		return true
+	}
+	switch ch.Type {
+	case "message_start", "content_block_start", "content_block_delta", "message_delta":
+		return true
+	}
+	// "ping", "message_stop" and content_block_stop carry no data. They are
+	// real events rather than unknown shapes though, so report them as
+	// payload-free instead of letting them accumulate as evidence of a format
+	// we failed to parse.
+	return false
+}
+
+// isKnownEmpty distinguishes a recognised but empty Anthropic/SSE event from a
+// genuinely unrecognised chunk shape. Only the latter is worth sampling.
+func (ch *streamChunk) isKnownEmpty() bool {
+	switch ch.Type {
+	case "ping", "message_stop", "content_block_stop", "error":
+		return true
+	}
+	return false
+}
+
+// applyAnthropic folds a chunk's tool-call fragments into st. Anthropic opens a
+// tool block with its name and id, then streams the arguments as partial_json
+// fragments that identify only the block index, so the two have to be joined
+// here rather than per-chunk.
+func (st *anthropicState) applyAnthropic(ch *streamChunk) {
+	if ch.Index == nil {
+		return
+	}
+	idx := *ch.Index
+	switch ch.Type {
+	case "content_block_start":
+		if ch.ContentBlock == nil || ch.ContentBlock.Type != "tool_use" {
+			return
+		}
+		if st.tools == nil {
+			st.tools = map[int]*ToolCall{}
+		}
+		if _, seen := st.tools[idx]; !seen {
+			st.order = append(st.order, idx)
+		}
+		i := idx
+		tc := &ToolCall{Index: &i, ID: ch.ContentBlock.ID, Type: "function"}
+		tc.Function.Name = ch.ContentBlock.Name
+		st.tools[idx] = tc
+	case "content_block_delta":
+		if ch.Delta == nil || ch.Delta.Type != "input_json_delta" {
+			return
+		}
+		// Arguments for a block we never saw opened - a call whose start line
+		// rotated out of the spool. Keep the fragments under a nameless call
+		// rather than discarding them.
+		tc, ok := st.tools[idx]
+		if !ok {
+			if st.tools == nil {
+				st.tools = map[int]*ToolCall{}
+			}
+			i := idx
+			tc = &ToolCall{Index: &i, Type: "function"}
+			st.tools[idx] = tc
+			st.order = append(st.order, idx)
+		}
+		tc.Function.Arguments += ch.Delta.PartialJSON
+	}
+}
+
+// calls returns the assembled tool calls in the order their blocks opened.
+func (st *anthropicState) calls() []ToolCall {
+	out := make([]ToolCall, 0, len(st.order))
+	for _, idx := range st.order {
+		if tc := st.tools[idx]; tc != nil {
+			out = append(out, *tc)
+		}
+	}
+	return out
 }
 
 // ---- parsing ---------------------------------------------------------------
@@ -396,13 +622,29 @@ func handleLine(line string, calls map[string]*Record) string {
 	switch {
 	case strings.HasPrefix(msg, "text request body:"):
 		rec.Request = parseRaw(strings.TrimSpace(msg[len("text request body:"):]))
+	// Anthropic-native relays log the request under a different marker. Missing
+	// it did more than blank the request pane: the body fell through to the
+	// error arm below, which matches any message containing "error" - and the
+	// Claude Code system prompt contains the word. Every claude-opus-5 prompt
+	// was being filed as an error. Both markers must be handled here, ahead of
+	// that catch-all.
+	case strings.HasPrefix(msg, "requestBody:"):
+		rec.Request = parseRaw(strings.TrimSpace(msg[len("requestBody:"):]))
 	case strings.HasPrefix(msg, "upstream response body:"):
 		rec.Response = parseRaw(strings.TrimSpace(msg[len("upstream response body:"):]))
 	case strings.HasPrefix(msg, "stream scanner data:"):
 		ch, body, ok := streamChunkOf(msg[len("stream scanner data:"):])
 		switch {
 		case ok && ch.hasPayload():
+			// Anthropic tool arguments span many lines and are joined by index,
+			// so they are folded into per-record state as they arrive rather
+			// than carried on the chunk.
+			if ch.isAnthropic() {
+				rec.anth.applyAnthropic(&ch)
+			}
 			rec.chunks = append(rec.chunks, ch)
+		case ok && ch.isKnownEmpty():
+			return r[1] // ping / message_stop / content_block_stop
 		case body != "":
 			// Parsed but empty of anything we recognise, or not JSON at all.
 			// Folding throws the raw lines away, so an unknown provider shape
@@ -433,6 +675,22 @@ func handleLine(line string, calls map[string]*Record) string {
 	case strings.HasPrefix(msg, "record consume log:"):
 		if i := strings.Index(msg, "params="); i >= 0 {
 			rec.Billing = parseRaw(strings.TrimSpace(msg[i+len("params="):]))
+			// Billing is written after the response is fully delivered, which
+			// makes it a completion marker in its own right - and the only one
+			// that reliably reaches the log FILE.
+			//
+			// The GIN line cannot be relied on: gin's access logger writes to
+			// gin.DefaultWriter, which is a different sink from the file New API
+			// opens for its own logger. Measured on this deployment - 347,863
+			// DEBUG lines in the live log file and not one GIN line, while
+			// `docker logs` showed them arriving on stdout the whole time.
+			// Archived history confirms it changed under us: Aug 10 had 2,052
+			// records carrying a GIN-only field, Aug 11 onward had none.
+			//
+			// Without this, every call waits out stallAfter and is filed as
+			// Stalled - a 10-minute archive delay on every record, and a
+			// "response never finished" badge on calls that finished fine.
+			rec.billingSeen = true
 		}
 	case strings.Contains(msg, "stream ended"):
 		if i := strings.LastIndex(msg, "reason="); i >= 0 {
@@ -472,7 +730,50 @@ func streamChunkOf(raw string) (streamChunk, string, bool) {
 	if json.Unmarshal([]byte(body), &ch) != nil {
 		return ch, body, false
 	}
+	ch.raw = body
 	return ch, body, true
+}
+
+// mergeUsage combines usage seen across chunks, preferring later non-nil
+// values. Needed because Anthropic splits the accounting in two: message_start
+// carries input and cache tokens, and the closing message_delta carries
+// output_tokens with input_tokens repeated but cache counts absent. Replacing
+// wholesale - which is what the OpenAI path did, since it reports usage once -
+// would drop the cache read of a 519k-token agent transcript.
+func mergeUsage(old, next *Usage) *Usage {
+	if old == nil {
+		return next
+	}
+	if next == nil {
+		return old
+	}
+	out := *old
+	if next.PromptTokens != nil {
+		// Keep the larger prompt count: message_delta repeats input_tokens
+		// without the cache totals, so taking it verbatim would shrink a
+		// 519,714-token prompt to 94.
+		if out.PromptTokens == nil || *next.PromptTokens > *out.PromptTokens {
+			out.PromptTokens = next.PromptTokens
+		}
+	}
+	if next.CompletionTokens != nil {
+		out.CompletionTokens = next.CompletionTokens
+	}
+	if next.PromptDetails != nil {
+		out.PromptDetails = next.PromptDetails
+	}
+	if next.CompletionDetails != nil {
+		out.CompletionDetails = next.CompletionDetails
+	}
+	// Recompute rather than trust either event's total: neither Anthropic event
+	// carries a total, and toUsage's is derived from whatever that event knew.
+	if out.PromptTokens != nil && out.CompletionTokens != nil {
+		sum := *out.PromptTokens + *out.CompletionTokens
+		out.TotalTokens = &sum
+	} else if next.TotalTokens != nil {
+		out.TotalTokens = next.TotalTokens
+	}
+	return &out
 }
 
 func clip(s string, n int) string {
@@ -525,7 +826,7 @@ func (r *Record) finalize() {
 			reasoning.WriteString(rs)
 			r.StreamToolCalls = append(r.StreamToolCalls, tools...)
 			if u := ch.usage(); u != nil {
-				r.Usage = u
+				r.Usage = mergeUsage(r.Usage, u)
 			}
 		}
 		r.StreamContent += content.String()
@@ -533,6 +834,12 @@ func (r *Record) finalize() {
 		r.sawChunks = true
 	} else if !r.sawChunks {
 		r.Usage = resp.Usage
+	}
+	// Anthropic tool calls live in cumulative state keyed by block index, so
+	// they are assigned rather than appended - finalize runs once per read pass
+	// and appending would duplicate every call already assembled.
+	if calls := r.anth.calls(); len(calls) > 0 {
+		r.StreamToolCalls = calls
 	}
 	if r.Usage == nil && hasBill {
 		r.Usage = &Usage{PromptTokens: bill.PromptTokens, CompletionTokens: bill.CompletionTokens}

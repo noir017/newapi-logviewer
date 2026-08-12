@@ -50,7 +50,18 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if path == "/healthz" {
-		s.writeJSON(w, 200, map[string]any{"ok": true, "pending": s.ing.pendingCount()})
+		// Reports write-side health, not just liveness. A pending-only check was
+		// green through both of this repo's real outages: reads need no write
+		// permission, so a viewer that archives nothing still serves perfect
+		// pages. Returns 503 when ingest is broken so a container healthcheck or
+		// an uptime monitor actually fires.
+		h := s.ing.health()
+		code := 200
+		if ok, _ := h["archive_ok"].(bool); !ok {
+			code = 503
+		}
+		h["ok"] = code == 200
+		s.writeJSON(w, code, h)
 		return
 	}
 

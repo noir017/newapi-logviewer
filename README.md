@@ -286,7 +286,23 @@ Two caveats worth knowing before you pick this mode:
   mode is practical for scripted access; for browsing, put the viewer behind your
   own auth (see below) and leave `AUTH_MODE=none`.
 
-`/healthz` is always reachable without a token.
+`/healthz` is always reachable without a token. It reports **write-side** health,
+not liveness, and returns `503` when ingest is broken:
+
+```json
+{"ok":true,"pending":0,"appends":3412,"archive_ok":true,
+ "last_append":"2026-08-12T22:18:09+08:00","last_append_age_sec":4,
+ "spool_bytes":118293504,"spool_files":1,"append_fails":0}
+```
+
+The distinction matters because **reads need no write permission**: a viewer that
+cannot write its archive still serves fast, correct pages and a green liveness
+check while recording nothing. A `pending`-only check was green through two real
+outages here, because the stall deadline drains `pending` whether writes land or
+fail. `archive_ok` goes false when appends are failing, when the spool is over
+`SPOOL_MAX_MB`, or when calls are waiting and nothing has been archived — but
+*not* merely because the archive is idle, since a check that goes red overnight
+is one that gets ignored by morning.
 
 ### Recommended: put it behind your reverse proxy's auth
 
@@ -408,11 +424,48 @@ New API emits one line per event, all tagged with a request id:
 
 ```
 [DEBUG] 2026/01/15 - 09:01:10 | <rid> | text request body: {...}
+[DEBUG] 2026/01/15 - 09:01:10 | <rid> | requestBody: {...}
 [DEBUG] 2026/01/15 - 09:01:12 | <rid> | upstream response body: {...}
 [DEBUG] 2026/01/15 - 09:02:31 | <rid> | stream scanner data: data: {...}
 [INFO]  2026/01/15 - 09:01:12 | <rid> | record consume log: userId=1, params={...}
 [GIN]   2026/01/15 - 09:01:12 | relay | <rid> | 200 | 2.01s | 10.0.0.9 | POST /v1/...
 ```
+
+Two markers carry the request body, not one: OpenAI-path relays log
+`text request body:`, Anthropic-path relays (`/v1/messages`) log `requestBody:`.
+Both must be handled, and **before** any catch-all that treats a line
+containing "error" as an error — a Claude Code system prompt contains the word,
+so a missing arm files the whole prompt as an error message rather than a body.
+
+**The `[GIN]` line may never reach the log file.** gin's access logger writes to
+`gin.DefaultWriter`, which is a different sink from the file New API opens for
+its own logger, so whether GIN lines land in the file is not something this
+viewer controls. Measured on a live gateway: 347,863 DEBUG lines in the log file
+and zero GIN lines, while `docker logs` showed them arriving on stdout
+throughout — and it changed mid-flight, with one day's archive carrying
+GIN-only fields on 2,052 records and the next day's on none.
+
+So completion is decided by the GIN line **or** by the billing
+(`record consume log:`) line, which is written after delivery and does reach the
+file. Relying on GIN alone makes every call wait out the stall deadline and land
+in the archive marked "stalled" — a 10-minute delay on every record plus a
+"response never finished" badge on calls that finished perfectly.
+
+Streaming chunks arrive in three different shapes, and folding is lossy, so an
+unrecognised one is destroyed rather than merely mis-displayed:
+
+| Channel | Chunk shape |
+|---|---|
+| OpenAI-compatible | `choices[].delta.content` / `.reasoning_content` |
+| Gemini native | `candidates[].content.parts[].text` (`thought` marks reasoning) |
+| Anthropic native | `content_block_delta` → `text_delta` / `thinking_delta` / `input_json_delta` |
+
+Anthropic's shape needs cross-line state: a tool call's name arrives in
+`content_block_start` while its arguments stream as `input_json_delta` fragments
+that identify only a block index. Its usage is also split across two events —
+`message_start` carries input and cache tokens, the closing `message_delta`
+carries `output_tokens` and repeats `input_tokens` *without* the cache counts, so
+usage must be merged rather than replaced or a 520k-token cache read becomes 94.
 
 Events from concurrent calls interleave, so the parser groups by request id and
 derives per-call summaries. Some deliberate choices:

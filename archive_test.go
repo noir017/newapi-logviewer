@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -750,5 +751,285 @@ func TestIngestSkipsHealthChecks(t *testing.T) {
 	}
 	if _, total, _, _ := q.list(listFilter{}, 1, 50); total != 3 {
 		t.Errorf("archive holds %d records, want 3", total)
+	}
+}
+
+// The outage this repo actually had: a 256MB tmpfs at 100%, and New API's log
+// writes failing for ~22 hours while the container reported healthy and the
+// viewer served pages normally.
+//
+// The cause was structural, not a tuning mistake. New API opens one log file per
+// process start and never rotates it, so the single file in the spool is always
+// prune's `newest` - permanently exempt from both sweeps. Every prune pass was a
+// no-op no matter how far over SPOOL_MAX_MB the spool went, because there were
+// no older files to drop.
+//
+// A fully-consumed live file must therefore be truncated, not skipped.
+func TestSpoolTruncatesSingleLiveFile(t *testing.T) {
+	spool, arcDir := t.TempDir(), t.TempDir()
+	arc := newArchive(arcDir)
+	defer arc.Close()
+
+	only := filepath.Join(spool, "oneapi-20260811204357.log")
+	if err := os.WriteFile(only, make([]byte, 4000), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ing := newIngester(spool, arc, time.Hour, 2500)
+	ing.offsets[only] = 4000 // every byte already folded into the archive
+	ing.prune([]string{only})
+
+	st, err := os.Stat(only)
+	if err != nil {
+		// Unlinking is not an acceptable fix: New API holds the descriptor open,
+		// so the blocks stay allocated while the log becomes unreachable.
+		t.Fatalf("the live spool file must still exist, got %v", err)
+	}
+	if st.Size() != 0 {
+		t.Errorf("live spool file is %d bytes, want 0 - spool over SPOOL_MAX_MB was not reclaimed", st.Size())
+	}
+	if ing.offsets[only] != 0 {
+		t.Errorf("offset = %d, want 0 after truncation; a stale offset skips everything written next",
+			ing.offsets[only])
+	}
+}
+
+// Truncation reclaims space by discarding bytes, so it may only ever touch a
+// file whose every byte is already in the archive. An unread tail means calls
+// that were never folded, and losing those is exactly what the archive exists
+// to prevent - better to let the tmpfs fill than to silently drop records.
+func TestSpoolNeverTruncatesUnreadBytes(t *testing.T) {
+	spool, arcDir := t.TempDir(), t.TempDir()
+	arc := newArchive(arcDir)
+	defer arc.Close()
+
+	only := filepath.Join(spool, "oneapi-20260811204357.log")
+	if err := os.WriteFile(only, make([]byte, 4000), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ing := newIngester(spool, arc, time.Hour, 2500)
+	ing.offsets[only] = 3999 // one byte still unread
+	ing.prune([]string{only})
+
+	st, err := os.Stat(only)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Size() != 4000 {
+		t.Errorf("size = %d, want 4000: truncated a file with unread bytes", st.Size())
+	}
+}
+
+// Under the high-water mark, nothing is touched. Truncation is a last resort,
+// not routine behaviour: the spool doubles as the retry buffer for calls that
+// have not finished, and discarding it whenever it was consumed would leave
+// nothing to re-read after a restart.
+func TestSpoolLeavesLiveFileUnderMaxBytes(t *testing.T) {
+	spool, arcDir := t.TempDir(), t.TempDir()
+	arc := newArchive(arcDir)
+	defer arc.Close()
+
+	only := filepath.Join(spool, "oneapi-20260811204357.log")
+	if err := os.WriteFile(only, make([]byte, 1000), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ing := newIngester(spool, arc, time.Hour, 2500)
+	ing.offsets[only] = 1000
+	ing.prune([]string{only})
+
+	if st, _ := os.Stat(only); st.Size() != 1000 {
+		t.Errorf("size = %d, want 1000: truncated while under the high-water mark", st.Size())
+	}
+}
+
+// /healthz must report write-side health, not liveness.
+//
+// This is the check that was green through both of this repo's real outages.
+// Reads need no write permission, so a viewer that archives nothing still
+// serves fast, correct pages; and `pending` is useless as a signal because the
+// stall deadline drains it whether writes land or fail.
+func TestHealthDetectsBrokenArchive(t *testing.T) {
+	spool, arcDir := t.TempDir(), t.TempDir()
+	arc := newArchive(arcDir)
+	defer arc.Close()
+	ing := newIngester(spool, arc, time.Hour, 0)
+
+	t.Run("healthy after a successful append", func(t *testing.T) {
+		p := filepath.Join(spool, "oneapi-20260304100000.log")
+		os.WriteFile(p, []byte(
+			`[DEBUG] 2026/03/04 - 10:00:01 | HealthOkAaaaBbbbCcccDddd | text request body: {"model":"m","messages":[]}`+"\n"+
+				`[GIN]   2026/03/04 - 10:00:01 | relay | HealthOkAaaaBbbbCcccDddd | 200 | 1.0s | 10.0.0.1 | POST /v1/chat/completions`+"\n"), 0o644)
+		ing.once()
+
+		h := ing.health()
+		if ok, _ := h["archive_ok"].(bool); !ok {
+			t.Errorf("archive_ok = false, want true: %v", h)
+		}
+		if got, _ := h["appends"].(int64); got != 1 {
+			t.Errorf("appends = %v, want 1", h["appends"])
+		}
+		if _, ok := h["last_append"]; !ok {
+			t.Error("last_append missing; without it staleness is undetectable")
+		}
+	})
+
+	t.Run("unhealthy while appends fail", func(t *testing.T) {
+		// Exactly the production failure: the archive is readable but not
+		// writable, so pages keep working while nothing is recorded.
+		ing.mu.Lock()
+		ing.appendFails, ing.lastErr = 1, "permission denied"
+		ing.mu.Unlock()
+
+		h := ing.health()
+		if ok, _ := h["archive_ok"].(bool); ok {
+			t.Errorf("archive_ok = true while appends are failing: %v", h)
+		}
+		if h["last_error"] != "permission denied" {
+			t.Errorf("last_error = %v, want the append error", h["last_error"])
+		}
+	})
+
+	t.Run("unhealthy while the spool is over its ceiling", func(t *testing.T) {
+		ing2 := newIngester(spool, arc, time.Hour, 10) // 10-byte ceiling
+		h := ing2.health()
+		if ok, _ := h["archive_ok"].(bool); ok {
+			t.Errorf("archive_ok = true with the spool over SPOOL_MAX_MB: %v", h)
+		}
+		if b, _ := h["spool_bytes"].(int64); b <= 10 {
+			t.Errorf("spool_bytes = %v, want > 10", h["spool_bytes"])
+		}
+	})
+
+	t.Run("idle gateway is healthy, not stale", func(t *testing.T) {
+		// An idle gateway archives nothing for hours. A check that goes red
+		// overnight is one that gets ignored by morning, so staleness only
+		// counts against health when there is work waiting.
+		idle := newIngester(t.TempDir(), arc, time.Hour, 0)
+		h := idle.health()
+		if ok, _ := h["archive_ok"].(bool); !ok {
+			t.Errorf("archive_ok = false on an idle gateway with no pending work: %v", h)
+		}
+	})
+
+	t.Run("unhealthy when calls wait and nothing is written", func(t *testing.T) {
+		stuck := newIngester(t.TempDir(), arc, time.Hour, 0)
+		stuck.pending["WaitingCallAaaaBbbbCccc0"] = blank("WaitingCallAaaaBbbbCccc0")
+		// Never had a successful append: lastAppend is the zero time.
+		h := stuck.health()
+		if ok, _ := h["archive_ok"].(bool); ok {
+			t.Errorf("archive_ok = true with calls pending and no append ever: %v", h)
+		}
+	})
+}
+
+// The endpoint must return 503 when ingest is broken, or nothing external ever
+// notices: a container healthcheck and an uptime monitor both key off status.
+func TestHealthzStatusCode(t *testing.T) {
+	spool, arcDir := t.TempDir(), t.TempDir()
+	cfg := loadConfig()
+	cfg.LogDir, cfg.ArchiveDir, cfg.AuthMode, cfg.Base = spool, arcDir, "none", ""
+	srv := newServer(cfg)
+	ing := srv.ing
+
+	rr := httptest.NewRecorder()
+	srv.ServeHTTP(rr, httptest.NewRequest("GET", "/healthz", nil))
+	if rr.Code != 200 {
+		t.Errorf("healthy: code = %d, want 200 (%s)", rr.Code, rr.Body.String())
+	}
+
+	ing.mu.Lock()
+	ing.appendFails, ing.lastErr = 3, "permission denied"
+	ing.mu.Unlock()
+
+	rr = httptest.NewRecorder()
+	srv.ServeHTTP(rr, httptest.NewRequest("GET", "/healthz", nil))
+	if rr.Code != 503 {
+		t.Errorf("broken: code = %d, want 503 (%s)", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), `"ok":false`) {
+		t.Errorf("broken body should carry ok=false, got %s", rr.Body.String())
+	}
+}
+
+// A billed call with no GIN line must archive as a normal, completed record.
+//
+// gin's access logger writes to gin.DefaultWriter, which is not the file New API
+// opens for its own logger. On the live deployment that meant 347,863 DEBUG
+// lines in the log file and not one GIN line, while `docker logs` showed them
+// arriving on stdout the whole time - and the archived history shows it changed
+// mid-flight: Aug 10 had 2,052 records carrying a GIN-only field, Aug 11 onward
+// had none.
+//
+// Relying on the GIN line alone therefore made every call wait out stallAfter
+// and land in the archive marked Stalled - a 10-minute delay on every record,
+// plus a "response never finished" badge on calls that finished perfectly.
+func TestIngestCompletesOnBillingWithoutGIN(t *testing.T) {
+	spool, arcDir := t.TempDir(), t.TempDir()
+	arc := newArchive(arcDir)
+	defer arc.Close()
+
+	p := filepath.Join(spool, "oneapi-20260811204357.log")
+	// No [GIN] line anywhere, exactly as the live spool looks.
+	os.WriteFile(p, []byte(
+		`[DEBUG] 2026/08/11 - 20:54:02 | BilledNoGinAaaaBbbbCccc0 | requestBody: {"model":"claude-opus-5","stream":true,"messages":[{"role":"user","content":"hi"}]}`+"\n"+
+			`[DEBUG] 2026/08/11 - 20:54:03 | BilledNoGinAaaaBbbbCccc0 | stream scanner data: data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}`+"\n"+
+			`[INFO]  2026/08/11 - 20:54:04 | BilledNoGinAaaaBbbbCccc0 | record consume log: userId=1, params={"model_name":"claude-opus-5","quota":42,"channel_id":2,"token_name":"t"}`+"\n"), 0o644)
+
+	ing := newIngester(spool, arc, time.Hour, 0)
+	ing.settleAfter = 0 // the quiet period is real but not what this test is about
+	ing.once()
+
+	if n := len(ing.pending); n != 0 {
+		t.Errorf("pending = %d, want 0: a billed call must not wait for a GIN line", n)
+	}
+	q := newQuery(newArchive(arcDir), 0)
+	got := q.get("BilledNoGinAaaaBbbbCccc0")
+	if got == nil {
+		t.Fatal("billed call missing from the archive")
+	}
+	if got.Stalled {
+		t.Error("stalled = true; a billed call was delivered and charged, not interrupted")
+	}
+	if got.StreamContent != "hello" {
+		t.Errorf("stream_content = %q, want hello", got.StreamContent)
+	}
+}
+
+// The quiet period matters: billing is emitted around the end of the response
+// and trailing chunks can still follow it in the file, so archiving the instant
+// billing lands truncates real content. The record is written once, so it has to
+// be written complete.
+func TestIngestWaitsForChunksAfterBilling(t *testing.T) {
+	spool, arcDir := t.TempDir(), t.TempDir()
+	arc := newArchive(arcDir)
+	defer arc.Close()
+
+	p := filepath.Join(spool, "oneapi-20260811204357.log")
+	os.WriteFile(p, []byte(
+		`[DEBUG] 2026/08/11 - 20:54:02 | SettleAaaaBbbbCcccDddd00 | requestBody: {"model":"claude-opus-5","stream":true,"messages":[]}`+"\n"+
+			`[INFO]  2026/08/11 - 20:54:04 | SettleAaaaBbbbCcccDddd00 | record consume log: userId=1, params={"model_name":"claude-opus-5","quota":42}`+"\n"), 0o644)
+
+	ing := newIngester(spool, arc, time.Hour, 0) // settleAfter at its default
+	ing.once()
+	if len(ing.pending) != 1 {
+		t.Fatalf("pending = %d, want 1: archived before the quiet period elapsed", len(ing.pending))
+	}
+
+	// A trailing chunk lands after billing, as it does in the real log.
+	f, _ := os.OpenFile(p, os.O_APPEND|os.O_WRONLY, 0o644)
+	f.WriteString(`[DEBUG] 2026/08/11 - 20:54:05 | SettleAaaaBbbbCcccDddd00 | stream scanner data: data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"trailing"}}` + "\n")
+	f.Close()
+
+	ing.settleAfter = 0 // the period has now "elapsed"
+	ing.once()
+
+	got := newQuery(newArchive(arcDir), 0).get("SettleAaaaBbbbCcccDddd00")
+	if got == nil {
+		t.Fatal("record missing from the archive")
+	}
+	if got.StreamContent != "trailing" {
+		t.Errorf("stream_content = %q, want trailing: a chunk after billing was lost", got.StreamContent)
 	}
 }
