@@ -336,14 +336,14 @@ func (i *ingester) truncateLive(path string) int64 {
 	if err := os.Truncate(path, 0); err != nil {
 		// Truncating is a permission on the FILE, unlike unlinking a rotated one,
 		// which is a permission on the directory the viewer owns. New API creates
-		// its log 0644 as root and passes that mode explicitly, so a umask cannot
-		// widen it and owning the directory is not enough.
+		// its log 0644 as root, so this fails unless something hands the file
+		// over - the combined image's entrypoint runs a watcher that chowns spool
+		// files to the viewer's uid for exactly this reason.
 		//
-		// Owning the directory IS enough to chmod a file inside it, though, so
-		// widen the file and retry once. This is the difference between the
-		// gateway losing all logging when the tmpfs fills and a spool that
-		// manages itself; the spool is a transient tmpfs copy of data already in
-		// the archive, so group/world write on it costs nothing that matters.
+		// The chmod retry below only helps when the viewer already owns the file
+		// (chmod requires ownership, not directory ownership - verified as uid
+		// 65534 against a root-owned file: EPERM). It is kept for the case where
+		// the owner is right but the mode is not, and it is cheap.
 		if cherr := os.Chmod(path, 0o666); cherr == nil {
 			err = os.Truncate(path, 0)
 		}
