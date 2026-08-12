@@ -25,6 +25,7 @@ set -uo pipefail
 
 newapi_pid=""
 viewer_pid=""
+spool_chown_pid=""
 shutting_down=0
 
 log() { echo "[entrypoint] $*"; }
@@ -34,7 +35,12 @@ terminate() {
   [ "$shutting_down" = 1 ] && return
   shutting_down=1
   log "shutting down"
-  # new-api first, and give it time to close DB connections before the
+  # The spool watcher first: it is an infinite sleep loop, so leaving it alive
+  # would make the `wait` calls below hang until the container is SIGKILLed.
+  if [ -n "$spool_chown_pid" ] && kill -0 "$spool_chown_pid" 2>/dev/null; then
+    kill -TERM "$spool_chown_pid" 2>/dev/null || true
+  fi
+  # new-api next, and give it time to close DB connections before the
   # container's own grace period runs out.
   if [ -n "$newapi_pid" ] && kill -0 "$newapi_pid" 2>/dev/null; then
     kill -TERM "$newapi_pid" 2>/dev/null || true
@@ -59,22 +65,54 @@ if [ "$LOGVIEWER_ENABLED" = "true" ]; then
   # both directories. Granting ownership is narrower than running it as root:
   # it still cannot touch /data or anything else new-api owns.
   #
-  # new-api runs as root and creates its log file 0644, which a non-owner can
-  # read but not unlink - unlinking is a directory permission, so owning the
-  # DIRECTORY is what matters for pruning and the files themselves stay root's.
+  # new-api runs as root and creates its log file 0644. A non-owner can read it
+  # but not unlink it - unlinking is a DIRECTORY permission, so owning the
+  # directory is what matters for pruning, and the files can stay root's.
   #
-  # Truncating, however, is a permission on the FILE. The viewer truncates the
-  # live spool file to reclaim space when it is the only file and has been fully
-  # archived (new-api never rotates, so that is the normal case) - and a
-  # root-owned 0644 file makes that fail with EPERM. Directory ownership alone
-  # left the spool growing to 93% of its tmpfs while the viewer logged
-  # "permission denied" every sweep. Owning the directory does allow chmod on a
-  # file inside it, so the viewer widens the file itself before retrying; see
-  # truncateLive. The chmod below covers the same case at startup, for a spool
-  # the previous run left behind.
+  # Truncating is different: it is a permission on the FILE. The viewer truncates
+  # the live spool file to reclaim tmpfs once its bytes are archived, which is
+  # the normal case here because new-api never rotates - one file per process
+  # start, growing forever. With a root-owned 0644 file that fails with EPERM,
+  # and the spool climbed to 93% of its tmpfs while the viewer logged
+  # "permission denied" on every sweep.
+  #
+  # Two things that look like fixes and are not, both ruled out on the running
+  # container rather than by reasoning:
+  #
+  #   - a umask on new-api. It passes 0644 explicitly, and a umask can only
+  #     clear bits. /proc/<pid>/status showed Umask 0111 and the file was 0644.
+  #   - the viewer chmod-ing the file itself. chmod requires OWNING the file;
+  #     owning the directory is not enough. EPERM as uid 65534.
+  #
+  # What does work is chown-ing the file, which needs root - so a small watcher
+  # does it. new-api names the log after its own start time, so the name cannot
+  # be pre-created; and it opens with O_APPEND and no O_CREAT, so it will not
+  # recreate or replace a file that already exists. Handing it over is safe.
   chown "$VIEWER_UID:$VIEWER_GID" "$LOG_DIR" "$ARCHIVE_DIR" 2>/dev/null || \
     log "WARNING: could not chown $LOG_DIR/$ARCHIVE_DIR; spool pruning will fail"
-  chmod o+w "$LOG_DIR"/*.log 2>/dev/null || true
+
+  # Hand every spool file to the viewer's uid, now and as new ones appear.
+  #
+  # Polling, not inotify: this image has no inotify tools, the spool holds one or
+  # two files, and a stat every few seconds costs nothing. It must keep running
+  # because new-api opens a new log on every restart, and an unowned file is
+  # exactly the failure this exists to prevent.
+  #
+  # Deliberately NOT tied to the fail-fast `wait -n` below: if this watcher dies
+  # the spool stops being reclaimable, which is degraded but not worth killing a
+  # working gateway for. /healthz reports it as spool_truncate_error.
+  (
+    while :; do
+      for f in "$LOG_DIR"/*.log; do
+        [ -e "$f" ] || continue
+        # -c so an already-correct file is not touched every pass.
+        chown -c "$VIEWER_UID:$VIEWER_GID" "$f" 2>/dev/null || true
+      done
+      sleep 5
+    done
+  ) &
+  spool_chown_pid=$!
+  log "spool owner watcher started (pid $spool_chown_pid)"
 
   # setpriv, not su: no PAM, no intermediate shell, so the viewer is a direct
   # child of this script and `wait -n` sees it exit.
@@ -90,18 +128,37 @@ else
   log "log viewer disabled (LOGVIEWER_ENABLED=$LOGVIEWER_ENABLED)"
 fi
 
-# Not run under a umask: new-api passes 0644 explicitly when it creates the log,
-# and a umask can only clear bits, never add them. Verified on the running
-# container - /proc/<pid>/status showed Umask 0111 and the log was still 0644.
-# The viewer chmods the file itself when it needs to truncate it, which works
-# because it owns the directory. See truncateLive.
+# The stale comment that used to sit here claimed a umask made new-api's log
+# group-writable. It does not: new-api passes 0644 explicitly and a umask can
+# only clear bits. The spool watcher above is what makes the log reclaimable.
 /new-api "$@" &
 newapi_pid=$!
 log "new-api started (pid $newapi_pid)"
 
-# Return as soon as EITHER exits, rather than waiting for both.
-wait -n
-rc=$?
+# Return as soon as either REAL service exits, rather than waiting for both.
+#
+# Not `wait -n`: the spool watcher is also a child, and `wait -n` would return
+# for it too - turning a degraded-but-harmless watcher crash into a container
+# restart. Poll the two pids that matter instead, at a granularity that is
+# irrelevant next to the restart itself.
+rc=0
+while :; do
+  if [ -n "$newapi_pid" ] && ! kill -0 "$newapi_pid" 2>/dev/null; then
+    wait "$newapi_pid"; rc=$?
+    break
+  fi
+  if [ -n "$viewer_pid" ] && ! kill -0 "$viewer_pid" 2>/dev/null; then
+    wait "$viewer_pid"; rc=$?
+    break
+  fi
+  # The watcher is not fatal, but a silent disappearance would leave the spool
+  # unreclaimable with nothing in the log to say why.
+  if [ -n "$spool_chown_pid" ] && ! kill -0 "$spool_chown_pid" 2>/dev/null; then
+    log "WARNING: spool owner watcher exited; the spool may stop being reclaimable"
+    spool_chown_pid=""
+  fi
+  sleep 1
+done
 
 # Identify which one died, for a log line that actually says what happened.
 if [ -n "$newapi_pid" ] && ! kill -0 "$newapi_pid" 2>/dev/null; then
