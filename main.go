@@ -34,6 +34,12 @@ func main() {
 	if runReindex(cfg) {
 		return
 	}
+	// Maintenance mode: recompute fields a parser bug damaged, in place. Unlike
+	// the two above this needs neither the raw logs nor a scratch archive - the
+	// underlying data survived and only the arithmetic over it was wrong.
+	if runRepair(cfg) {
+		return
+	}
 
 	handler := newServer(cfg)
 	srv := &http.Server{

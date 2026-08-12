@@ -61,9 +61,20 @@ if [ "$LOGVIEWER_ENABLED" = "true" ]; then
   #
   # new-api runs as root and creates its log file 0644, which a non-owner can
   # read but not unlink - unlinking is a directory permission, so owning the
-  # DIRECTORY is what matters and the files themselves stay root's.
+  # DIRECTORY is what matters for pruning and the files themselves stay root's.
+  #
+  # Truncating, however, is a permission on the FILE. The viewer truncates the
+  # live spool file to reclaim space when it is the only file and has been fully
+  # archived (new-api never rotates, so that is the normal case) - and a
+  # root-owned 0644 file makes that fail with EPERM. Directory ownership alone
+  # left the spool growing to 100% of its tmpfs while the viewer logged
+  # "permission denied" every sweep. See NEWAPI_UMASK below for the fix.
   chown "$VIEWER_UID:$VIEWER_GID" "$LOG_DIR" "$ARCHIVE_DIR" 2>/dev/null || \
     log "WARNING: could not chown $LOG_DIR/$ARCHIVE_DIR; spool pruning will fail"
+
+  # Existing files predate the umask set at new-api's launch - a restart
+  # re-reads a spool the previous run created - so widen those too.
+  chmod o+w "$LOG_DIR"/*.log 2>/dev/null || true
 
   # setpriv, not su: no PAM, no intermediate shell, so the viewer is a direct
   # child of this script and `wait -n` sees it exit.
@@ -79,7 +90,13 @@ else
   log "log viewer disabled (LOGVIEWER_ENABLED=$LOGVIEWER_ENABLED)"
 fi
 
-/new-api "$@" &
+# new-api's log file must be writable by the viewer's uid, which needs to
+# truncate it to reclaim tmpfs (see the spool note above). The umask is set in a
+# subshell around new-api ONLY: applying it process-wide would also widen the
+# archive files the viewer creates, and those are the permanent record on disk
+# rather than a transient tmpfs copy. 0111 clears just the execute bits, so the
+# log lands 0666.
+( umask 0111; exec /new-api "$@" ) &
 newapi_pid=$!
 log "new-api started (pid $newapi_pid)"
 

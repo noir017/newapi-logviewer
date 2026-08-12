@@ -63,6 +63,7 @@ type ingester struct {
 	lastErr     string    // last append error, empty once one succeeds
 	appendFails int       // consecutive failures
 	appends     int64     // successful appends since start
+	truncErr    string    // last live-spool truncate error, empty once one succeeds
 }
 
 func newIngester(spoolDir string, arc *archive, keep time.Duration, maxBytes int64) *ingester {
@@ -333,9 +334,18 @@ func (i *ingester) truncateLive(path string) int64 {
 		return 0 // unread bytes: dropping them would lose calls
 	}
 	if err := os.Truncate(path, 0); err != nil {
+		// Worth surfacing on /healthz rather than only in the log: this is the
+		// one reclaim path that protects the gateway, and when it fails the
+		// spool fills to 100% of its tmpfs and New API's writes start failing.
+		// It failed silently in production for exactly this reason - new-api
+		// creates the log 0644 as root, and truncating is a permission on the
+		// FILE, not the directory the viewer owns. The spool-over-max signal
+		// alone did not say why it was over.
+		i.truncErr = err.Error()
 		log.Printf("spool truncate %s: %v", path, err)
 		return 0
 	}
+	i.truncErr = ""
 
 	// Resume from wherever the file now ends, which is NOT always zero. If New
 	// API opened the log with O_APPEND its next write lands at 0 and the stat
@@ -415,6 +425,15 @@ func (i *ingester) health() map[string]any {
 	if i.maxBytes > 0 && spool > i.maxBytes {
 		ok = false
 		why = append(why, "spool over SPOOL_MAX_MB")
+	}
+	// A failing reclaim is the reason the spool stays over, so say so. Without
+	// this the operator sees "spool over SPOOL_MAX_MB" and reasonably concludes
+	// ingest is behind, when in fact the bytes are archived and the viewer
+	// simply cannot free them.
+	if i.truncErr != "" {
+		h["spool_truncate_error"] = i.truncErr
+		ok = false
+		why = append(why, "cannot truncate live spool file (check its mode; truncate needs write on the FILE)")
 	}
 	// Work waiting and nothing written recently. The window is generous
 	// relative to stallAfter: below it, calls legitimately sit in pending while

@@ -154,6 +154,11 @@ type Record struct {
 	// different lines that may land in different passes.
 	anth anthropicState
 
+	// tacc does the same for OpenAI-shaped tool_call deltas. Both formats
+	// stream a call as a name in one line and arguments in many, so both need
+	// state that outlives a single chunk and a single read pass.
+	tacc toolAcc
+
 	chunks []streamChunk // dropped by finalize
 }
 
@@ -485,6 +490,78 @@ func (st *anthropicState) calls() []ToolCall {
 	out := make([]ToolCall, 0, len(st.order))
 	for _, idx := range st.order {
 		if tc := st.tools[idx]; tc != nil {
+			out = append(out, *tc)
+		}
+	}
+	return out
+}
+
+// toolAcc folds OpenAI-shaped streaming tool_call deltas into whole calls.
+//
+// OpenAI streams a tool call the same way it streams text: the first delta
+// carries id, name and index, and every following delta carries the index plus
+// one more slice of the arguments JSON. So the fragments have to be joined by
+// index, exactly like Anthropic's input_json_delta - the difference is only
+// which field names the block.
+//
+// Without this the fragments were appended to StreamToolCalls verbatim, so one
+// tool call became one "call" per delta: a single `write` with a file body in
+// its arguments rendered as 540 nameless calls holding a character or two each.
+type toolAcc struct {
+	byIdx map[int]*ToolCall
+	order []int // first-seen order, so output is deterministic
+	last  int   // index of the call being streamed, for fragments without one
+	seen  bool
+}
+
+// add merges one tool_call delta into the accumulating set.
+func (ta *toolAcc) add(frag ToolCall) {
+	idx := 0
+	switch {
+	case frag.Index != nil:
+		idx = *frag.Index
+	case ta.seen:
+		// No index. Providers that omit it stream one call at a time, so keep
+		// appending to the current one - unless this fragment names a
+		// different tool, which can only mean the next call has started.
+		idx = ta.last
+		if n := frag.Function.Name; n != "" {
+			if cur := ta.byIdx[idx]; cur != nil && cur.Function.Name != "" && cur.Function.Name != n {
+				idx = ta.last + 1
+			}
+		}
+	}
+	ta.last, ta.seen = idx, true
+
+	if ta.byIdx == nil {
+		ta.byIdx = map[int]*ToolCall{}
+	}
+	tc, ok := ta.byIdx[idx]
+	if !ok {
+		i := idx
+		tc = &ToolCall{Index: &i}
+		ta.byIdx[idx] = tc
+		ta.order = append(ta.order, idx)
+	}
+	// Identity fields arrive once, on the opening delta; later fragments leave
+	// them empty and must not blank out what the opener established.
+	if frag.ID != "" {
+		tc.ID = frag.ID
+	}
+	if frag.Type != "" {
+		tc.Type = frag.Type
+	}
+	if frag.Function.Name != "" {
+		tc.Function.Name = frag.Function.Name
+	}
+	tc.Function.Arguments += frag.Function.Arguments
+}
+
+// calls returns the assembled tool calls in first-seen index order.
+func (ta *toolAcc) calls() []ToolCall {
+	out := make([]ToolCall, 0, len(ta.order))
+	for _, idx := range ta.order {
+		if tc := ta.byIdx[idx]; tc != nil {
 			out = append(out, *tc)
 		}
 	}
@@ -824,7 +901,9 @@ func (r *Record) finalize() {
 			c, rs, tools := ch.text()
 			content.WriteString(c)
 			reasoning.WriteString(rs)
-			r.StreamToolCalls = append(r.StreamToolCalls, tools...)
+			for _, frag := range tools {
+				r.tacc.add(frag)
+			}
 			if u := ch.usage(); u != nil {
 				r.Usage = mergeUsage(r.Usage, u)
 			}
@@ -835,9 +914,12 @@ func (r *Record) finalize() {
 	} else if !r.sawChunks {
 		r.Usage = resp.Usage
 	}
-	// Anthropic tool calls live in cumulative state keyed by block index, so
-	// they are assigned rather than appended - finalize runs once per read pass
-	// and appending would duplicate every call already assembled.
+	// Both accumulators hold cumulative state keyed by call index, so their
+	// output is ASSIGNED rather than appended: finalize runs once per read pass,
+	// and appending would re-add every call already assembled.
+	if calls := r.tacc.calls(); len(calls) > 0 {
+		r.StreamToolCalls = calls
+	}
 	if calls := r.anth.calls(); len(calls) > 0 {
 		r.StreamToolCalls = calls
 	}
@@ -881,13 +963,20 @@ func (r *Record) finalize() {
 
 	// Conversation size. An agent transcript is a single call carrying dozens
 	// of prior turns, so counts belong on the list row.
+	// Assign, never accumulate. finalize runs once per read pass - a streaming
+	// call is finalized on every pass that brings it new chunks - and these are
+	// all derived wholly from req, which is re-decoded each time. `r.Turns++`
+	// therefore multiplied the true count by the number of passes: a 256-message
+	// transcript read across 13 passes reported 3,328 turns.
 	r.MsgCount = len(req.Messages)
 	r.ToolCount = len(r.ToolNames)
+	turns := 0
 	for _, m := range req.Messages {
 		if m.Role == "assistant" {
-			r.Turns++
+			turns++
 		}
 	}
+	r.Turns = turns
 
 	// Preview text for the collapsed row: last user message.
 	for i := len(req.Messages) - 1; i >= 0; i-- {
