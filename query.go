@@ -97,11 +97,26 @@ func matchIndex(e idxEntry, f listFilter) bool {
 	if f.Model != "" && e.Model != f.Model {
 		return false
 	}
-	if f.Status == "ok" && (e.Status == nil || *e.Status != 200) {
-		return false
-	}
-	if f.Status == "err" && (e.Status == nil || *e.Status == 200) {
-		return false
+	// Filter on the derived outcome, falling back to the HTTP status only when
+	// no outcome was derived. Filtering on Status alone matched nothing on a
+	// deployment whose log carries no GIN lines - the same cause that blanked
+	// the column. An entry with neither is excluded from both sides rather than
+	// guessed at.
+	if f.Status == "ok" || f.Status == "err" {
+		want := outcomeOK
+		if f.Status == "err" {
+			want = outcomeErr
+		}
+		oc := e.Outcome
+		if oc == "" && e.Status != nil {
+			oc = outcomeOK
+			if *e.Status >= 400 {
+				oc = outcomeErr
+			}
+		}
+		if oc != want {
+			return false
+		}
 	}
 	if f.Stream == "1" && !e.IsStream {
 		return false
@@ -226,6 +241,7 @@ func (q *query) entryToItem(e idxEntry) listItem {
 	it := listItem{
 		RequestID: e.RID, TS: e.TS, Epoch: e.Epoch,
 		Model: e.Model, Status: e.Status, Latency: e.Latency,
+		Outcome: e.Outcome,
 		IsStream: e.IsStream, HasTools: e.HasTools, Quota: e.Quota,
 		Preview: e.Preview, Errors: e.Errors,
 		MsgCount: e.MsgCount, Turns: e.Turns, ToolCount: e.ToolCnt,

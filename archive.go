@@ -70,6 +70,13 @@ type idxEntry struct {
 	Model  string `json:"m,omitempty"`
 	Status *int   `json:"s,omitempty"`
 
+	// Whether the call succeeded. Distinct from Status, which is only ever set
+	// from the GIN line and is absent entirely on deployments where gin logs to
+	// another sink - which is every record on this one. The list column reads
+	// this; without it in the index the column is blank however good the record
+	// behind it is.
+	Outcome string `json:"oc,omitempty"`
+
 	Latency  string `json:"l,omitempty"`
 	IsStream bool   `json:"st,omitempty"`
 	HasTools bool   `json:"ht,omitempty"`
@@ -94,6 +101,7 @@ func makeIdxEntry(r *Record, off, n int64) idxEntry {
 	return idxEntry{
 		RID: r.RequestID, TS: r.TS, Epoch: r.Epoch, Off: off, Len: n,
 		Model: r.Model, Status: r.Status, Latency: r.Latency,
+		Outcome: r.Outcome,
 		IsStream: r.IsStream, HasTools: r.HasTools, Quota: r.Quota,
 		Preview: r.Preview, Errors: len(r.Errors),
 		MsgCount: r.MsgCount, Turns: r.Turns, ToolCnt: r.ToolCount,

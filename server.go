@@ -103,6 +103,7 @@ type listItem struct {
 	Epoch     int64  `json:"epoch"`
 	Model     string `json:"model"`
 	Status    *int   `json:"status"`
+	Outcome   string `json:"outcome,omitempty"`
 	Latency   string `json:"latency"`
 	IsStream  bool   `json:"is_stream"`
 	HasTools  bool   `json:"has_tools"`
@@ -124,6 +125,7 @@ func toListItem(r *Record) listItem {
 	return listItem{
 		RequestID: r.RequestID, TS: r.TS, Epoch: r.Epoch,
 		Model: r.Model, Status: r.Status, Latency: r.Latency,
+		Outcome: r.Outcome,
 		IsStream: r.IsStream, HasTools: r.HasTools, Quota: r.Quota,
 		Preview: r.Preview, Errors: len(r.Errors),
 		MsgCount: r.MsgCount, Turns: r.Turns, ToolCount: r.ToolCount,
