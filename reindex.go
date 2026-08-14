@@ -55,6 +55,11 @@ func reindexDay(dir, day string) (int, error) {
 			f.Close()
 			return n, fmt.Errorf("fetch %s: %w", e.RID, err)
 		}
+		// Re-derive the outcome before projecting. Records archived before the
+		// field existed have Outcome empty but still carry the billing payload
+		// it comes from, so this backfills history from the archive alone - the
+		// raw logs it was parsed from are long gone.
+		rec.refreshOutcome()
 		// The offsets are the one thing that cannot be recomputed from the
 		// record, so they are carried across verbatim.
 		line, err := json.Marshal(makeIdxEntry(rec, e.Off, e.Len))

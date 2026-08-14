@@ -440,7 +440,7 @@ function detail(r){
   return `
   <div class="dh">
     <h2>${esc(r.model || '—')}</h2>
-    <span class="tag ${r.status === 200 ? 'ok' : 'err'}">${r.status ?? '?'}</span>
+    ${statusTag(r)}
     ${r.is_stream ? '<span class="tag st">流式</span>' : ''}
     <span class="rid mono">${esc(r.request_id)}</span>
   </div>
@@ -454,7 +454,7 @@ function detail(r){
     <div><b>计费</b><span>${fmtQ(r.quota)}</span></div>
     <div><b>倍率</b><span>${r.model_ratio ?? '—'} × ${r.completion_ratio ?? '—'}</span></div>
     <div><b>客户端 IP</b><span>${esc(r.ip || '—')}</span></div>
-    <div><b>流式结束</b><span>${esc(r.stream_end || '—')}</span></div>
+    <div><b>流式结束</b><span>${esc(r.stream_end || r.outcome_reason || '—')}</span></div>
     <div style="grid-column:1/-1"><b>上游地址</b><span>${esc(r.upstream_url || '—')}</span></div>
   </div>
   ${sec('用量', '', usageHtml(r.usage))}
@@ -541,7 +541,7 @@ function item(r){
     <div class="i1">
       <span class="t">${esc((r.ts || '').slice(5, 16))}</span>
       <span class="m">${esc(r.model || '—')}</span>
-      <span class="tag ${r.status === 200 ? 'ok' : 'err'}">${r.status ?? '?'}</span>
+      ${statusTag(r)}
     </div>
     <div class="i2">${esc(r.preview || '（无提示词）')}</div>
     <div class="i3">
@@ -561,6 +561,27 @@ function item(r){
 function chanLabel(r){
   return [r.channel_id != null ? '#' + r.channel_id : '', r.channel_name]
     .filter(Boolean).join(' ') || '—';
+}
+
+// statusTag renders the success/failure chip.
+//
+// The HTTP status is only ever populated from the log's [GIN] line, which gin
+// writes to a different sink than the file New API logs to — on this deployment
+// it never arrives, so every row rendered "?" while the calls themselves were
+// fine. So prefer the outcome derived at ingest (from the billing line's
+// stream_status), show the HTTP code when one was genuinely observed, and keep
+// "?" for the case where the log really does not say.
+function statusTag(r){
+  const code = r.status != null ? r.status : null;
+  const oc = r.outcome || (code == null ? '' : (code < 400 ? 'ok' : 'error'));
+  const label = code != null ? code : (oc === 'ok' ? '成功' : oc === 'error' ? '失败' : '?');
+  const cls = oc === 'ok' ? 'ok' : oc === 'error' ? 'err' : '';
+  const title = [
+    oc === 'ok' ? '成功' : oc === 'error' ? '失败' : '日志未记录结束状态',
+    r.outcome_reason || '',
+    code == null && r.outcome ? '（依据计费记录，非 HTTP 状态码）' : '',
+  ].filter(Boolean).join(' · ');
+  return `<span class="tag ${cls}" title="${esc(title)}">${esc(String(label))}</span>`;
 }
 
 // chanChip renders the channel column: name if resolvable, else the upstream

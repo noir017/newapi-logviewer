@@ -172,6 +172,9 @@ func (i *ingester) flushFinished() {
 			}
 			rec.Stalled = true
 		}
+		// Stalled is decided here, after the last finalize, so the outcome has
+		// to be re-derived before the record is frozen into the archive.
+		rec.refreshOutcome()
 		if !worthArchiving(rec) {
 			delete(i.pending, rid)
 			continue

@@ -78,6 +78,26 @@ type Record struct {
 	StreamEnd   string   `json:"stream_end"`
 	Errors      []LogErr `json:"errors"`
 
+	// Outcome is whether the call succeeded, derived in finalize from whatever
+	// evidence the log actually carried. Status alone could not answer this:
+	// it comes only from the GIN line, which reaches a different sink than the
+	// log file and was absent from every record on this deployment, so the UI
+	// showed "?" for all of them.
+	//
+	// Kept separate from Status rather than synthesising an HTTP code, for the
+	// same reason Stalled is separate from Incomplete: "the gateway billed this
+	// as a completed stream" and "the gateway returned 200" are different
+	// facts, and inventing a 200 would erase the distinction permanently.
+	//
+	// One of outcomeOK, outcomeErr, or "" when nothing in the log settles it.
+	Outcome string `json:"outcome,omitempty"`
+
+	// OutcomeReason is the short machine token behind Outcome - the billing
+	// line's end_reason (done/eof/client_gone/scanner_error), or a marker for
+	// the evidence used when billing was absent. Displayed on the detail pane
+	// so a failure says why rather than only that.
+	OutcomeReason string `json:"outcome_reason,omitempty"`
+
 	Model    string `json:"model"`
 	IsStream bool   `json:"is_stream"`
 	HasTools bool   `json:"has_tools"`
@@ -199,6 +219,22 @@ type billView struct {
 		ModelRatio      *float64 `json:"model_ratio"`
 		CompletionRatio *float64 `json:"completion_ratio"`
 		FRT             *float64 `json:"frt"`
+
+		// How the stream actually ended, as New API judged it at billing time.
+		// This is the only success/failure signal that reliably reaches the log
+		// FILE: the HTTP status lives on the GIN line, and gin writes that to
+		// gin.DefaultWriter - a different sink. Measured on this deployment,
+		// 0 GIN lines against 291 billing lines, which left Status nil on every
+		// record and rendered the whole list as "?".
+		//
+		// status is "ok" or "error"; end_reason is done/eof on success and
+		// client_gone/scanner_error on failure, with end_error carrying the
+		// detail.
+		StreamStatus *struct {
+			Status    string `json:"status"`
+			EndReason string `json:"end_reason"`
+			EndError  string `json:"end_error"`
+		} `json:"stream_status"`
 	} `json:"other"`
 }
 
@@ -931,6 +967,7 @@ func (r *Record) finalize() {
 	if bill.Other != nil {
 		r.ModelRatio, r.CompletionRatio, r.FRT = bill.Other.ModelRatio, bill.Other.CompletionRatio, bill.Other.FRT
 	}
+	r.deriveOutcome(&bill)
 
 	// Epoch seconds for time-range filtering (TS is a display string).
 	if t, err := time.ParseInLocation("2006/01/02 15:04:05", r.TS, time.Local); err == nil {
@@ -993,6 +1030,100 @@ func (r *Record) finalize() {
 	// this viewer serves a few times a day.
 
 	r.chunks = nil
+}
+
+// Outcome values. Deliberately not HTTP codes: the log does not always carry
+// one, and synthesising a 200 would be indistinguishable from having observed
+// one.
+const (
+	outcomeOK  = "ok"
+	outcomeErr = "error"
+)
+
+// deriveOutcome decides whether the call succeeded, from the best evidence the
+// log actually carried.
+//
+// The evidence is ranked, strongest first, because the sources disagree in
+// predictable ways:
+//
+//  1. The GIN status line, when present - an observed HTTP response code.
+//  2. The billing line's stream_status - written by New API after delivery, and
+//     the only outcome signal that reaches the log FILE on every deployment.
+//  3. A logged [ERR] line, or a stall with no completion marker at all.
+//
+// Billing is consulted before r.Errors because a call can log a recoverable
+// error - a retried upstream, a channel failover - and still be delivered and
+// charged as a success. Trusting the error list first would file those as
+// failures. Conversely a call with no billing and no GIN line never completed,
+// whatever else it logged.
+func (r *Record) deriveOutcome(bill *billView) {
+	// Assign, never accumulate: finalize runs once per read pass, and every
+	// input here is re-derived from the record each time.
+	r.Outcome, r.OutcomeReason = "", ""
+
+	if r.Status != nil {
+		if *r.Status < 400 {
+			r.Outcome = outcomeOK
+		} else {
+			r.Outcome = outcomeErr
+		}
+		r.OutcomeReason = "http_" + strconv.Itoa(*r.Status)
+		return
+	}
+
+	if bill.Other != nil && bill.Other.StreamStatus != nil {
+		ss := bill.Other.StreamStatus
+		switch ss.Status {
+		case "ok":
+			r.Outcome = outcomeOK
+		case "error":
+			r.Outcome = outcomeErr
+		}
+		if r.Outcome != "" {
+			r.OutcomeReason = ss.EndReason
+			if ss.EndError != "" {
+				r.OutcomeReason = strings.TrimSpace(ss.EndReason + ": " + ss.EndError)
+			}
+			return
+		}
+	}
+
+	// A billing line with no stream_status still means the response was
+	// delivered and charged - non-streaming calls carry no stream status at all.
+	if r.billingSeen || !r.Billing.empty() {
+		r.Outcome, r.OutcomeReason = outcomeOK, "billed"
+		return
+	}
+
+	// No completion marker of any kind. Stalled is set by the ingester when the
+	// call went quiet past its deadline; either way nothing says it finished.
+	if r.Stalled {
+		r.Outcome, r.OutcomeReason = outcomeErr, "stalled"
+		return
+	}
+	if len(r.Errors) > 0 {
+		r.Outcome, r.OutcomeReason = outcomeErr, "logged_error"
+		return
+	}
+	// Leave empty: the UI shows "?" only when the log genuinely does not say.
+}
+
+// refreshOutcome re-derives Outcome for a record whose bodies are already
+// assembled, decoding the billing payload rather than taking it from a parse
+// pass.
+//
+// Two callers need this and neither can use finalize. The ingester marks a call
+// Stalled after finalize has already run, and reindex fetches records straight
+// out of the archive: a full finalize there would rebuild derived fields from
+// bodies alone, and since sawChunks is not persisted it would overwrite the
+// stored Usage of every streaming record with the non-streaming response's
+// (nil). This touches only the two outcome fields.
+func (r *Record) refreshOutcome() {
+	var bill billView
+	if !r.Billing.empty() {
+		json.Unmarshal(r.Billing, &bill)
+	}
+	r.deriveOutcome(&bill)
 }
 
 // contentText flattens a message body, which is either a plain string or a

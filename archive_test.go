@@ -1083,3 +1083,174 @@ func TestSpoolTruncatesReadOnlyLiveFile(t *testing.T) {
 		t.Errorf("truncErr = %q, want empty after a successful retry", ing.truncErr)
 	}
 }
+
+// The bug this guards: Status is populated only from the [GIN] line, and gin
+// writes its access log to gin.DefaultWriter - a different sink from the file
+// New API logs to. On the live deployment the spool held 0 GIN lines against
+// 291 billing lines, so Status was nil on every record and the whole list
+// rendered "?" for calls that had in fact succeeded.
+//
+// The billing line's stream_status is the signal that does reach the file.
+func TestOutcomeFromBillingWithoutGIN(t *testing.T) {
+	spool, arcDir := t.TempDir(), t.TempDir()
+	arc := newArchive(arcDir)
+	defer arc.Close()
+
+	// Both real shapes measured in the live log: end_reason done and eof, and
+	// the client_gone failure with its end_error detail.
+	p := filepath.Join(spool, "oneapi-20260814171353.log")
+	os.WriteFile(p, []byte(
+		`[DEBUG] 2026/08/14 - 17:13:55 | OutcomeOkAaaaBbbbCccc0001 | requestBody: {"model":"claude-opus-5","stream":true,"messages":[{"role":"user","content":"hi"}]}`+"\n"+
+			`[INFO]  2026/08/14 - 17:13:58 | OutcomeOkAaaaBbbbCccc0001 | record consume log: userId=1, params={"model_name":"claude-opus-5","quota":9,"channel_id":10,"other":{"stream_status":{"end_reason":"done","status":"ok"}}}`+"\n"+
+			`[DEBUG] 2026/08/14 - 17:14:00 | OutcomeErrAaaaBbbbCccc002 | requestBody: {"model":"claude-opus-5","stream":true,"messages":[{"role":"user","content":"hi"}]}`+"\n"+
+			`[INFO]  2026/08/14 - 17:14:05 | OutcomeErrAaaaBbbbCccc002 | record consume log: userId=1, params={"model_name":"claude-opus-5","quota":0,"channel_id":10,"other":{"stream_status":{"end_error":"context canceled","end_reason":"client_gone","status":"error"}}}`+"\n"), 0o644)
+
+	ing := newIngester(spool, arc, time.Hour, 0)
+	ing.settleAfter = 0
+	ing.once()
+
+	q := newQuery(newArchive(arcDir), 0)
+	ok := q.get("OutcomeOkAaaaBbbbCccc0001")
+	if ok == nil {
+		t.Fatal("succeeded call missing from the archive")
+	}
+	if ok.Status != nil {
+		t.Fatalf("status = %v, want nil: this fixture has no GIN line", *ok.Status)
+	}
+	if ok.Outcome != outcomeOK {
+		t.Errorf("outcome = %q, want %q: a billed stream_status ok is a success", ok.Outcome, outcomeOK)
+	}
+	if ok.OutcomeReason != "done" {
+		t.Errorf("outcome_reason = %q, want done", ok.OutcomeReason)
+	}
+
+	bad := q.get("OutcomeErrAaaaBbbbCccc002")
+	if bad == nil {
+		t.Fatal("failed call missing from the archive")
+	}
+	if bad.Outcome != outcomeErr {
+		t.Errorf("outcome = %q, want %q", bad.Outcome, outcomeErr)
+	}
+	if !strings.Contains(bad.OutcomeReason, "client_gone") ||
+		!strings.Contains(bad.OutcomeReason, "context canceled") {
+		t.Errorf("outcome_reason = %q, want the end_reason and its end_error", bad.OutcomeReason)
+	}
+
+	// The list column reads the index, not the record, so a field that reaches
+	// one but not the other leaves the column blank however good the record is.
+	items, total, _, _ := q.list(listFilter{}, 1, 50)
+	if total != 2 {
+		t.Fatalf("listed %d, want 2", total)
+	}
+	for _, it := range items {
+		if it.Outcome == "" {
+			t.Errorf("%s: outcome missing from the index projection", it.RequestID)
+		}
+	}
+
+	// And the filter must agree with the column, or "仅错误" returns nothing on
+	// exactly the deployment that made the column wrong.
+	_, nOK, _, _ := q.list(listFilter{Status: "ok"}, 1, 50)
+	if nOK != 1 {
+		t.Errorf("status=ok matched %d, want 1", nOK)
+	}
+	_, nErr, _, _ := q.list(listFilter{Status: "err"}, 1, 50)
+	if nErr != 1 {
+		t.Errorf("status=err matched %d, want 1", nErr)
+	}
+}
+
+// A call that logs a recoverable error - a retried upstream, a channel failover
+// - can still be delivered and charged. Ranking r.Errors above the billing line
+// would file those as failures.
+func TestOutcomePrefersBillingOverLoggedError(t *testing.T) {
+	r := &Record{RequestID: "x", TS: "2026/08/14 17:13:58"}
+	r.Errors = append(r.Errors, LogErr{TS: "2026/08/14 17:13:56", Msg: "upstream error, retrying"})
+	r.Billing = Raw(`{"model_name":"m","other":{"stream_status":{"end_reason":"eof","status":"ok"}}}`)
+	r.refreshOutcome()
+	if r.Outcome != outcomeOK {
+		t.Errorf("outcome = %q, want %q: billing is written after delivery", r.Outcome, outcomeOK)
+	}
+}
+
+// A GIN line, when it is present, is an observed HTTP response and outranks
+// everything derived.
+func TestOutcomePrefersGINStatus(t *testing.T) {
+	code := 429
+	r := &Record{RequestID: "x", Status: &code}
+	r.Billing = Raw(`{"other":{"stream_status":{"end_reason":"done","status":"ok"}}}`)
+	r.refreshOutcome()
+	if r.Outcome != outcomeErr {
+		t.Errorf("outcome = %q, want %q for HTTP 429", r.Outcome, outcomeErr)
+	}
+}
+
+// Nothing in the log settles the outcome: the chip must stay "?" rather than
+// guess. A stalled call is a failure; a bare record is unknown.
+func TestOutcomeUnknownWhenLogIsSilent(t *testing.T) {
+	r := &Record{RequestID: "x"}
+	r.refreshOutcome()
+	if r.Outcome != "" {
+		t.Errorf("outcome = %q, want empty when the log does not say", r.Outcome)
+	}
+	r.Stalled = true
+	r.refreshOutcome()
+	if r.Outcome != outcomeErr || r.OutcomeReason != "stalled" {
+		t.Errorf("outcome = %q/%q, want error/stalled", r.Outcome, r.OutcomeReason)
+	}
+}
+
+// finalize runs once per read pass for a streaming call, so the outcome must be
+// assigned rather than accumulated - the mistake that once tripled turn counts.
+func TestOutcomeSurvivesRepeatedFinalize(t *testing.T) {
+	r := &Record{RequestID: "x", TS: "2026/08/14 17:13:58"}
+	r.Billing = Raw(`{"model_name":"m","other":{"stream_status":{"end_reason":"done","status":"ok"}}}`)
+	for i := 0; i < 3; i++ {
+		r.finalize()
+	}
+	if r.Outcome != outcomeOK || r.OutcomeReason != "done" {
+		t.Errorf("outcome = %q/%q after 3 passes, want ok/done", r.Outcome, r.OutcomeReason)
+	}
+}
+
+// Records archived before Outcome existed still carry the billing payload it is
+// derived from, so -reindex backfills history from the archive alone. The raw
+// logs those records were parsed from are long gone by then.
+func TestReindexBackfillsOutcome(t *testing.T) {
+	arcDir := t.TempDir()
+	arc := newArchive(arcDir)
+	rec := &Record{
+		RequestID: "ReindexOutcomeAaaaBbbbCc1", TS: "2026/08/14 17:13:58",
+		Model:   "claude-opus-5",
+		Billing: Raw(`{"model_name":"claude-opus-5","other":{"stream_status":{"end_reason":"done","status":"ok"}}}`),
+	}
+	rec.Epoch = 1786707238
+	// Written the way the old code did: no outcome anywhere.
+	if err := arc.Append(rec); err != nil {
+		t.Fatal(err)
+	}
+	arc.Close()
+
+	before, err := newArchive(arcDir).index("20260814")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(before) != 1 || before[0].Outcome != "" {
+		t.Fatalf("fixture should start with no outcome, got %+v", before)
+	}
+
+	if _, err := reindexDay(arcDir, "20260814"); err != nil {
+		t.Fatal(err)
+	}
+	after, err := newArchive(arcDir).index("20260814")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after[0].Outcome != outcomeOK {
+		t.Errorf("outcome = %q after reindex, want %q", after[0].Outcome, outcomeOK)
+	}
+	// Offsets are the one thing reindex cannot recompute.
+	if after[0].Off != before[0].Off || after[0].Len != before[0].Len {
+		t.Errorf("offsets moved: %d/%d -> %d/%d", before[0].Off, before[0].Len, after[0].Off, after[0].Len)
+	}
+}
