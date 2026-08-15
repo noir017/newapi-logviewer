@@ -83,8 +83,13 @@ async function main(){
   check('turn header summarises the tools used',
         /⚒/.test(s.firstTurnSummary || ''), s.firstTurnSummary);
 
-  // THE regression risk: clamps inside a card that was hidden at render time
+  // THE regression risk: clamps inside a card that was hidden at render time.
+  // Turn cards now live inside the collapsed 会话历史 fold, so open that first —
+  // clicking a card in a display:none subtree measures nothing, which is the
+  // very failure mode the lazy wiring exists to avoid.
   const lazy = await ev(`(() => {
+    const hist = document.querySelector('#detail .card.hist');
+    if (hist && !hist.classList.contains('open')) hist.querySelector('.chd').click();
     const c = [...document.querySelectorAll('#detail .card.turn')][1];
     const before = {clamps: c.querySelectorAll('.clamp').length,
                     visibleToggles: [...c.querySelectorAll('.exp')].filter(b => !b.hidden).length};

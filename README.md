@@ -563,6 +563,24 @@ node clamp_test.js 9222 http://localhost:7070/logviewer/
 node channel_render.js 9222 http://localhost:7070/logviewer/   # channel chips
 ```
 
+`cards_test.js` and `fold_test.js` need a long transcript, so point `LOG_DIR`
+at `./bigdata` (a 138-message agent call) rather than `./testdata`:
+
+```bash
+node cards_test.js 9222 http://localhost:7070/logviewer/
+node fold_test.js  9222 http://localhost:7070/logviewer/
+```
+
+`fold_test.js` asserts the two things that made a 351-message record unusable,
+as measurements rather than as markup shape:
+
+- **Click depth.** A card header and an inner clamp are both collapse controls,
+  so a message wrapped in both took two clicks to read. It measures the height
+  actually *shown* against the content height — measuring the text node itself
+  passes even when a clamp hides 90% of it.
+- **Scroll distance to the response.** With the transcript flat the 本次模型返回
+  section starts at 2811px; folded it starts at 664px.
+
 Run it against a real deployment too — the fixture cannot produce a 16,000-char
 prompt or a 26-message conversation, and both change what overflows.
 
