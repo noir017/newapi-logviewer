@@ -155,6 +155,12 @@ pre.j{background:#0d1017;border:1px solid var(--line);border-radius:7px;padding:
 .card.sysmsg{border-left:3px solid var(--sys)}
 .card.usermsg{border-left:3px solid var(--usr)}
 .card.turn{border-left:3px solid var(--asst)}
+/* the folded transcript: everything but the newest exchange lives in here, so
+   opening a record does not mean scrolling past 300 cards to reach the reply */
+.card.hist>.chd{background:#1a1520}
+.card.hist{border-color:#2a2233}
+.card.hist>.cbd{padding:8px 9px;background:#0f1116}
+.tailhd{color:var(--dim2);font-size:11px;margin:10px 0 5px;letter-spacing:.3px}
 .cardgroup{margin-bottom:6px}
 .tools-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:6px}
 .exp-all{margin-left:auto;flex:none}
@@ -358,6 +364,18 @@ function groupTurns(msgs){
   return out;
 }
 
+// One block inside a turn: the assistant's text, a tool call's arguments, or a
+// tool result. `sole` drops the clamp when the block is the card's ONLY content
+// — a card header and a clamp are both collapse controls, so stacking them
+// costs two clicks to read one message. With several blocks the clamp earns its
+// place: it keeps a long tool result from burying the ones under it.
+function turnBlock(b, sole){
+  const head = b.role ? `<div class="role">${b.role}</div>`
+                      : `<div class="nm">⚒ ${esc(b.name)}</div>`;
+  return `<div class="${b.cls}">${head}
+    ${sole ? b.inner : clamp(b.inner, b.stat, {h: 76, fade: b.fade})}</div>`;
+}
+
 function turnCard(t, n){
   const a = t.assistant;
   const calls = a.tool_calls || [];
@@ -371,22 +389,23 @@ function turnCard(t, n){
   const right = `<span class="cs" style="flex:none;text-align:right">${
     (txt ? statOf(txt) + ' · ' : '')}${t.results.length} 结果 · ${resChars.toLocaleString()} 字符</span>`;
 
-  const body = `
-    ${txt ? `<div class="msg assistant"><div class="role">assistant</div>
-      ${clamp(`<div class="txt">${esc(txt)}</div>`, statOf(txt), {h: 76})}</div>` : ''}
-    ${calls.map(tc => {
-      const args = safeArgs(tc.function?.arguments);
-      return `<div class="tc"><div class="nm">⚒ ${esc(tc.function?.name)}</div>
-        ${clamp(`<pre class="j">${hl(args)}</pre>`, statJSON(args), {h: 76, fade: '#1a1710'})}</div>`;
-    }).join('')}
-    ${t.results.map(r => {
-      const rt = contentText(r.content);
-      return `<div class="msg tool"><div class="role">tool result</div>
-        ${clamp(`<div class="txt">${esc(rt)}</div>`, statOf(rt), {h: 76})}</div>`;
-    }).join('')}`;
+  const blocks = [];
+  if (txt) blocks.push({cls: 'msg assistant', role: 'assistant',
+    inner: `<div class="txt">${esc(txt)}</div>`, stat: statOf(txt)});
+  for (const tc of calls){
+    const args = safeArgs(tc.function?.arguments);
+    blocks.push({cls: 'tc', name: tc.function?.name,
+      inner: `<pre class="j">${hl(args)}</pre>`, stat: statJSON(args), fade: '#1a1710'});
+  }
+  for (const r of t.results){
+    const rt = contentText(r.content);
+    blocks.push({cls: 'msg tool', role: 'tool result',
+      inner: `<div class="txt">${esc(rt)}</div>`, stat: statOf(rt)});
+  }
+  const sole = blocks.length === 1;
 
-  return card(`<span class="idx">#${n}</span> 调用`, summary, body,
-              {cls: 'turn', right});
+  return card(`<span class="idx">#${n}</span> 调用`, summary,
+              blocks.map(b => turnBlock(b, sole)).join(''), {cls: 'turn', right});
 }
 
 function usageHtml(u){
@@ -424,18 +443,44 @@ function detail(r){
   const groups = groupTurns(msgs);
   const turns = groups.filter(g => g.kind === 'turn');
   let turnNo = 0;
-  // A 16k-char system prompt open by default fills the screen before the
-  // first turn is even visible, so only short standalone messages start open.
-  const OPEN_CHARS = 400;
-  const convHtml = groups.map(g => {
+  const cardOf = (g, open) => {
     if (g.kind === 'turn') return turnCard(g, ++turnNo);
     const m = g.msg, t = contentText(m.content);
     const cls = m.role === 'system' ? 'sysmsg' : m.role === 'user' ? 'usermsg' : '';
+    // No clamp here: the card header IS the collapse control, and a 16k system
+    // prompt behind a card toggle AND an inner 展开 took two clicks to read one
+    // message. Opening the card is already the deliberate "show me this".
     return card(esc(m.role), statOf(t),
-      `<div class="msg ${esc(m.role)}">${clamp(`<div class="txt">${esc(t)}</div>`,
-        statOf(t), {h: 84})}</div>`,
-      {cls, open: [...t].length <= OPEN_CHARS});
-  }).join('');
+      `<div class="msg ${esc(m.role)}"><div class="txt">${esc(t)}</div></div>`,
+      {cls, open: open && [...t].length <= OPEN_CHARS});
+  };
+  // A 351-message transcript rendered as 351 sibling cards means scrolling past
+  // all of it to reach 本次模型返回 — the thing you actually opened the record
+  // for. Past FOLD_AT groups, fold the history into one card that reports only
+  // its size, like the tool catalogue, and leave the newest exchange (this
+  // call's actual prompt) in the open next to the response. Below that a fold
+  // buys nothing and costs a click, so render flat.
+  const FOLD_AT = 4, OPEN_CHARS = 400;
+  const fold = groups.length > FOLD_AT;
+  const hist = fold ? groups.slice(0, -1) : [];
+  const tailGroups = fold ? groups.slice(-1) : groups;
+  const histMsgs = hist.reduce((n, g) =>
+    n + (g.kind === 'turn' ? 1 + g.results.length : 1), 0);
+  const histChars = hist.reduce((n, g) => n + (g.kind === 'turn'
+    ? [...contentText(g.assistant.content)].length
+      + g.results.reduce((s, r) => s + [...contentText(r.content)].length, 0)
+    : [...contentText(g.msg.content)].length), 0);
+  const histTurns = hist.filter(g => g.kind === 'turn').length;
+  // Numbering runs over all groups so the folded history and the tail share one
+  // sequence; build the history HTML first to keep turnNo in order.
+  const histHtml = hist.map(g => cardOf(g, false)).join('');
+  const convHtml = (fold ? card('会话历史',
+      `${histMsgs} 条消息${histTurns ? ` · ${histTurns} 次调用` : ''} · ${histChars.toLocaleString()} 字符`,
+      histHtml,
+      {cls: 'hist', open: false,
+       right: '<span class="toggle exp-all" data-all="1">展开全部</span>'})
+    + '<div class="tailhd">最新一条</div>' : '')
+    + tailGroups.map(g => cardOf(g, true)).join('');
 
   return `
   <div class="dh">
@@ -717,8 +762,13 @@ $('#detail').addEventListener('click', e => {
   const scope = all.closest('.card') || all.closest('section');
   const open = all.textContent.trim() === '展开全部';
   // Opening a section means opening its cards first, otherwise the clamps
-  // inside are still hidden and cannot be measured.
-  scope.querySelectorAll('.card').forEach(c => {
+  // inside are still hidden and cannot be measured. When the toggle lives in a
+  // card's own header (the tool catalogue, the folded transcript) that card is
+  // part of the scope too — expanding children of a card that stays closed
+  // measures a display:none subtree and shows nothing.
+  const cards = [...scope.querySelectorAll('.card')];
+  if (scope.classList.contains('card')) cards.unshift(scope);
+  cards.forEach(c => {
     c.classList.toggle('open', open);
     if (open && !c.dataset.wired){ c.dataset.wired = '1'; wireClamps(c); }
   });
