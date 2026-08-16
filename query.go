@@ -57,14 +57,26 @@ type dayEntry struct {
 	e   idxEntry
 }
 
-// candidates walks the days overlapping the time filter, newest first, and
-// returns the entries matching every index-answerable predicate.
+// eachMatch walks the days overlapping the time filter, newest first, and calls
+// fn for every entry matching each index-answerable predicate.
 //
 // A request id may appear more than once: the archive is append-only, so
 // correcting a record (after a parser fix, say) means appending a new version.
-// The last entry for an id wins, and the earlier ones are not listed.
-func (q *query) candidates(f listFilter) []dayEntry {
-	var out []dayEntry
+// The last entry for an id wins, and the earlier ones are skipped. This matters
+// far more than it sounds: 1,741 of 15,386 entries on the production archive are
+// superseded duplicates - 55% of one day - so an aggregate that skips this step
+// does not merely list a row twice, it overstates spend.
+//
+// Deduping per day file is sufficient because the day is a pure function of the
+// record's TS (archive.Append -> dayOf), and TS is preserved verbatim by every
+// re-append path (repair, reingest). Verified on the production archive: zero
+// ids appear in two different day files.
+//
+// This is a callback rather than a slice because it has two callers with
+// opposite needs. The list wants every match materialised and sorted; stats want
+// to fold 600k entries without ever holding them. Sharing the walk is the point:
+// the two views must never disagree about which entries exist.
+func (q *query) eachMatch(f listFilter, fn func(day string, e idxEntry)) {
 	for _, day := range q.arc.daysInRange(f.Since, f.Until) {
 		entries, err := q.arc.index(day)
 		if err != nil {
@@ -81,9 +93,17 @@ func (q *query) candidates(f listFilter) []dayEntry {
 			if !matchIndex(e, f) {
 				continue
 			}
-			out = append(out, dayEntry{day, e})
+			fn(day, e)
 		}
 	}
+}
+
+// candidates returns every entry matching the filter, newest first.
+func (q *query) candidates(f listFilter) []dayEntry {
+	var out []dayEntry
+	q.eachMatch(f, func(day string, e idxEntry) {
+		out = append(out, dayEntry{day, e})
+	})
 	sort.Slice(out, func(a, b int) bool {
 		if out[a].e.TS != out[b].e.TS {
 			return out[a].e.TS > out[b].e.TS
@@ -91,6 +111,32 @@ func (q *query) candidates(f listFilter) []dayEntry {
 		return out[a].e.RID > out[b].e.RID
 	})
 	return out
+}
+
+// entryOutcome resolves whether an indexed call succeeded, from the index alone.
+//
+// The ladder matches deriveOutcome's: the derived outcome first, then the HTTP
+// status as a fallback for records archived before Outcome existed. Returns ""
+// when the index settles neither - which is not a rare corner. 9,723 of 15,386
+// entries on the production archive predate the field and carry no status
+// either, so "" is a third state the callers must handle, not an edge case.
+// Folding it into failure would render a 63%-unknown archive as a 63% failure
+// rate; folding it into success would invent deliveries that were never
+// observed.
+//
+// Shared by matchIndex and the stats aggregation so the two can never disagree
+// about what "ok" means.
+func entryOutcome(e idxEntry) string {
+	if e.Outcome != "" {
+		return e.Outcome
+	}
+	if e.Status != nil {
+		if *e.Status >= 400 {
+			return outcomeErr
+		}
+		return outcomeOK
+	}
+	return ""
 }
 
 func matchIndex(e idxEntry, f listFilter) bool {
@@ -107,14 +153,7 @@ func matchIndex(e idxEntry, f listFilter) bool {
 		if f.Status == "err" {
 			want = outcomeErr
 		}
-		oc := e.Outcome
-		if oc == "" && e.Status != nil {
-			oc = outcomeOK
-			if *e.Status >= 400 {
-				oc = outcomeErr
-			}
-		}
-		if oc != want {
+		if entryOutcome(e) != want {
 			return false
 		}
 	}
@@ -241,7 +280,7 @@ func (q *query) entryToItem(e idxEntry) listItem {
 	it := listItem{
 		RequestID: e.RID, TS: e.TS, Epoch: e.Epoch,
 		Model: e.Model, Status: e.Status, Latency: e.Latency,
-		Outcome: e.Outcome,
+		Outcome:  e.Outcome,
 		IsStream: e.IsStream, HasTools: e.HasTools, Quota: e.Quota,
 		Preview: e.Preview, Errors: e.Errors,
 		MsgCount: e.MsgCount, Turns: e.Turns, ToolCount: e.ToolCnt,
@@ -253,6 +292,21 @@ func (q *query) entryToItem(e idxEntry) listItem {
 		it.Channel = q.ch.name(*e.Chan)
 	}
 	return it
+}
+
+// earliest returns the start of the oldest archived day, as an epoch, for a
+// caller that needs a lower bound and was not given one. Falls back to the
+// supplied instant when the archive is empty, so a range is always well-formed.
+func (q *query) earliest(fallback int64) int64 {
+	days := q.arc.days() // newest first
+	if len(days) == 0 {
+		return fallback
+	}
+	t, err := time.ParseInLocation("20060102", days[len(days)-1], time.Local)
+	if err != nil {
+		return fallback
+	}
+	return t.Unix()
 }
 
 // get fetches one full record by request id.

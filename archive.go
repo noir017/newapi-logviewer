@@ -92,21 +92,47 @@ type idxEntry struct {
 	// be resolved. Only the host is kept - the full URL is in the record.
 	Chan *int   `json:"c,omitempty"`
 	Up   string `json:"u,omitempty"`
+
+	// Token counts, carried so the stats view can total them without opening a
+	// single body: the day's records are ~340MB of gzip against ~700KB of index.
+	//
+	// Pointers, not ints, for the same reason Outcome is not a synthesised
+	// status: a call whose usage never reached the log must not be
+	// indistinguishable from one that genuinely used zero tokens. Averaging over
+	// the former silently understates; the nil lets the stats page report
+	// coverage instead of guessing.
+	PT *int `json:"pt,omitempty"`
+	CT *int `json:"ct,omitempty"`
 }
 
 // makeIdxEntry is the single definition of the list-row projection. reindex
 // calls it too, so a rebuilt index is byte-identical to one Append would have
 // written.
 func makeIdxEntry(r *Record, off, n int64) idxEntry {
-	return idxEntry{
+	e := idxEntry{
 		RID: r.RequestID, TS: r.TS, Epoch: r.Epoch, Off: off, Len: n,
 		Model: r.Model, Status: r.Status, Latency: r.Latency,
-		Outcome: r.Outcome,
+		Outcome:  r.Outcome,
 		IsStream: r.IsStream, HasTools: r.HasTools, Quota: r.Quota,
 		Preview: r.Preview, Errors: len(r.Errors),
 		MsgCount: r.MsgCount, Turns: r.Turns, ToolCnt: r.ToolCount,
 		Chan: r.ChannelID, Up: hostOf(r.UpstreamURL),
 	}
+	// Both levels are optional: Usage is absent on calls that never reported it
+	// (4% of a recent day), and either count can be missing within it. Copy the
+	// values rather than aliasing the record's pointers, so a later mutation of
+	// the record cannot reach into an already-written index entry.
+	if r.Usage != nil {
+		if p := r.Usage.PromptTokens; p != nil {
+			v := *p
+			e.PT = &v
+		}
+		if c := r.Usage.CompletionTokens; c != nil {
+			v := *c
+			e.CT = &v
+		}
+	}
+	return e
 }
 
 func newArchive(dir string) *archive { return &archive{dir: dir} }
