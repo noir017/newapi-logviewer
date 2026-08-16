@@ -2,11 +2,13 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"math"
 	"net/http"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type server struct {
@@ -86,6 +88,8 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleCalls(w, r, user)
 	case "/api/call":
 		s.handleCall(w, r)
+	case "/api/stats":
+		s.handleStats(w, r)
 	default:
 		s.writeJSON(w, 404, map[string]any{"success": false, "message": "not found"})
 	}
@@ -125,7 +129,7 @@ func toListItem(r *Record) listItem {
 	return listItem{
 		RequestID: r.RequestID, TS: r.TS, Epoch: r.Epoch,
 		Model: r.Model, Status: r.Status, Latency: r.Latency,
-		Outcome: r.Outcome,
+		Outcome:  r.Outcome,
 		IsStream: r.IsStream, HasTools: r.HasTools, Quota: r.Quota,
 		Preview: r.Preview, Errors: len(r.Errors),
 		MsgCount: r.MsgCount, Turns: r.Turns, ToolCount: r.ToolCount,
@@ -178,6 +182,117 @@ func (s *server) handleCall(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.writeJSON(w, 404, map[string]any{"success": false, "message": "not found"})
+}
+
+// resolveRange turns a named range into epoch bounds, in the server's location.
+//
+// The calendar ranges are computed here rather than in the browser on purpose.
+// A relative offset ("last 7 days") is the same instant everywhere, but "today"
+// and "this year" are calendar boundaries and depend on which clock draws them.
+// There are already two clocks in play - the log's, which names the day files,
+// and the viewer's, which computed every Epoch at ingest - and main.go requires
+// them to match. Letting the browser supply a third would make the numbers
+// depend on where the reader happens to be sitting.
+//
+// Both bounds are inclusive, matching matchIndex. The upper bound is the last
+// second of the final day rather than the next midnight, so a call logged at
+// exactly 00:00:00 is not counted in two adjacent ranges.
+func resolveRange(name string, now time.Time) (int64, int64, bool) {
+	y, m, d := now.Date()
+	loc := now.Location()
+	midnight := time.Date(y, m, d, 0, 0, 0, 0, loc)
+	endOfToday := midnight.AddDate(0, 0, 1).Add(-time.Second)
+
+	switch name {
+	case "today":
+		return midnight.Unix(), endOfToday.Unix(), true
+	case "7d":
+		return midnight.AddDate(0, 0, -6).Unix(), endOfToday.Unix(), true
+	case "30d":
+		return midnight.AddDate(0, 0, -29).Unix(), endOfToday.Unix(), true
+	case "ytd":
+		return time.Date(y, 1, 1, 0, 0, 0, 0, loc).Unix(), endOfToday.Unix(), true
+	}
+	return 0, 0, false
+}
+
+// parseEpoch is the strict counterpart to atoiDef.
+//
+// atoiDef swallows a malformed value and returns its default, which for a time
+// bound means silently widening the query to all of history - 70ms today, but
+// seconds once the archive spans a year, and wrong either way. A stats query
+// with a broken range is a bug in the caller, so it is reported as one.
+func parseEpoch(v string) (int64, error) {
+	if v == "" {
+		return 0, nil
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	if n < 0 {
+		return 0, errBadRange
+	}
+	// Epoch seconds, not milliseconds. A caller that forgets to divide by 1000
+	// would otherwise ask for a window in the year 58000 and get an empty page
+	// with no hint as to why.
+	if n > 1<<34 {
+		return 0, errBadRange
+	}
+	return n, nil
+}
+
+var errBadRange = errors.New("range out of bounds")
+
+func (s *server) handleStats(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	now := time.Now()
+
+	var since, until int64
+	name := q.Get("range")
+	if name != "" && name != "custom" {
+		var ok bool
+		since, until, ok = resolveRange(name, now)
+		if !ok {
+			s.writeJSON(w, 400, map[string]any{
+				"success": false, "message": "unknown range: " + name})
+			return
+		}
+	} else {
+		var err error
+		if since, err = parseEpoch(q.Get("since")); err != nil {
+			s.writeJSON(w, 400, map[string]any{"success": false, "message": "bad since"})
+			return
+		}
+		if until, err = parseEpoch(q.Get("until")); err != nil {
+			s.writeJSON(w, 400, map[string]any{"success": false, "message": "bad until"})
+			return
+		}
+		if until == 0 {
+			until = now.Unix()
+		}
+		if since == 0 {
+			// An open-ended custom range still needs a lower bound to draw an
+			// axis against; fall back to the archive's own start.
+			since = s.q.earliest(until)
+		}
+		if until < since {
+			s.writeJSON(w, 400, map[string]any{"success": false, "message": "until before since"})
+			return
+		}
+	}
+
+	res := s.q.stats(statsFilter{Since: since, Until: until, Model: q.Get("model")}, now.Location())
+
+	s.writeJSON(w, 200, map[string]any{
+		"success": true,
+		"data":    res,
+		// Echo the resolved window and the clock that resolved it, so the page
+		// can state the range it actually drew rather than the one it asked for.
+		"range": map[string]any{
+			"name": name, "since": since, "until": until, "tz": now.Location().String(),
+		},
+	})
 }
 
 func atoiDef(s string, def int) int {

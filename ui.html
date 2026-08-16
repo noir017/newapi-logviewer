@@ -10,6 +10,19 @@
   --acc:#5b9dff; --ok:#3fb950; --err:#f85149; --warn:#d29922;
   --sys:#a371f7; --usr:#3fb950; --asst:#5b9dff; --tool:#d29922;
   --hdr:96px;
+
+  /* Chart-only colour slots.
+     Scoped to the stats view rather than reusing --ok/--err, which measure a
+     CVD separation of ΔE 2.2 (deutan) against this panel colour — indistinguishable
+     to a red-green colourblind reader. That is tolerable in the list, where every
+     status chip carries a word beside the colour, but a stacked bar has nothing
+     but hue. These two measure ΔE 19.2 and pass every check of the palette
+     validator against #171a21. Changing them means re-running it. */
+  --c-1:#3987e5;      /* the single series: spend, model volume, success */
+  --c-err:#e66767;    /* failures */
+  --c-unk:#6e7681;    /* outcome the log never recorded — grey, not a hue: it is
+                         the absence of a measurement, not a third category */
+  --grid:#232833;     /* hairline, one step off the surface */
 }
 html,body{height:100%}
 body{margin:0;font:14px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",sans-serif;
@@ -78,6 +91,74 @@ label.ck input{width:13px;height:13px;accent-color:var(--acc)}
 .tag.ch{color:#93a4c8;border-color:#2c3654;max-width:190px;overflow:hidden;
   text-overflow:ellipsis;display:inline-block;vertical-align:bottom}
 .tag.cl{color:var(--tool);border-color:#4a3a12;background:#241d0e;cursor:pointer}
+
+/* ---- stats view ---- */
+/* Its own scroll container. body is overflow:hidden and .split is sized from
+   --hdr, so a stats pane that grew the document would be unscrollable — content
+   below the fold simply unreachable. */
+.stats{height:calc(100vh - var(--hdr));overflow-y:auto;padding:16px 20px 48px;display:none}
+body.view-stats .stats{display:block}
+body.view-stats .split{display:none}
+/* Refetch holds the previous render rather than flashing a skeleton. */
+.stats.busy{opacity:.55;transition:opacity .12s}
+
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;margin-bottom:16px}
+.kpi{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px 14px}
+.kpi .lb{color:var(--dim2);font-size:11.5px;margin-bottom:5px}
+/* Proportional figures, not tabular: tabular-nums gives every digit the width of
+   a zero, which reads loose at display sizes. Tabular is for the table below. */
+.kpi .vl{font-size:23px;font-weight:600;line-height:1.15;letter-spacing:-.2px}
+.kpi .sub{color:var(--dim2);font-size:11px;margin-top:3px}
+.kpi.hero .vl{font-size:34px}
+.kpi .vl.dim{color:var(--dim2);font-weight:500}
+
+.card2{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+  padding:13px 15px 15px;margin-bottom:14px}
+.card2 h3{font-size:12.5px;margin:0 0 2px;font-weight:600}
+.card2 .cap{color:var(--dim2);font-size:11.5px;margin-bottom:10px}
+.card2 .hd{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
+.card2 .hd .grow{flex:1}
+.lg{display:flex;gap:12px;align-items:center;flex-wrap:wrap;font-size:11.5px;color:var(--dim)}
+.lg i{width:9px;height:9px;border-radius:2px;display:inline-block;margin-right:4px;vertical-align:-1px}
+.chart{width:100%;display:block;overflow:visible}
+.chart text{fill:var(--dim2);font-size:10px}
+.chart .gl{stroke:var(--grid);stroke-width:1}
+.chart .hit{fill:transparent;cursor:pointer}
+.chart .bar{transition:opacity .1s}
+.chart g.on .bar{opacity:.72}
+.chart .cross{stroke:var(--dim2);stroke-width:1;opacity:0;pointer-events:none}
+
+/* Model rows are a list, not an SVG: names run long and HTML ellipsis handles
+   that far better than tspan arithmetic. */
+.mrow{display:grid;grid-template-columns:1fr 76px;gap:10px;align-items:center;
+  padding:5px 0;cursor:pointer;border-radius:5px}
+.mrow:hover{background:var(--panel2)}
+.mrow .nm{font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mrow .track{height:7px;background:#20242e;border-radius:4px;overflow:hidden;margin-top:4px}
+.mrow .fill{height:100%;background:var(--c-1);border-radius:4px}
+.mrow .vv{text-align:right;font-size:11.5px;color:var(--dim);font-variant-numeric:tabular-nums}
+
+/* The table twin. Every value a tooltip shows is reachable here without
+   hovering, which is what keeps the charts from gating their own data. */
+.tbl{width:100%;border-collapse:collapse;font-size:11.5px;font-variant-numeric:tabular-nums}
+.tbl th,.tbl td{text-align:right;padding:3px 8px;border-bottom:1px solid #1e222b;white-space:nowrap}
+.tbl th:first-child,.tbl td:first-child{text-align:left}
+.tbl th{color:var(--dim2);font-weight:500;position:sticky;top:0;background:var(--panel)}
+.tblwrap{max-height:260px;overflow:auto;margin-top:8px;display:none}
+.tblwrap.on{display:block}
+.lnk{background:none;border:none;color:var(--dim2);font-size:11.5px;padding:2px 4px;cursor:pointer}
+.lnk:hover{color:var(--acc)}
+
+#tip{position:fixed;z-index:40;pointer-events:none;opacity:0;transition:opacity .08s;
+  background:#0b0e14;border:1px solid var(--line);border-radius:7px;padding:7px 9px;
+  font-size:11.5px;box-shadow:0 6px 20px #0009;max-width:260px}
+#tip .tt{color:var(--dim2);margin-bottom:3px}
+#tip .rw{display:flex;align-items:center;gap:6px;justify-content:space-between}
+#tip .rw b{font-variant-numeric:tabular-nums}
+#tip .k{width:10px;height:2px;border-radius:2px;display:inline-block;vertical-align:2px;margin-right:5px}
+.note{color:var(--dim2);font-size:11.5px;margin:-4px 0 12px}
+.warnbox{background:#1d1a0e;border:1px solid #4a3a12;color:#e3b341;border-radius:8px;
+  padding:8px 11px;font-size:11.5px;margin-bottom:12px}
 
 /* ---- detail ---- */
 .ph{color:var(--dim2);text-align:center;padding:80px 20px;font-size:13px}
@@ -202,13 +283,16 @@ pre.j{background:#0d1017;border:1px solid var(--line);border-radius:7px;padding:
 <header>
   <div class="hrow">
     <h1>New API 调用日志</h1>
+    <div class="seg" id="view">
+      <button data-v="list" class="on">调用列表</button><button data-v="stats">统计</button>
+    </div>
     <span class="who" id="who"></span>
     <span class="who" id="authnote" style="color:#d29922"></span>
     <span class="grow"></span>
     <label class="ck"><input type="checkbox" id="auto"> 自动刷新</label>
     <button id="refresh">刷新</button>
   </div>
-  <div class="filters">
+  <div class="filters" id="listfilters">
     <div class="seg" id="quick">
       <button data-h="0.25">15分钟</button><button data-h="1">1小时</button>
       <button data-h="6">6小时</button><button data-h="24">24小时</button>
@@ -228,7 +312,29 @@ pre.j{background:#0d1017;border:1px solid var(--line);border-radius:7px;padding:
     <select id="size"><option value="30">30/页</option><option value="60">60/页</option><option value="100">100/页</option></select>
     <button id="reset">重置</button>
   </div>
+
+  <!-- Kept to exactly one line, like the list's filter row: --hdr is a fixed
+       96px that .split and .stats both subtract from the viewport, so a taller
+       row would push content past the bottom of an unscrollable body. -->
+  <div class="filters" id="statsfilters" style="display:none">
+    <div class="seg" id="srange">
+      <button data-r="today">今天</button>
+      <button data-r="7d" class="on">7 日</button>
+      <button data-r="30d">30 日</button>
+      <button data-r="ytd">今年</button>
+      <button data-r="custom">自定义</button>
+    </div>
+    <input type="datetime-local" id="sfrom" title="起始时间" style="display:none">
+    <span id="sarrow" style="color:var(--dim2);font-size:12px;display:none">→</span>
+    <input type="datetime-local" id="sto" title="结束时间" style="display:none">
+    <span class="sep"></span>
+    <select id="smodel"><option value="">全部模型</option></select>
+    <span class="who" id="srangelabel"></span>
+  </div>
 </header>
+
+<div class="stats" id="stats"><div class="spin">加载中…</div></div>
+<div id="tip"></div>
 
 <div class="split">
   <div class="left" id="left">
@@ -829,5 +935,411 @@ $('#auto').onchange = e => {
   const saved = localStorage.getItem('lv-w'); if (saved) l.style.width = saved;
 })();
 
+// ===================== stats view =====================
+//
+// Charts are hand-written SVG. The viewer ships as one static binary with the
+// UI embedded, so there is no library to load and nothing to serve off disk —
+// a charting dependency would mean either a CDN call from an air-gapped LAN box
+// or a second asset path to keep in sync.
+
+const SVGNS = 'http://www.w3.org/2000/svg';
+let statsData = null, statsBusy = false;
+
+const nfmt = n => (n ?? 0).toLocaleString();
+// Compact form for the KPI tiles: 7,121,573,591 does not fit in a tile and is
+// not read digit-by-digit anyway. The exact value stays in the tooltip/table.
+function compact(n){
+  n = n || 0;
+  if (n >= 1e9) return (n / 1e9).toFixed(2) + 'B';
+  if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M';
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+  return String(n);
+}
+// Dollars come from the same divisor the list view uses, so the two pages can
+// never disagree about what a quota unit is worth.
+const money = q => '$' + (q / 500000).toFixed(4);
+
+function el(tag, attrs, parent){
+  const n = document.createElementNS(SVGNS, tag);
+  for (const k in attrs) n.setAttribute(k, attrs[k]);
+  if (parent) parent.appendChild(n);
+  return n;
+}
+
+// Round an axis maximum up to a clean number, so ticks read 0 / 500 / 1,000
+// rather than 0 / 437 / 874.
+function niceMax(v){
+  if (v <= 0) return 1;
+  const mag = Math.pow(10, Math.floor(Math.log10(v)));
+  const norm = v / mag;
+  const step = norm <= 1 ? 1 : norm <= 2 ? 2 : norm <= 5 ? 5 : 10;
+  return step * mag;
+}
+
+const tip = () => document.getElementById('tip');
+function showTip(evt, html){
+  const t = tip();
+  t.innerHTML = html;
+  t.style.opacity = '1';
+  const r = t.getBoundingClientRect();
+  let x = evt.clientX + 14, y = evt.clientY - r.height - 10;
+  if (x + r.width > window.innerWidth - 8) x = evt.clientX - r.width - 14;
+  if (y < 8) y = evt.clientY + 18;
+  t.style.left = x + 'px';
+  t.style.top = y + 'px';
+}
+const hideTip = () => { tip().style.opacity = '0'; };
+
+// A bar with its data-end rounded and its baseline square.
+//
+// An SVG rect's rx rounds all four corners, which detaches the bar from its own
+// baseline and makes a stack read as separate floating pills. Only the end that
+// encodes the value gets the radius.
+function barPath(x, y, w, h, r){
+  r = Math.max(0, Math.min(r, w / 2, h));
+  if (r <= 0) return `M${x} ${y}h${w}v${h}h${-w}z`;
+  return `M${x} ${y + h}V${y + r}a${r} ${r} 0 0 1 ${r} ${-r}h${w - 2 * r}` +
+         `a${r} ${r} 0 0 1 ${r} ${r}V${y + h}z`;
+}
+
+// barChart draws one time-bucketed chart into a host element.
+//
+// series: the API's buckets. keys: which fields to stack, in draw order.
+// Every bar carries its own hover/focus target sized to the whole band, not to
+// the painted pixels — a 3px bar in a 365-day range is otherwise unhittable.
+function barChart(host, series, keys, colors, labels, fmt){
+  host.innerHTML = '';
+  const W = Math.max(host.clientWidth || 720, 320), H = 190;
+  const padL = 52, padR = 10, padT = 10, padB = 26;
+  const iw = W - padL - padR, ih = H - padT - padB;
+
+  const svg = el('svg', {class: 'chart', viewBox: `0 0 ${W} ${H}`,
+    width: '100%', height: H, role: 'img'}, host);
+
+  const totals = series.map(b => keys.reduce((s, k) => s + (b[k] || 0), 0));
+  const max = niceMax(Math.max(1, ...totals));
+
+  // Gridlines + y ticks. Solid hairlines, one step off the surface: dashed
+  // reads as "threshold" when it is just a grid.
+  for (let i = 0; i <= 4; i++){
+    const y = padT + ih - (ih * i / 4);
+    el('line', {class: 'gl', x1: padL, y1: y, x2: W - padR, y2: y}, svg);
+    const t = el('text', {x: padL - 7, y: y + 3, 'text-anchor': 'end'}, svg);
+    t.textContent = fmt ? fmt(max * i / 4, true) : nfmt(Math.round(max * i / 4));
+  }
+
+  const n = series.length || 1;
+  const band = iw / n;
+  // Cap the bar so the band always keeps some air; never fill the slot.
+  const bw = Math.max(1, Math.min(24, band - (band > 6 ? 2 : 0.5)));
+
+  series.forEach((b, i) => {
+    const cx = padL + band * i + band / 2;
+    const g = el('g', {}, svg);
+    let acc = 0;
+    keys.forEach((k, ki) => {
+      const v = b[k] || 0;
+      if (v <= 0) return;
+      const h = (v / max) * ih;
+      const y = padT + ih - h - acc;
+      // 4px rounded data-end on the topmost segment only; the rest stay square
+      // so a stack does not look like separate floating pills.
+      const isTop = keys.slice(ki + 1).every(kk => !(b[kk] > 0));
+      const hh = Math.max(h, v > 0 ? 1 : 0);
+      el('path', {class: 'bar', d: barPath(cx - bw / 2, y, bw, hh, isTop ? 4 : 0),
+        fill: colors[ki]}, g);
+      // 2px surface gap between stacked segments — white doing the separating,
+      // never a stroke around the mark.
+      acc += h + (h > 2 ? 2 : 0);
+    });
+
+    // The hit target is the whole band and the full height, so the pointer only
+    // has to be near the right date.
+    const hit = el('rect', {class: 'hit', x: padL + band * i, y: padT,
+      width: band, height: ih, tabindex: '0'}, g);
+    const rows = keys.map((k, ki) =>
+      `<div class="rw"><span><i class="k" style="background:${colors[ki]}"></i>${
+        esc(labels[ki])}</span><b>${fmt ? fmt(b[k] || 0) : nfmt(b[k] || 0)}</b></div>`).join('');
+    const html = `<div class="tt">${esc(b.label)}</div>${rows}`;
+    const show = e => { g.classList.add('on'); showTip(e, html); };
+    hit.addEventListener('pointerenter', show);
+    hit.addEventListener('pointermove', show);
+    hit.addEventListener('focus', () => {
+      const r = hit.getBoundingClientRect();
+      show({clientX: r.left + r.width / 2, clientY: r.top});
+    });
+    hit.addEventListener('pointerleave', () => { g.classList.remove('on'); hideTip(); });
+    hit.addEventListener('blur', () => { g.classList.remove('on'); hideTip(); });
+  });
+
+  // X labels, thinned to whatever fits. A label that would collide with its
+  // neighbour is dropped rather than shrunk or rotated: the axis exists to
+  // orient the reader, and the exact value of every bucket is in the tooltip
+  // and the table twin.
+  //
+  // Widths are MEASURED, not assumed. A guessed constant is what put "22:00"
+  // and "23:00" on top of each other: the estimate was 46px and the hourly
+  // label actually renders at ~68. getComputedTextLength reports what the
+  // browser will really draw, so the rule holds for any label format.
+  let lastRight = -Infinity;
+  const place = i => {
+    const x = padL + band * i + band / 2;
+    const t = el('text', {x, y: H - 8, 'text-anchor': 'middle'}, svg);
+    t.textContent = series[i].label;
+    let w;
+    try { w = t.getComputedTextLength(); } catch { w = series[i].label.length * 5.6; }
+    if (x - w / 2 < lastRight + 6 || x + w / 2 > W - padR + 4){
+      svg.removeChild(t);                    // would collide, or overflow the plot
+      return;
+    }
+    lastRight = x + w / 2;
+  };
+  // Stride from a measured sample rather than a constant.
+  const probe = el('text', {x: -999, y: -999}, svg);
+  probe.textContent = series.length ? series[0].label : '';
+  let lw;
+  try { lw = probe.getComputedTextLength() || 46; } catch { lw = 46; }
+  svg.removeChild(probe);
+  const every = Math.max(1, Math.ceil(n / Math.max(1, Math.floor(iw / (lw + 16)))));
+  for (let i = 0; i < n; i += every) place(i);
+  if (n > 1 && (n - 1) % every) place(n - 1);     // always try the last bucket
+}
+
+function kpi(label, value, sub, cls){
+  return `<div class="kpi ${cls || ''}">
+    <div class="lb">${esc(label)}</div>
+    <div class="vl ${value === '—' ? 'dim' : ''}">${esc(String(value))}</div>
+    ${sub ? `<div class="sub">${esc(sub)}</div>` : ''}
+  </div>`;
+}
+
+function renderStats(d, rng){
+  const host = $('#stats');
+  const s = d.series || [], models = d.models || [];
+  const gran = {hour: '每小时', day: '每天', week: '每周'}[d.granularity] || d.granularity;
+
+  // Success rate is over calls whose outcome the log actually recorded. 63% of
+  // this archive predates the outcome field, and ok/total would render that
+  // silence as a 37% success rate — a number someone would escalate on.
+  const known = d.ok + d.err;
+  const rate = known ? (100 * d.ok / known).toFixed(1) + '%' : '—';
+  const avg = d.quota_count ? money(d.quota / d.quota_count) : '—';
+
+  const parts = [];
+
+  if (d.unknown > 0){
+    parts.push(`<div class="warnbox">${nfmt(d.unknown)} 次调用（${
+      (100 * d.unknown / Math.max(d.requests, 1)).toFixed(0)
+      }%）的日志未记录结束状态，未计入成功率。这些记录早于 outcome 字段，
+      可用 <code>-reindex</code> 从归档回填。</div>`);
+  }
+  if (d.token_count === 0 && d.requests > 0){
+    parts.push(`<div class="warnbox">索引中暂无 token 数据。运行
+      <code>logviewer -reindex</code> 可从已归档的记录中回填。</div>`);
+  }
+
+  parts.push(`<div class="kpis">
+    ${kpi('总花费', money(d.quota), `${nfmt(d.quota_count)} 次计费`, 'hero')}
+    ${kpi('请求数', nfmt(d.requests), gran + ' · ' + s.length + ' 个区间')}
+    ${kpi('成功率', rate, known ? `${nfmt(d.ok)} 成功 / ${nfmt(d.err)} 失败` : '无可用状态')}
+    ${kpi('平均单价', avg, d.quota_count ? '按已计费调用' : '无计费记录')}
+    ${kpi('Token 总量', d.token_count ? compact(d.tokens) : '—',
+      d.token_count ? `${nfmt(d.token_count)} 次上报 · 入 ${compact(d.prompt_tokens)} / 出 ${compact(d.completion_tokens)}`
+                    : '索引未记录')}
+  </div>`);
+
+  // Two charts, one axis each. Spend and request count are different units, and
+  // overlaying them on twin y-scales would invent a correlation out of the
+  // arbitrary alignment of two ranges.
+  parts.push(`<div class="card2">
+    <div class="hd"><div><h3>花费趋势</h3><div class="cap">${gran} · 单位美元</div></div>
+      <span class="grow"></span>
+      <button class="lnk" data-tbl="t-spend">表格</button></div>
+    <div id="c-spend"></div>
+    <div class="tblwrap" id="t-spend"></div>
+  </div>`);
+
+  parts.push(`<div class="card2">
+    <div class="hd"><div><h3>请求量</h3><div class="cap">${gran} · 按结束状态分层</div></div>
+      <span class="grow"></span>
+      <div class="lg">
+        <span><i style="background:var(--c-1)"></i>成功</span>
+        <span><i style="background:var(--c-err)"></i>失败</span>
+        <span><i style="background:var(--c-unk)"></i>未记录</span>
+      </div>
+      <button class="lnk" data-tbl="t-req">表格</button></div>
+    <div id="c-req"></div>
+    <div class="tblwrap" id="t-req"></div>
+  </div>`);
+
+  const maxReq = Math.max(1, ...models.map(m => m.requests));
+  parts.push(`<div class="card2">
+    <div class="hd"><div><h3>模型分布</h3>
+      <div class="cap">按请求数排序 · 点击可在列表中筛选</div></div></div>
+    ${models.length ? models.map(m => `
+      <div class="mrow" data-model="${esc(m.model)}">
+        <div>
+          <div class="nm" title="${esc(m.model)}">${esc(m.model)}</div>
+          <div class="track"><div class="fill" style="width:${
+            Math.max(1, 100 * m.requests / maxReq)}%"></div></div>
+        </div>
+        <div class="vv">${nfmt(m.requests)}<br><span style="color:var(--dim2)">${money(m.quota)}</span></div>
+      </div>`).join('') : '<div class="cap">此范围内没有调用</div>'}
+  </div>`);
+
+  if (d.unknown_time > 0){
+    parts.push(`<div class="note">另有 ${nfmt(d.unknown_time)} 条记录没有可用时间戳，
+      无法归入任何区间，已排除。</div>`);
+  }
+  parts.push(`<div class="note">时间范围 ${fmtRange(rng)} · 时区 ${esc(rng.tz || '')}</div>`);
+
+  host.innerHTML = parts.join('');
+
+  barChart($('#c-spend'), s, ['quota'], ['var(--c-1)'], ['花费'],
+    (v, axis) => axis ? '$' + (v / 500000).toFixed(v / 500000 >= 10 ? 0 : 2) : money(v));
+  barChart($('#c-req'), s, ['ok', 'err', 'unknown'],
+    ['var(--c-1)', 'var(--c-err)', 'var(--c-unk)'], ['成功', '失败', '未记录']);
+
+  // Table twins. Built with textContent, never innerHTML concatenation: model
+  // names come from the request body a client sent, so they are untrusted.
+  fillTable($('#t-spend'), ['时间', '花费', '请求'],
+    s.map(b => [b.label, money(b.quota), nfmt(b.requests)]));
+  fillTable($('#t-req'), ['时间', '成功', '失败', '未记录', '合计'],
+    s.map(b => [b.label, nfmt(b.ok), nfmt(b.err), nfmt(b.unknown), nfmt(b.requests)]));
+}
+
+function fillTable(host, head, rows){
+  host.innerHTML = '';
+  const t = document.createElement('table');
+  t.className = 'tbl';
+  const thead = t.createTHead().insertRow();
+  head.forEach(h => { const th = document.createElement('th'); th.textContent = h; thead.appendChild(th); });
+  const tb = t.createTBody();
+  rows.forEach(r => {
+    const tr = tb.insertRow();
+    r.forEach(c => { tr.insertCell().textContent = c; });
+  });
+  host.appendChild(t);
+}
+
+function fmtRange(rng){
+  if (!rng || !rng.since) return '—';
+  const f = e => {
+    const d = new Date(e * 1000);
+    const p = n => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+  };
+  return f(rng.since) + ' → ' + f(rng.until);
+}
+
+function statsParams(){
+  const btn = document.querySelector('#srange button.on');
+  const r = btn ? btn.dataset.r : '7d';
+  const p = new URLSearchParams({range: r, model: $('#smodel').value});
+  if (r === 'custom'){
+    const a = toEpoch($('#sfrom').value), b = toEpoch($('#sto').value);
+    if (a) p.set('since', a);
+    if (b) p.set('until', b);
+  }
+  return p;
+}
+
+async function loadStats(){
+  if (statsBusy) return;
+  statsBusy = true;
+  const host = $('#stats');
+  // Hold the previous render at reduced opacity rather than flashing a
+  // skeleton: no layout jump, and the numbers stay readable while they refresh.
+  if (statsData) host.classList.add('busy');
+  else host.innerHTML = '<div class="spin">加载中…</div>';
+  try {
+    const res = await fetch('api/stats?' + statsParams(), {credentials: 'same-origin'});
+    if (res.status === 401){ location.reload(); return; }
+    const d = await res.json();
+    if (!d.success) throw new Error(d.message || '加载失败');
+    statsData = d;
+    renderStats(d.data, d.range);
+    fillSel($('#smodel'),
+      (d.data.models || []).map(m => m.model).filter(m => m !== 'other'), '全部模型');
+  } catch(e){
+    host.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`;
+  } finally {
+    host.classList.remove('busy');
+    statsBusy = false;
+  }
+}
+
+function setView(v){
+  document.body.classList.toggle('view-stats', v === 'stats');
+  $('#listfilters').style.display = v === 'stats' ? 'none' : '';
+  $('#statsfilters').style.display = v === 'stats' ? '' : 'none';
+  document.querySelectorAll('#view button').forEach(b =>
+    b.classList.toggle('on', b.dataset.v === v));
+  localStorage.setItem('lv-view', v);
+  if (v === 'stats' && !statsData) loadStats();
+}
+
+$('#view').addEventListener('click', e => {
+  const b = e.target.closest('button');
+  if (b) setView(b.dataset.v);
+});
+
+$('#srange').addEventListener('click', e => {
+  const b = e.target.closest('button'); if (!b) return;
+  document.querySelectorAll('#srange button').forEach(n => n.classList.remove('on'));
+  b.classList.add('on');
+  const custom = b.dataset.r === 'custom';
+  ['#sfrom', '#sarrow', '#sto'].forEach(s => $(s).style.display = custom ? '' : 'none');
+  if (custom && statsData && statsData.range){
+    // Seed the custom inputs from the window just shown, so switching to it is
+    // a refinement rather than a blank slate.
+    if (!$('#sfrom').value) $('#sfrom').value = localISO(new Date(statsData.range.since * 1000));
+    if (!$('#sto').value) $('#sto').value = localISO(new Date(statsData.range.until * 1000));
+  }
+  loadStats();
+});
+
+['#sfrom', '#sto', '#smodel'].forEach(s =>
+  $(s).addEventListener('change', () => loadStats()));
+
+$('#stats').addEventListener('click', e => {
+  const tb = e.target.closest('[data-tbl]');
+  if (tb){
+    const w = document.getElementById(tb.dataset.tbl);
+    w.classList.toggle('on');
+    tb.textContent = w.classList.contains('on') ? '收起表格' : '表格';
+    return;
+  }
+  // Drill-down: a model row hands its slice to the list view, which already
+  // does per-call inspection well. The stats page does not duplicate it.
+  const row = e.target.closest('[data-model]');
+  if (!row) return;
+  const m = row.dataset.model;
+  if (m === 'other' || m === '(unknown)') return;
+  const rng = statsData && statsData.range;
+  if (rng){
+    $('#from').value = localISO(new Date(rng.since * 1000));
+    $('#to').value = localISO(new Date(rng.until * 1000));
+    document.querySelectorAll('#quick button').forEach(n => n.classList.remove('on'));
+  }
+  $('#model').value = m;
+  if ($('#model').value !== m){         // model absent from the list's options
+    $('#model').add(new Option(m, m));
+    $('#model').value = m;
+  }
+  setView('list');
+  page = 1; load(true);
+});
+
+// Redraw on resize: the SVG viewBox is computed from the host's pixel width, so
+// a resized window would otherwise leave the bars at their old scale.
+let rz;
+window.addEventListener('resize', () => {
+  if (!document.body.classList.contains('view-stats') || !statsData) return;
+  clearTimeout(rz);
+  rz = setTimeout(() => renderStats(statsData.data, statsData.range), 150);
+});
+
 load();
+if (localStorage.getItem('lv-view') === 'stats') setView('stats');
 </script></body></html>
