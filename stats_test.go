@@ -4,6 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -57,6 +60,21 @@ func withOutcome(oc string, status *int) func(*Record) {
 
 func withModel(m string) func(*Record) {
 	return func(r *Record) { r.Model = m }
+}
+
+func withToken(name string) func(*Record) {
+	return func(r *Record) { r.TokenName = name }
+}
+
+// unbilled models the call shape the archive actually holds for an unnamed
+// token: no billing line, so neither the name nor the quota was ever recorded.
+// Verified across 13,955 production records - 785 carry no token name and every
+// one of them has a nil quota.
+func unbilled() func(*Record) {
+	return func(r *Record) {
+		r.TokenName = ""
+		r.Quota = nil
+	}
 }
 
 // span returns the filter covering the given day range, inclusive, the way the
@@ -402,7 +420,7 @@ func TestStatsAgreesWithListTotal(t *testing.T) {
 	q := archivedQuery(t, recs)
 	f := span("20260304", "20260304")
 
-	_, total, _, _ := q.list(listFilter{Since: f.Since, Until: f.Until}, 1, 10)
+	_, total, _, _, _ := q.list(listFilter{Since: f.Since, Until: f.Until}, 1, 10)
 	got := q.stats(f, time.Local)
 
 	if got.Requests != total {
@@ -448,5 +466,344 @@ func TestStatsEchoesResolvedRange(t *testing.T) {
 	// rather than nothing at all.
 	if len(body.Data.Series) == 0 {
 		t.Error("series must be zero-filled even when the archive is empty")
+	}
+}
+
+// BREAK 7: sort foldTokens by Requests (i.e. reuse foldModels' comparator).
+// Then this reports "hermes" first, and the page answers "which token is
+// busiest" while claiming to answer "which token is costing me money". The
+// numbers here are the real ones from 2026-08-17 on the production archive,
+// where the two orderings genuinely invert: 13 calls outspent 150 by 17x.
+func TestTokenSpendRanksByQuotaNotVolume(t *testing.T) {
+	var recs []*Record
+	for i := 0; i < 150; i++ {
+		recs = append(recs, statRec(
+			fmt.Sprintf("Hrm%019d", i),
+			fmt.Sprintf("2026/03/04 %02d:%02d:00", 8+i/60, i%60),
+			367, withToken("hermes")))
+	}
+	for i := 0; i < 13; i++ {
+		recs = append(recs, statRec(
+			fmt.Sprintf("Lap%019d", i),
+			fmt.Sprintf("2026/03/04 12:%02d:00", i),
+			74434, withToken("laptop")))
+	}
+
+	got := archivedQuery(t, recs).stats(span("20260304", "20260304"), time.Local)
+
+	if len(got.TokenStats) != 2 {
+		t.Fatalf("token rows = %d, want 2: %+v", len(got.TokenStats), got.TokenStats)
+	}
+	if got.TokenStats[0].Token != "laptop" {
+		t.Errorf("first row = %q (%d calls, %d quota), want laptop: the breakdown "+
+			"answers which token SPENT the most, and the busiest token is not it",
+			got.TokenStats[0].Token, got.TokenStats[0].Requests, got.TokenStats[0].Quota)
+	}
+	if got.TokenStats[0].Requests >= got.TokenStats[1].Requests {
+		t.Errorf("fixture does not invert: %d vs %d calls - this test only proves "+
+			"anything while the spend leader is the volume laggard",
+			got.TokenStats[0].Requests, got.TokenStats[1].Requests)
+	}
+	if got.TokenStats[0].Quota != 967642 {
+		t.Errorf("laptop quota = %d, want 967642", got.TokenStats[0].Quota)
+	}
+}
+
+// BREAK 8: drop the `TN: r.TokenName` line from makeIdxEntry.
+// The breakdown then files every call in history under (未命名) while the record
+// behind each one carries the name perfectly well - the same failure mode as the
+// blank channel column, and invisible to any page that does not cross-check the
+// record it came from.
+func TestTokenNameReachesTheIndex(t *testing.T) {
+	got := archivedQuery(t, []*Record{
+		statRec("Idx00000000000000000001", "2026/03/04 10:00:00", 500, withToken("laptop")),
+	}).stats(span("20260304", "20260304"), time.Local)
+
+	if len(got.TokenStats) != 1 || got.TokenStats[0].Token != "laptop" {
+		t.Fatalf("token rows = %+v, want one row named laptop: the stats page reads "+
+			"the .idx alone, so a field missing from makeIdxEntry is missing here "+
+			"however good the record behind it is", got.TokenStats)
+	}
+	if got.TokenNameCount != 1 {
+		t.Errorf("token_name_count = %d, want 1", got.TokenNameCount)
+	}
+}
+
+// An index written before the TN field decodes every entry as "", which is
+// per-entry indistinguishable from a call that had no billing line. Only the
+// coverage counter separates them, and the UI needs that separation to choose
+// between "these calls were never billed" and "your index is stale, run
+// -reindex".
+//
+// BREAK 9: increment TokenNameCount before defaulting the empty name (i.e. count
+// the row rather than the name). A stale index then reports full coverage, and
+// the page renders 100% of a month's spend attributed to nobody with no hint
+// that the fix is one command away.
+func TestTokenNameCountMeasuresIndexCoverageNotRows(t *testing.T) {
+	got := archivedQuery(t, []*Record{
+		statRec("Cov00000000000000000001", "2026/03/04 10:00:00", 100, withToken("laptop")),
+		statRec("Cov00000000000000000002", "2026/03/04 10:01:00", 0, unbilled()),
+		statRec("Cov00000000000000000003", "2026/03/04 10:02:00", 0, unbilled()),
+	}).stats(span("20260304", "20260304"), time.Local)
+
+	if got.Requests != 3 {
+		t.Fatalf("requests = %d, want 3", got.Requests)
+	}
+	if got.TokenNameCount != 1 {
+		t.Errorf("token_name_count = %d, want 1 of 3: it measures how many calls "+
+			"carried a name, which is what tells a stale index from an unbilled call",
+			got.TokenNameCount)
+	}
+}
+
+// The breakdown must account for every call, including the unnamed ones, or it
+// cannot be reconciled against the request total - and an unreconcilable
+// breakdown is exactly where a quietly-dropped row hides.
+//
+// BREAK 10: skip entries with an empty TN instead of labelling them. Requests
+// still reads 3 while the rows sum to 1, and the chart looks entirely healthy.
+func TestTokenBreakdownReconcilesIncludingUnnamed(t *testing.T) {
+	got := archivedQuery(t, []*Record{
+		statRec("Rec00000000000000000001", "2026/03/04 10:00:00", 100, withToken("laptop")),
+		statRec("Rec00000000000000000002", "2026/03/04 10:01:00", 0, unbilled()),
+		statRec("Rec00000000000000000003", "2026/03/04 10:02:00", 0, unbilled()),
+	}).stats(span("20260304", "20260304"), time.Local)
+
+	sum, quota := 0, int64(0)
+	var unnamed *tokenStat
+	for i := range got.TokenStats {
+		sum += got.TokenStats[i].Requests
+		quota += got.TokenStats[i].Quota
+		if got.TokenStats[i].Token == tokenUnnamed {
+			unnamed = &got.TokenStats[i]
+		}
+	}
+	if sum != got.Requests {
+		t.Errorf("token rows sum to %d but requests = %d: every call must land in "+
+			"a row, or the breakdown cannot be reconciled", sum, got.Requests)
+	}
+	if quota != got.Quota {
+		t.Errorf("token rows spend %d but total quota = %d", quota, got.Quota)
+	}
+	if unnamed == nil {
+		t.Fatalf("no %q row: unnamed calls must be labelled, not dropped", tokenUnnamed)
+	}
+	if unnamed.Requests != 2 {
+		t.Errorf("%s requests = %d, want 2", tokenUnnamed, unnamed.Requests)
+	}
+	// The name and the quota arrive on the same billing line, so a call missing
+	// one is missing both - verified across 13,955 production records, zero
+	// exceptions. If this ever fires, that invariant has broken and the unnamed
+	// row is quietly absorbing real spend.
+	if unnamed.Quota != 0 {
+		t.Errorf("%s quota = %d, want 0: an unnamed call has no billing line and "+
+			"therefore no quota - non-zero here means real spend is being "+
+			"attributed to nobody", tokenUnnamed, unnamed.Quota)
+	}
+}
+
+// The token filter must narrow the stats page and the list to the same calls.
+// That is the drill-down contract: clicking a token row hands its slice to the
+// list view, and the two disagreeing is precisely what sharing eachMatch is
+// meant to prevent.
+//
+// BREAK 11: delete the `f.Token != "" && e.TN != f.Token` arm in matchIndex. The
+// filter then silently does nothing - stats reports all 3 calls under a filter
+// naming one token, so one token's page shows another's spend.
+func TestTokenFilterNarrowsStatsAndListAlike(t *testing.T) {
+	q := archivedQuery(t, []*Record{
+		statRec("Flt00000000000000000001", "2026/03/04 10:00:00", 100, withToken("laptop")),
+		statRec("Flt00000000000000000002", "2026/03/04 10:01:00", 200, withToken("hermes")),
+		statRec("Flt00000000000000000003", "2026/03/04 10:02:00", 300, withToken("hermes")),
+	})
+	f := span("20260304", "20260304")
+	f.Token = "hermes"
+
+	got := q.stats(f, time.Local)
+	if got.Requests != 2 || got.Quota != 500 {
+		t.Errorf("requests/quota = %d/%d, want 2/500: the filter must select the "+
+			"named token alone", got.Requests, got.Quota)
+	}
+	if len(got.TokenStats) != 1 || got.TokenStats[0].Token != "hermes" {
+		t.Errorf("token rows = %+v, want hermes alone", got.TokenStats)
+	}
+
+	_, total, _, _, _ := q.list(
+		listFilter{Since: f.Since, Until: f.Until, Token: "hermes"}, 1, 10)
+	if total != got.Requests {
+		t.Errorf("list total = %d but stats requests = %d: the drill-down would "+
+			"land on a different set of calls than the row it came from",
+			total, got.Requests)
+	}
+}
+
+// A superseded entry must not be counted, and the correction's token must win.
+// The dedupe lives in eachMatch, which stats already shares - but a breakdown
+// keyed on a NEW field is where a stale duplicate does the most damage, because
+// it can attribute the same spend to two different tokens at once.
+//
+// BREAK 12: delete the `latest[e.RID] != i` skip in eachMatch. Both rows then
+// survive, the archive reports 2 calls, and "laptop" is credited for spend a
+// repair pass had already reattributed to "hermes".
+func TestTokenSpendFollowsTheLatestAppend(t *testing.T) {
+	got := archivedQuery(t, []*Record{
+		statRec("Sup00000000000000000001", "2026/03/04 10:00:00", 100, withToken("laptop")),
+		statRec("Sup00000000000000000001", "2026/03/04 10:00:00", 300, withToken("hermes")),
+	}).stats(span("20260304", "20260304"), time.Local)
+
+	if got.Requests != 1 {
+		t.Fatalf("requests = %d, want 1", got.Requests)
+	}
+	if len(got.TokenStats) != 1 {
+		t.Fatalf("token rows = %+v, want 1: a superseded entry is not a second "+
+			"call, and must not surface as a second token", got.TokenStats)
+	}
+	if got.TokenStats[0].Token != "hermes" || got.TokenStats[0].Quota != 300 {
+		t.Errorf("row = %+v, want hermes/300 (the correction, not the original)",
+			got.TokenStats[0])
+	}
+}
+
+// The tail folds into one row and the fold still reconciles, as the model
+// breakdown's does. topTokenLimit is larger than topModelLimit (12 vs 7) because
+// these are single-colour bars rather than a categorical palette - but the fold
+// must still exist, for a deployment that mints a token per client.
+//
+// BREAK 13: return `out` unfolded when len(out) > limit. The page then grows an
+// unbounded row list, and the "other" row that keeps it reconcilable is gone.
+func TestTokenFoldKeepsTheTailAccounted(t *testing.T) {
+	var recs []*Record
+	// 15 tokens, descending in spend, so everything past 12 must fold.
+	for tk := 1; tk <= 15; tk++ {
+		recs = append(recs, statRec(
+			fmt.Sprintf("Fld%019d", tk),
+			fmt.Sprintf("2026/03/04 %02d:00:00", tk%24),
+			int64(1000-tk), withToken(fmt.Sprintf("tok-%02d", tk))))
+	}
+
+	got := archivedQuery(t, recs).stats(span("20260304", "20260304"), time.Local)
+
+	if len(got.TokenStats) != topTokenLimit+1 {
+		t.Fatalf("token rows = %d, want %d (top %d plus other)",
+			len(got.TokenStats), topTokenLimit+1, topTokenLimit)
+	}
+	sum, quota := 0, int64(0)
+	for _, s := range got.TokenStats {
+		sum += s.Requests
+		quota += s.Quota
+	}
+	if sum != got.Requests || quota != got.Quota {
+		t.Errorf("folded rows sum to %d calls / %d quota, want %d / %d",
+			sum, quota, got.Requests, got.Quota)
+	}
+	if got.TokenStats[len(got.TokenStats)-1].Token != modelOther {
+		t.Errorf("last row = %q, want %q",
+			got.TokenStats[len(got.TokenStats)-1].Token, modelOther)
+	}
+}
+
+// Row order must be stable across identical queries. The rows come out of a Go
+// map, whose iteration order is deliberately randomised, so ties need a total
+// ordering or the chart reshuffles between two refreshes of unchanged data -
+// which reads as the data having changed.
+//
+// BREAK 14: drop the final `out[a].Token < out[b].Token` tiebreak. That fails
+// intermittently rather than every run, which is why this iterates.
+func TestTokenRowOrderIsStableAcrossQueries(t *testing.T) {
+	var recs []*Record
+	// Identical in spend and in volume, so ONLY the name can break the tie.
+	for i, name := range []string{"alpha", "bravo", "charlie", "delta", "echo"} {
+		recs = append(recs, statRec(
+			fmt.Sprintf("Ord%019d", i),
+			fmt.Sprintf("2026/03/04 10:%02d:00", i), 100, withToken(name)))
+	}
+	q := archivedQuery(t, recs)
+	f := span("20260304", "20260304")
+
+	first := q.stats(f, time.Local).TokenStats
+	for i := 0; i < 12; i++ {
+		again := q.stats(f, time.Local).TokenStats
+		for j := range first {
+			if first[j].Token != again[j].Token {
+				t.Fatalf("row %d = %q on the first query and %q on query %d: map "+
+					"iteration order is randomised, so ties need a total ordering",
+					j, first[j].Token, again[j].Token, i+2)
+			}
+		}
+	}
+	if first[0].Token != "alpha" {
+		t.Errorf("first row = %q, want alpha (ties break by name)", first[0].Token)
+	}
+}
+
+// The point of the derived index, applied to this field: 3.3GB of records were
+// archived before TN existed, and their raw logs are long gone. Backfilling has
+// to work from the archive alone or the breakdown is blank until history rolls
+// over. Verified on the real archive too - `-reindex -day 20260817` recovered
+// 246 of 279 entries (165 hermes, 81 laptop), the other 33 having genuinely
+// never been billed.
+//
+// BREAK 15: drop `TN: r.TokenName` from makeIdxEntry. reindex calls the same
+// projection, so the rebuild silently produces the same blank index it started
+// with and the whole archive stays unattributed.
+func TestReindexBackfillsTokenName(t *testing.T) {
+	dir := t.TempDir()
+	arc := newArchive(dir)
+	for i := 0; i < 5; i++ {
+		if err := arc.Append(statRec(
+			fmt.Sprintf("20260810tk%019d", i), "2026/08/10 10:00:00",
+			100, withToken("laptop"))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	arc.Close()
+
+	// Simulate the pre-upgrade index: same offsets, no token field. This is
+	// exactly what every deployed archive looks like before this change - the
+	// production one measured zero `"tk"` across 13,955 entries.
+	ip := filepath.Join(dir, "arc-20260810.idx")
+	entries, err := newArchive(dir).index("20260810")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var old strings.Builder
+	for _, e := range entries {
+		e.TN = ""
+		line, _ := json.Marshal(e)
+		old.Write(line)
+		old.WriteByte('\n')
+	}
+	if err := os.WriteFile(ip, []byte(old.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// The stale index must report zero coverage rather than a confident
+	// attribution to nobody - the signal the UI turns into "run -reindex".
+	q := newQuery(newArchive(dir), 0)
+	stale := q.stats(span("20260810", "20260810"), time.Local)
+	if stale.TokenNameCount != 0 {
+		t.Fatalf("fixture is not a pre-upgrade index: token_name_count = %d",
+			stale.TokenNameCount)
+	}
+	if len(stale.TokenStats) != 1 || stale.TokenStats[0].Token != tokenUnnamed {
+		t.Fatalf("stale index rows = %+v, want everything under %q",
+			stale.TokenStats, tokenUnnamed)
+	}
+
+	if _, err := reindexDay(dir, "20260810"); err != nil {
+		t.Fatalf("reindex: %v", err)
+	}
+
+	got := newQuery(newArchive(dir), 0).stats(span("20260810", "20260810"), time.Local)
+	if got.TokenNameCount != 5 {
+		t.Errorf("token_name_count = %d after reindex, want 5: the index is "+
+			"derived, so this field must be recoverable from the records alone",
+			got.TokenNameCount)
+	}
+	if len(got.TokenStats) != 1 || got.TokenStats[0].Token != "laptop" {
+		t.Fatalf("rows after reindex = %+v, want laptop alone", got.TokenStats)
+	}
+	if got.TokenStats[0].Quota != 500 {
+		t.Errorf("laptop quota = %d, want 500", got.TokenStats[0].Quota)
 	}
 }

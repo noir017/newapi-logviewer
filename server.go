@@ -123,6 +123,11 @@ type listItem struct {
 	ChannelID *int   `json:"channel_id,omitempty"`
 	Channel   string `json:"channel,omitempty"`
 	Upstream  string `json:"upstream,omitempty"`
+
+	// Which API token the caller presented. Surfaced on the row so a drill-down
+	// from the token breakdown can be checked against the calls it claims to
+	// cover, rather than being taken on faith.
+	TokenName string `json:"token_name,omitempty"`
 }
 
 func toListItem(r *Record) listItem {
@@ -133,6 +138,7 @@ func toListItem(r *Record) listItem {
 		IsStream: r.IsStream, HasTools: r.HasTools, Quota: r.Quota,
 		Preview: r.Preview, Errors: len(r.Errors),
 		MsgCount: r.MsgCount, Turns: r.Turns, ToolCount: r.ToolCount,
+		TokenName: r.TokenName,
 	}
 }
 
@@ -151,13 +157,14 @@ func (s *server) handleCalls(w http.ResponseWriter, r *http.Request, user authUs
 	}
 
 	f := listFilter{
-		Model: q.Get("model"), Status: q.Get("status"), Stream: q.Get("stream"),
+		Model: q.Get("model"), Token: q.Get("token"),
+		Status: q.Get("status"), Stream: q.Get("stream"),
 		Tools: q.Get("tools"), ToolName: q.Get("tool_name"), Search: q.Get("search"),
 		ErrorsOnly: q.Get("errors") == "1",
 		Since:      int64(atoiDef(q.Get("since"), 0)),
 		Until:      int64(atoiDef(q.Get("until"), 0)),
 	}
-	items, total, models, tools := s.q.list(f, page, size)
+	items, total, models, tools, tokens := s.q.list(f, page, size)
 
 	s.writeJSON(w, 200, map[string]any{
 		"success":   true,
@@ -166,6 +173,7 @@ func (s *server) handleCalls(w http.ResponseWriter, r *http.Request, user authUs
 		"page_size": size,
 		"models":    models,
 		"tools":     tools,
+		"tokens":    tokens,
 		"user":      map[string]any{"username": user.Username, "role": user.Role},
 		"auth_mode": s.cfg.AuthMode,
 		"items":     items,
@@ -282,7 +290,10 @@ func (s *server) handleStats(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	res := s.q.stats(statsFilter{Since: since, Until: until, Model: q.Get("model")}, now.Location())
+	res := s.q.stats(statsFilter{
+		Since: since, Until: until,
+		Model: q.Get("model"), Token: q.Get("token"),
+	}, now.Location())
 
 	s.writeJSON(w, 200, map[string]any{
 		"success": true,

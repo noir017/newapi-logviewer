@@ -40,6 +40,7 @@ func (q *query) withChannels(c *channelResolver) *query {
 // listFilter is the subset of the UI's filters that the index alone can answer.
 type listFilter struct {
 	Model      string
+	Token      string
 	Status     string // "ok" | "err" | ""
 	Stream     string // "1" | "0" | ""
 	Tools      string // "1" | ""
@@ -143,6 +144,13 @@ func matchIndex(e idxEntry, f listFilter) bool {
 	if f.Model != "" && e.Model != f.Model {
 		return false
 	}
+	// Token names are matched exactly, including the empty one. An index that
+	// predates the TN field decodes every entry as "" and would therefore match
+	// nothing rather than everything, which is the safe direction: a filter that
+	// silently ignores itself would attribute one token's spend to all of them.
+	if f.Token != "" && e.TN != f.Token {
+		return false
+	}
 	// Filter on the derived outcome, falling back to the HTTP status only when
 	// no outcome was derived. Filtering on Status alone matched nothing on a
 	// deployment whose log carries no GIN lines - the same cause that blanked
@@ -199,7 +207,12 @@ func (q *query) searchWindow(f listFilter) listFilter {
 // Free-text search and tool-name filtering cannot be answered from the index -
 // they need the body - so those are applied by inflating candidates in
 // newest-first order. Everything else is index-only.
-func (q *query) list(f listFilter, page, size int) ([]listItem, int, []string, []string) {
+//
+// The returned model/tool/token option sets are collected from the matched
+// candidates, so they narrow as filters are applied. That is why the UI only
+// refills a select while its own filter is empty: refilling from a response the
+// select already narrowed would delete every option but the chosen one.
+func (q *query) list(f listFilter, page, size int) ([]listItem, int, []string, []string, []string) {
 	needsBody := f.Search != "" || f.ToolName != ""
 	if needsBody {
 		f = q.searchWindow(f)
@@ -208,6 +221,7 @@ func (q *query) list(f listFilter, page, size int) ([]listItem, int, []string, [
 
 	models := map[string]bool{}
 	tools := map[string]bool{}
+	tokens := map[string]bool{}
 
 	var matched []dayEntry
 	if !needsBody {
@@ -215,6 +229,9 @@ func (q *query) list(f listFilter, page, size int) ([]listItem, int, []string, [
 		for _, c := range cands {
 			if c.e.Model != "" {
 				models[c.e.Model] = true
+			}
+			if c.e.TN != "" {
+				tokens[c.e.TN] = true
 			}
 		}
 	} else {
@@ -232,6 +249,13 @@ func (q *query) list(f listFilter, page, size int) ([]listItem, int, []string, [
 			}
 			if rec.Model != "" {
 				models[rec.Model] = true
+			}
+			// From the index entry, not the record: an entry whose TN predates
+			// the field is empty even when the record carries the name, and the
+			// option list must describe what the FILTER can actually match -
+			// which is the index.
+			if c.e.TN != "" {
+				tokens[c.e.TN] = true
 			}
 			for _, t := range rec.ToolNames {
 				tools[t] = true
@@ -254,7 +278,7 @@ func (q *query) list(f listFilter, page, size int) ([]listItem, int, []string, [
 	for _, c := range matched[start:end] {
 		items = append(items, q.entryToItem(c.e))
 	}
-	return items, total, sortedKeys(models), sortedKeys(tools)
+	return items, total, sortedKeys(models), sortedKeys(tools), sortedKeys(tokens)
 }
 
 // recordMatches is the on-demand equivalent of the old resident searchBlob.
@@ -284,7 +308,7 @@ func (q *query) entryToItem(e idxEntry) listItem {
 		IsStream: e.IsStream, HasTools: e.HasTools, Quota: e.Quota,
 		Preview: e.Preview, Errors: e.Errors,
 		MsgCount: e.MsgCount, Turns: e.Turns, ToolCount: e.ToolCnt,
-		ChannelID: e.Chan, Upstream: e.Up,
+		ChannelID: e.Chan, Upstream: e.Up, TokenName: e.TN,
 	}
 	// Resolution happens here rather than at ingest so a renamed or newly
 	// labelled channel is reflected on records already archived.

@@ -93,6 +93,22 @@ type idxEntry struct {
 	Chan *int   `json:"c,omitempty"`
 	Up   string `json:"u,omitempty"`
 
+	// Which API token (令牌) the caller presented, so spend can be attributed
+	// without opening a body.
+	//
+	// A plain string rather than a pointer, unlike PT/CT and Quota. Those need
+	// to distinguish "reported zero" from "never reported"; a token name has no
+	// zero value to confuse it with, and the empty case is not ambiguous either:
+	// the name and the quota arrive on the same billing line, so a call missing
+	// one is missing both. Measured across 13,955 archived records - 785 with no
+	// token name, and every single one of them with a nil Quota, no exceptions.
+	// So an unnamed call contributes exactly zero to a spend breakdown and needs
+	// no separate "unbilled but billed" concept.
+	//
+	// What the empty string cannot distinguish is an index written before this
+	// field existed. That is what statsResult.TokenNameCount is for.
+	TN string `json:"tk,omitempty"`
+
 	// Token counts, carried so the stats view can total them without opening a
 	// single body: the day's records are ~340MB of gzip against ~700KB of index.
 	//
@@ -117,6 +133,7 @@ func makeIdxEntry(r *Record, off, n int64) idxEntry {
 		Preview: r.Preview, Errors: len(r.Errors),
 		MsgCount: r.MsgCount, Turns: r.Turns, ToolCnt: r.ToolCount,
 		Chan: r.ChannelID, Up: hostOf(r.UpstreamURL),
+		TN: r.TokenName,
 	}
 	// Both levels are optional: Usage is absent on calls that never reported it
 	// (4% of a recent day), and either count can be missing within it. Copy the

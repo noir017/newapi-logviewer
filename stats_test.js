@@ -86,7 +86,10 @@ async function main(){
   // Both numbers look plausible alone; only their disagreement is visible.
   const rec = await ev(`(() => {
     const d = statsData.data;
-    const rows = [...document.querySelectorAll('.mrow')];
+    // .mrow alone now also matches the token rows, which share the geometry.
+    // Scope to the model rows or this counts 8 models + 3 tokens and reports a
+    // breakdown mismatch that does not exist.
+    const rows = [...document.querySelectorAll('.mrow[data-model]')];
     const shown = rows.length;
     const sum = d.models.reduce((s, m) => s + m.requests, 0);
     return {kpi: d.requests, modelSum: sum, rowsRendered: shown,
@@ -170,6 +173,73 @@ async function main(){
   check('bars are paths with a square baseline',
     shape.tag === 'path' && !shape.rx, JSON.stringify(shape));
 
+  // --- 4b. Per-token spend --------------------------------------------------
+  // The card must reconcile like the model breakdown does, and it must be
+  // ranked by SPEND. Those are different assertions: a breakdown can add up
+  // perfectly and still answer the wrong question.
+  const tk = await ev(`(() => {
+    const d = statsData.data, rows = [...document.querySelectorAll('.mrow.tkrow')];
+    const t = d.tokens_by_token || [];
+    return {
+      rows: rows.length, returned: t.length,
+      reqSum: t.reduce((s, x) => s + x.requests, 0),
+      quotaSum: t.reduce((s, x) => s + x.quota, 0),
+      kpiReq: d.requests, kpiQuota: d.quota,
+      quotas: t.map(x => x.quota),
+      nameCount: d.token_name_count,
+      // Rendered bar widths, to check the bar encodes the same thing the
+      // number does. A row sorted by spend with a bar scaled to volume would
+      // read as a chart contradicting its own labels.
+      bars: rows.map(r => parseFloat(r.querySelector('.fill').style.width)),
+      unnamedFilterable: rows.filter(r =>
+        r.classList.contains('na') && r.dataset.token !== undefined).length,
+    };
+  })()`);
+  check('every token row is rendered', tk.rows === tk.returned,
+    `rendered=${tk.rows} returned=${tk.returned}`);
+  check('token breakdown sums to the request total', tk.reqSum === tk.kpiReq,
+    `tokens=${tk.reqSum} kpi=${tk.kpiReq}`);
+  check('token breakdown sums to total spend', tk.quotaSum === tk.kpiQuota,
+    `tokens=${tk.quotaSum} kpi=${tk.kpiQuota}`);
+  // The ordering assertion. Ranked by requests instead, this fails on any
+  // archive where the biggest spender is not also the busiest — which is the
+  // normal case, not the corner one.
+  check('token rows are ranked by spend',
+    tk.quotas.every((q, i) => i === 0 || tk.quotas[i - 1] >= q),
+    JSON.stringify(tk.quotas));
+  check('bars are scaled to spend, matching the order',
+    tk.bars.every((b, i) => i === 0 || tk.bars[i - 1] >= b - 0.01),
+    JSON.stringify(tk.bars));
+  // An unnamed row is a gap in the measurement, so it must not offer a
+  // drill-down: the name is exactly what is missing to filter by.
+  check('the unnamed row is not filterable', tk.unnamedFilterable === 0,
+    `${tk.unnamedFilterable} unnamed rows carry data-token`);
+  // A named token row must read as ordinary body text. Naming the row class
+  // `.tk` put it under the JSON highlighter's token-KEY rule and every token
+  // name rendered green — a stylesheet collision no layout or reconciliation
+  // assertion can see, because the numbers were all correct.
+  const hue = await ev(`(() => {
+    const rows = [...document.querySelectorAll('.mrow.tkrow[data-token] .nm')];
+    const body = getComputedStyle(document.body).color;
+    return {colors: [...new Set(rows.map(n => getComputedStyle(n).color))], body};
+  })()`);
+  check('token names use the default text colour',
+    hue.colors.length === 0 || hue.colors.every(c => c === hue.body),
+    `names=${JSON.stringify(hue.colors)} body=${hue.body}`);
+  // Coverage must be stated, not assumed. A zero here on a non-empty range is
+  // a stale index, and the page has to say so rather than attribute every
+  // call to nobody.
+  const warned = await ev(`(() => {
+    const d = statsData.data;
+    const stale = d.requests > 0 && d.token_name_count === 0;
+    const box = [...document.querySelectorAll('.warnbox')]
+      .some(b => b.textContent.includes('reindex') && b.textContent.includes('令牌'));
+    return {stale, box, count: d.token_name_count};
+  })()`);
+  check('a stale token index is reported, not rendered as fact',
+    warned.stale === warned.box,
+    `stale=${warned.stale} warned=${warned.box} count=${warned.count}`);
+
   // --- 5. The table twin exposes every value without hovering ---------------
   await ev(`document.querySelector('[data-tbl="t-req"]').click()`);
   await new Promise(r => setTimeout(r, 200));
@@ -207,7 +277,44 @@ async function main(){
   check('custom inputs seeded from the shown window', !!custom.fromVal,
     JSON.stringify(custom));
 
-  // --- 8. Switching back to the list leaves it working ----------------------
+  // --- 8. Token drill-down lands on the calls the row counted ---------------
+  // The row claims N calls; the list must show exactly N. This is the assertion
+  // that catches a drill-down whose filter silently does nothing — the list
+  // would render a perfectly plausible page of the wrong token's calls.
+  await ev(`setView('stats')`);
+  await new Promise(r => setTimeout(r, 1600));
+  const drill = await ev(`(() => {
+    const row = document.querySelector('.mrow.tkrow[data-token]');
+    if (!row) return {skip: true};
+    const t = statsData.data.tokens_by_token
+      .find(x => x.token === row.dataset.token);
+    row.click();
+    return {skip: false, token: row.dataset.token, want: t.requests};
+  })()`);
+  if (drill.skip){
+    check('token drill-down (no named token in range)', true, 'skipped');
+  } else {
+    await new Promise(r => setTimeout(r, 1600));
+    const landed = await ev(`(() => ({
+      total: state.total,
+      sel: document.getElementById('tokensel').value,
+      view: document.body.classList.contains('view-stats'),
+      // Every row on screen must actually belong to that token, not merely add
+      // up to the right count.
+      rows: state.items.length,
+      foreign: state.items.filter(i => i.token_name !== ${JSON.stringify(drill.token)}).length,
+    }))()`);
+    check('drill-down switches to the list view', !landed.view, JSON.stringify(landed));
+    check('drill-down applies the token filter',
+      landed.sel === drill.token, `select=${landed.sel} want=${drill.token}`);
+    check('list total matches the row that was clicked',
+      landed.total === drill.want,
+      `list=${landed.total} row=${drill.want} token=${drill.token}`);
+    check('every listed call belongs to that token', landed.foreign === 0,
+      `${landed.foreign} of ${landed.rows} rows carry another token`);
+  }
+
+  // --- 9. Switching back to the list leaves it working ----------------------
   await ev(`setView('list')`);
   await new Promise(r => setTimeout(r, 900));
   const back = await ev(`(() => ({

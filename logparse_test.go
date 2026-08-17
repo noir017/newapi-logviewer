@@ -125,7 +125,7 @@ func TestParseSample(t *testing.T) {
 
 	t.Run("health checks excluded from the list", func(t *testing.T) {
 		q := archivedQuery(t, recs)
-		shown, total, _, _ := q.list(listFilter{}, 1, 100)
+		shown, total, _, _, _ := q.list(listFilter{}, 1, 100)
 		for _, r := range shown {
 			if r.RequestID == "3fJ7kQmZxR2wLpVnB8sTyHdA" {
 				t.Error("/api/status health check should not be listed")
@@ -158,7 +158,7 @@ func TestParseSample(t *testing.T) {
 			{"since", listFilter{Since: 1}, 7},
 		}
 		for _, c := range cases {
-			_, got, _, _ := q.list(c.f, 1, 100)
+			_, got, _, _, _ := q.list(c.f, 1, 100)
 			if got != c.want {
 				t.Errorf("filter %s = %d, want %d", c.name, got, c.want)
 			}

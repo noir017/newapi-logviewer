@@ -24,13 +24,14 @@ type statsFilter struct {
 	Since int64
 	Until int64
 	Model string
+	Token string
 }
 
 // toList projects onto the shared list filter so the walk, the dedupe, and the
 // predicates are literally the same code the list view uses. Only the
 // index-answerable fields are set - see the type comment.
 func (f statsFilter) toList() listFilter {
-	return listFilter{Model: f.Model, Since: f.Since, Until: f.Until}
+	return listFilter{Model: f.Model, Token: f.Token, Since: f.Since, Until: f.Until}
 }
 
 // bucket is one point on the time series.
@@ -52,6 +53,19 @@ type bucket struct {
 // modelStat is one row of the model breakdown.
 type modelStat struct {
 	Model    string `json:"model"`
+	Requests int    `json:"requests"`
+	Quota    int64  `json:"quota"`
+	Tokens   int64  `json:"tokens"`
+}
+
+// tokenStat is one row of the per-token spend breakdown.
+//
+// Requests is carried alongside Quota because the two disagree, often sharply,
+// and the disagreement is the point: on one production day the `laptop` token
+// spent 967,645 units across 13 calls while `hermes` spent 55,053 across 150.
+// A breakdown showing only the volume would rank those two backwards.
+type tokenStat struct {
+	Token    string `json:"token"`
 	Requests int    `json:"requests"`
 	Quota    int64  `json:"quota"`
 	Tokens   int64  `json:"tokens"`
@@ -88,6 +102,24 @@ type statsResult struct {
 
 	Series []bucket    `json:"series"`
 	Models []modelStat `json:"models"`
+
+	// TokenStats is the per-API-token spend breakdown, ranked by quota.
+	//
+	// Named for the field rather than the concept because statsResult.Tokens is
+	// already the token *count* total - two unrelated meanings of the word, one
+	// from the billing line and one from usage. The json name says which.
+	TokenStats []tokenStat `json:"tokens_by_token"`
+
+	// TokenNameCount is how many counted calls carried a token name at all.
+	//
+	// This exists for the same reason TokenCount does, and guards the same
+	// mistake in a nastier form. An index written before the TN field existed
+	// decodes it as "" - indistinguishable, per entry, from a call that genuinely
+	// had no billing line. Zero here against a non-zero Requests means the index
+	// predates the field and the whole breakdown is one big unattributed row, so
+	// the UI can say "run -reindex" instead of rendering an honest-looking chart
+	// that attributes 100% of a month's spend to nobody.
+	TokenNameCount int `json:"token_name_count"`
 
 	// Granularity is which bucket size was chosen ("hour"/"day"/"week"), so the
 	// UI can label the axis honestly instead of assuming days.
@@ -228,6 +260,23 @@ const topModelLimit = 7
 const modelOther = "other"
 const modelUnknown = "(unknown)"
 
+// tokenUnnamed labels calls that carried no token name.
+//
+// Kept as a row rather than dropped, for the same reason modelUnknown is: the
+// breakdown has to account for every call or it cannot be reconciled against
+// the request total, and a silently-dropped row is exactly the failure that
+// reconciliation exists to catch. Its spend is always zero - the name and the
+// quota come from the same billing line, verified across the production archive
+// - so it never distorts the ranking it appears in.
+const tokenUnnamed = "(未命名)"
+
+// topTokenLimit is deliberately larger than topModelLimit. The model fold exists
+// to keep a categorical palette readable; this list is bars in one colour, so
+// the only ceiling is vertical space. The production archive holds 7 distinct
+// token names across every day of history, so in practice nothing folds at all -
+// the limit is a guard against a deployment that mints tokens per client.
+const topTokenLimit = 12
+
 func foldModels(m map[string]*modelStat, limit int) []modelStat {
 	out := make([]modelStat, 0, len(m))
 	for _, v := range m {
@@ -251,6 +300,45 @@ func foldModels(m map[string]*modelStat, limit int) []modelStat {
 	return append(out[:limit:limit], rest)
 }
 
+// foldTokens is foldModels' twin, ranked by spend rather than by volume.
+//
+// The sort key is the whole reason this is not one shared function taking a
+// comparator: the question this breakdown answers is "which token is costing
+// me money", and on the production archive the two orderings genuinely invert
+// (13 calls at 967,645 units above 150 calls at 55,053). Ties fall back to
+// requests and then to the name, so the row order is stable across refreshes
+// rather than reshuffling with map iteration order - a chart whose rows move
+// between two identical queries reads as data changing.
+//
+// The unnamed row sorts by the same rule as any other. It carries zero quota,
+// so it lands at the bottom on its own without a special case; it is only ever
+// hoisted by having more requests than a token that also spent nothing.
+func foldTokens(m map[string]*tokenStat, limit int) []tokenStat {
+	out := make([]tokenStat, 0, len(m))
+	for _, v := range m {
+		out = append(out, *v)
+	}
+	sort.Slice(out, func(a, b int) bool {
+		if out[a].Quota != out[b].Quota {
+			return out[a].Quota > out[b].Quota
+		}
+		if out[a].Requests != out[b].Requests {
+			return out[a].Requests > out[b].Requests
+		}
+		return out[a].Token < out[b].Token
+	})
+	if len(out) <= limit {
+		return out
+	}
+	rest := tokenStat{Token: modelOther}
+	for _, s := range out[limit:] {
+		rest.Requests += s.Requests
+		rest.Quota += s.Quota
+		rest.Tokens += s.Tokens
+	}
+	return append(out[:limit:limit], rest)
+}
+
 // stats folds the archive into one dashboard payload.
 //
 // The walk is shared with the list view (eachMatch), so the two can never
@@ -265,9 +353,11 @@ func (q *query) stats(f statsFilter, loc *time.Location) statsResult {
 	}
 	gran := granularityFor(f.Since, f.Until)
 
-	res := statsResult{Granularity: gran, Series: []bucket{}, Models: []modelStat{}}
+	res := statsResult{Granularity: gran, Series: []bucket{}, Models: []modelStat{},
+		TokenStats: []tokenStat{}}
 	buckets := map[string]*bucket{}
 	models := map[string]*modelStat{}
+	tokens := map[string]*tokenStat{}
 
 	q.eachMatch(f.toList(), func(_ string, e idxEntry) {
 		// No usable timestamp: unplaceable on the axis, and matchIndex lets a
@@ -339,6 +429,24 @@ func (q *query) stats(f statsFilter, loc *time.Location) statsResult {
 		ms.Requests++
 		ms.Quota += q64
 		ms.Tokens += tok
+
+		// Per-token spend. The name is counted before it is defaulted, so
+		// TokenNameCount measures index coverage rather than the label the row
+		// happens to render under.
+		tn := e.TN
+		if tn != "" {
+			res.TokenNameCount++
+		} else {
+			tn = tokenUnnamed
+		}
+		ts := tokens[tn]
+		if ts == nil {
+			ts = &tokenStat{Token: tn}
+			tokens[tn] = ts
+		}
+		ts.Requests++
+		ts.Quota += q64
+		ts.Tokens += tok
 	})
 
 	// Emit the axis from the requested range so quiet periods are drawn as
@@ -362,5 +470,6 @@ func (q *query) stats(f statsFilter, loc *time.Location) statsResult {
 	}
 
 	res.Models = foldModels(models, topModelLimit)
+	res.TokenStats = foldTokens(tokens, topTokenLimit)
 	return res
 }
