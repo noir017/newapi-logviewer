@@ -138,6 +138,23 @@ body.view-stats .split{display:none}
 .mrow .fill{height:100%;background:var(--c-1);border-radius:4px}
 .mrow .vv{text-align:right;font-size:11.5px;color:var(--dim);font-variant-numeric:tabular-nums}
 
+/* Token rows reuse .mrow's geometry with a wider value column: the figure there
+   is money ("$12.3456"), not a request count, and it must not wrap under its own
+   bar. The bar encodes spend, so its scale is the row's quota, not its volume.
+
+   NOT named .tk — that class is already the JSON syntax highlighter's token-KEY
+   colour (green, see .tk/.tv/.tn below), and a token row wearing it inherited
+   green names from a rule about pretty-printed JSON. Two different meanings of
+   "token" in one stylesheet; this one spells out which. */
+.mrow.tkrow{grid-template-columns:1fr 104px}
+/* The unnamed row is a measurement gap, not a token. Grey it the same way the
+   charts grey an unrecorded outcome, and drop the affordance: there is nothing
+   to filter by, since the name is exactly what is missing. */
+.mrow.na{cursor:default}
+.mrow.na .nm{color:var(--dim2)}
+.mrow.na .fill{background:var(--c-unk)}
+.mrow.na:hover{background:none}
+
 /* The table twin. Every value a tooltip shows is reachable here without
    hovering, which is what keeps the charts from gating their own data. */
 .tbl{width:100%;border-collapse:collapse;font-size:11.5px;font-variant-numeric:tabular-nums}
@@ -304,6 +321,7 @@ pre.j{background:#0d1017;border:1px solid var(--line);border-radius:7px;padding:
     <span class="sep"></span>
     <input type="search" id="q" placeholder="搜索提示词 / 返回 / request_id">
     <select id="model"><option value="">全部模型</option></select>
+    <select id="tokensel"><option value="">全部令牌</option></select>
     <select id="toolsel"><option value="">全部工具</option></select>
     <select id="status"><option value="">全部状态</option><option value="ok">仅 200</option><option value="err">仅错误</option></select>
     <select id="stream"><option value="">流式+非流式</option><option value="1">仅流式</option><option value="0">仅非流式</option></select>
@@ -329,6 +347,7 @@ pre.j{background:#0d1017;border:1px solid var(--line);border-radius:7px;padding:
     <input type="datetime-local" id="sto" title="结束时间" style="display:none">
     <span class="sep"></span>
     <select id="smodel"><option value="">全部模型</option></select>
+    <select id="stoken"><option value="">全部令牌</option></select>
     <span class="who" id="srangelabel"></span>
   </div>
 </header>
@@ -752,6 +771,7 @@ function params(){
   return new URLSearchParams({
     page, page_size: $('#size').value,
     search: $('#q').value, model: $('#model').value,
+    token: $('#tokensel').value,
     tool_name: $('#toolsel').value,
     status: $('#status').value, stream: $('#stream').value,
     tools: $('#tools').checked ? '1' : '', errors: $('#errors').checked ? '1' : '',
@@ -783,6 +803,9 @@ async function load(keepSel){
     ? `${d.user.username}（role ${d.user.role}）` : '';
   $('#authnote').textContent = d.auth_mode === 'none' ? '⚠ 未鉴权（内网直连）' : '';
   fillSel($('#model'), d.models, '全部模型');
+  // Same rule as the stats page: a response narrowed by this very filter holds
+  // only the chosen token, so refilling from it would strand the reader there.
+  if (!$('#tokensel').value) fillSel($('#tokensel'), d.tokens || [], '全部令牌');
   fillSel($('#toolsel'), d.tools, '全部工具');
   const pages = Math.max(1, Math.ceil(d.total / d.page_size));
   $('#meta').textContent = `${d.total} 次调用`;
@@ -898,7 +921,7 @@ $('#quick').addEventListener('click', e => {
 
 let deb;
 $('#q').addEventListener('input', () => { clearTimeout(deb); deb = setTimeout(() => { page = 1; load(true); }, 300); });
-['#model','#toolsel','#status','#stream','#size','#from','#to'].forEach(s =>
+['#model','#tokensel','#toolsel','#status','#stream','#size','#from','#to'].forEach(s =>
   $(s).addEventListener('change', () => { page = 1; load(true); }));
 ['#tools','#errors'].forEach(s => $(s).addEventListener('change', () => { page = 1; load(true); }));
 $('#prev').onclick = () => { if (page > 1) { page--; load(true); } };
@@ -906,7 +929,7 @@ $('#next').onclick = () => { page++; load(true); };
 $('#refresh').onclick = () => load(true);
 $('#reset').onclick = () => {
   ['#q','#from','#to'].forEach(s => $(s).value = '');
-  ['#model','#toolsel','#status','#stream'].forEach(s => $(s).value = '');
+  ['#model','#tokensel','#toolsel','#status','#stream'].forEach(s => $(s).value = '');
   ['#tools','#errors'].forEach(s => $(s).checked = false);
   document.querySelectorAll('#quick button').forEach(n => n.classList.remove('on'));
   document.querySelector('#quick button:last-child').classList.add('on');
@@ -944,6 +967,12 @@ $('#auto').onchange = e => {
 
 const SVGNS = 'http://www.w3.org/2000/svg';
 let statsData = null, statsBusy = false;
+
+// Must match stats.go's tokenUnnamed exactly. It is a label the server sends,
+// not a sentinel the client invents, so the two only need to agree on the string
+// — but they DO need to agree: this is what tells a filterable row from a gap in
+// the measurement.
+const TOKEN_UNNAMED = '(未命名)';
 
 const nfmt = n => (n ?? 0).toLocaleString();
 // Compact form for the KPI tiles: 7,121,573,591 does not fit in a tile and is
@@ -1187,6 +1216,42 @@ function renderStats(d, rng){
       </div>`).join('') : '<div class="cap">此范围内没有调用</div>'}
   </div>`);
 
+  // Per-token spend. Ranked by cost, not by volume — the server sorts, and the
+  // bar is scaled to the top row's quota so the visual order matches the number
+  // beside it. On the production archive the two orderings genuinely invert
+  // (13 calls outspending 150 by 17x), which is the whole reason this card
+  // exists separately from 模型分布.
+  const tks = d.tokens_by_token || [];
+  const maxTQ = Math.max(1, ...tks.map(t => t.quota));
+  const named = tks.filter(t => t.token !== TOKEN_UNNAMED && t.token !== 'other');
+  parts.push(`<div class="card2">
+    <div class="hd"><div><h3>令牌用量</h3>
+      <div class="cap">按花费排序 · 点击可在列表中筛选</div></div>
+      <span class="grow"></span>
+      <button class="lnk" data-tbl="t-token">表格</button></div>
+    ${d.requests > 0 && d.token_name_count === 0 ? `<div class="warnbox">
+      索引中暂无令牌名称。运行 <code>logviewer -reindex</code> 可从已归档的记录中回填；
+      在此之前所有调用都归入「${esc(TOKEN_UNNAMED)}」。</div>` : ''}
+    ${tks.length ? tks.map(t => {
+      // An unnamed row is a gap in the measurement, not a token you can filter
+      // by — the name is precisely what is missing. It carries no quota either
+      // (the name and the billing line arrive together), so it is labelled with
+      // its request count rather than a $0.0000 that reads as a real figure.
+      const na = t.token === TOKEN_UNNAMED;
+      return `<div class="mrow tkrow ${na ? 'na' : ''}"${
+        na ? '' : ` data-token="${esc(t.token)}"`}>
+        <div>
+          <div class="nm" title="${esc(t.token)}">${esc(t.token)}</div>
+          <div class="track"><div class="fill" style="width:${
+            Math.max(1, 100 * t.quota / maxTQ)}%"></div></div>
+        </div>
+        <div class="vv">${na ? '—' : money(t.quota)}<br><span style="color:var(--dim2)">${
+          nfmt(t.requests)} 次</span></div>
+      </div>`;
+    }).join('') : '<div class="cap">此范围内没有调用</div>'}
+    <div class="tblwrap" id="t-token"></div>
+  </div>`);
+
   if (d.unknown_time > 0){
     parts.push(`<div class="note">另有 ${nfmt(d.unknown_time)} 条记录没有可用时间戳，
       无法归入任何区间，已排除。</div>`);
@@ -1206,6 +1271,11 @@ function renderStats(d, rng){
     s.map(b => [b.label, money(b.quota), nfmt(b.requests)]));
   fillTable($('#t-req'), ['时间', '成功', '失败', '未记录', '合计'],
     s.map(b => [b.label, nfmt(b.ok), nfmt(b.err), nfmt(b.unknown), nfmt(b.requests)]));
+  // Token names are chosen by whoever created the token, so they go through
+  // textContent like the model names do.
+  fillTable($('#t-token'), ['令牌', '花费', '请求', 'Token'],
+    tks.map(t => [t.token, t.token === TOKEN_UNNAMED ? '—' : money(t.quota),
+                  nfmt(t.requests), t.tokens ? compact(t.tokens) : '—']));
 }
 
 function fillTable(host, head, rows){
@@ -1235,7 +1305,8 @@ function fmtRange(rng){
 function statsParams(){
   const btn = document.querySelector('#srange button.on');
   const r = btn ? btn.dataset.r : '7d';
-  const p = new URLSearchParams({range: r, model: $('#smodel').value});
+  const p = new URLSearchParams({range: r, model: $('#smodel').value,
+                                 token: $('#stoken').value});
   if (r === 'custom'){
     const a = toEpoch($('#sfrom').value), b = toEpoch($('#sto').value);
     if (a) p.set('since', a);
@@ -1261,6 +1332,15 @@ async function loadStats(){
     renderStats(d.data, d.range);
     fillSel($('#smodel'),
       (d.data.models || []).map(m => m.model).filter(m => m !== 'other'), '全部模型');
+    // Only refill the token options from an UNFILTERED response. A filtered one
+    // contains exactly the token that was filtered on, so refilling from it
+    // would delete every other option and strand the reader on that token with
+    // no way back but a reset.
+    if (!$('#stoken').value){
+      fillSel($('#stoken'),
+        (d.data.tokens_by_token || []).map(t => t.token)
+          .filter(t => t !== 'other' && t !== TOKEN_UNNAMED), '全部令牌');
+    }
   } catch(e){
     host.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`;
   } finally {
@@ -1299,7 +1379,7 @@ $('#srange').addEventListener('click', e => {
   loadStats();
 });
 
-['#sfrom', '#sto', '#smodel'].forEach(s =>
+['#sfrom', '#sto', '#smodel', '#stoken'].forEach(s =>
   $(s).addEventListener('change', () => loadStats()));
 
 $('#stats').addEventListener('click', e => {
@@ -1310,23 +1390,30 @@ $('#stats').addEventListener('click', e => {
     tb.textContent = w.classList.contains('on') ? '收起表格' : '表格';
     return;
   }
-  // Drill-down: a model row hands its slice to the list view, which already
-  // does per-call inspection well. The stats page does not duplicate it.
-  const row = e.target.closest('[data-model]');
+  // Drill-down: a model or token row hands its slice to the list view, which
+  // already does per-call inspection well. The stats page does not duplicate it.
+  const row = e.target.closest('[data-model],[data-token]');
   if (!row) return;
-  const m = row.dataset.model;
-  if (m === 'other' || m === '(unknown)') return;
+  const m = row.dataset.model, tk = row.dataset.token;
+  if (m === 'other' || m === '(unknown)' || tk === 'other') return;
   const rng = statsData && statsData.range;
   if (rng){
     $('#from').value = localISO(new Date(rng.since * 1000));
     $('#to').value = localISO(new Date(rng.until * 1000));
     document.querySelectorAll('#quick button').forEach(n => n.classList.remove('on'));
   }
-  $('#model').value = m;
-  if ($('#model').value !== m){         // model absent from the list's options
-    $('#model').add(new Option(m, m));
-    $('#model').value = m;
-  }
+  // Carry the whole filter across, not just the clicked dimension. The row's
+  // numbers were computed under the stats page's model filter too, so landing
+  // on a list that ignored it would show more calls than the row claimed.
+  const setSel = (sel, v) => {
+    $(sel).value = v || '';
+    if (v && $(sel).value !== v){       // value absent from the list's options
+      $(sel).add(new Option(v, v));
+      $(sel).value = v;
+    }
+  };
+  setSel('#model', tk ? $('#smodel').value : m);
+  setSel('#tokensel', tk || $('#stoken').value);
   setView('list');
   page = 1; load(true);
 });

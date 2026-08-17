@@ -178,7 +178,7 @@ func TestRepairDayAppendsCorrection(t *testing.T) {
 	}
 
 	// And the list row, which reads only the .idx, must agree.
-	rows, _, _, _ := q.list(listFilter{}, 1, 10)
+	rows, _, _, _, _ := q.list(listFilter{}, 1, 10)
 	if len(rows) == 0 {
 		t.Fatal("no list rows")
 	}

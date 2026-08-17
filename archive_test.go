@@ -563,7 +563,7 @@ func TestReingestAppendsCorrections(t *testing.T) {
 	if rec := q.get("IntactAaaaBbbbCcccDdd002"); rec == nil || rec.StreamContent != "fine" {
 		t.Errorf("untouched record damaged: %+v", rec)
 	}
-	if _, total, _, _ := q.list(listFilter{}, 1, 50); total != 2 {
+	if _, total, _, _, _ := q.list(listFilter{}, 1, 50); total != 2 {
 		t.Errorf("list shows %d rows, want 2", total)
 	}
 
@@ -605,7 +605,7 @@ func TestAppendedCorrectionSupersedes(t *testing.T) {
 	if rec.StreamContent != "recovered text" {
 		t.Errorf("stream_content = %q, want the appended correction", rec.StreamContent)
 	}
-	if _, total, _, _ := q.list(listFilter{}, 1, 50); total != 1 {
+	if _, total, _, _, _ := q.list(listFilter{}, 1, 50); total != 1 {
 		t.Errorf("list shows %d rows for one id, want 1 (correction must not duplicate)", total)
 	}
 }
@@ -750,7 +750,7 @@ func TestIngestSkipsHealthChecks(t *testing.T) {
 			t.Errorf("%s should have been archived", rid)
 		}
 	}
-	if _, total, _, _ := q.list(listFilter{}, 1, 50); total != 3 {
+	if _, total, _, _, _ := q.list(listFilter{}, 1, 50); total != 3 {
 		t.Errorf("archive holds %d records, want 3", total)
 	}
 }
@@ -1138,7 +1138,7 @@ func TestOutcomeFromBillingWithoutGIN(t *testing.T) {
 
 	// The list column reads the index, not the record, so a field that reaches
 	// one but not the other leaves the column blank however good the record is.
-	items, total, _, _ := q.list(listFilter{}, 1, 50)
+	items, total, _, _, _ := q.list(listFilter{}, 1, 50)
 	if total != 2 {
 		t.Fatalf("listed %d, want 2", total)
 	}
@@ -1150,11 +1150,11 @@ func TestOutcomeFromBillingWithoutGIN(t *testing.T) {
 
 	// And the filter must agree with the column, or "仅错误" returns nothing on
 	// exactly the deployment that made the column wrong.
-	_, nOK, _, _ := q.list(listFilter{Status: "ok"}, 1, 50)
+	_, nOK, _, _, _ := q.list(listFilter{Status: "ok"}, 1, 50)
 	if nOK != 1 {
 		t.Errorf("status=ok matched %d, want 1", nOK)
 	}
-	_, nErr, _, _ := q.list(listFilter{Status: "err"}, 1, 50)
+	_, nErr, _, _, _ := q.list(listFilter{Status: "err"}, 1, 50)
 	if nErr != 1 {
 		t.Errorf("status=err matched %d, want 1", nErr)
 	}

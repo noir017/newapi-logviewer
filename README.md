@@ -211,6 +211,12 @@ logs, which by then have usually been rotated away:
 logviewer -reindex [-day 20260809]     # rebuild arc-DAY.idx from arc-DAY.jsonl.gz
 ```
 
+This is how the per-token spend breakdown reaches existing history: the token
+name lives in every archived record but was only added to the index later, so
+until a rebuild the stats page files every historical call under `(未命名)` and
+says so. Measured on a production day: `-reindex` recovered 246 of 279 entries,
+the remaining 33 having genuinely never been billed.
+
 Run it with the server stopped: a live ingester holds the `.idx` open in append
 mode, and swapping the file under it would send its appends to the replaced
 inode. Only the index is rewritten — via a temp file and a rename, so a failure
@@ -423,16 +429,36 @@ If you need headers, they have to be added to New API itself.
 The UI is a client of a small JSON API you can script against.
 
 ```
-GET /api/calls?page=1&page_size=30&search=&model=&tool_name=&status=&stream=
+GET /api/calls?page=1&page_size=30&search=&model=&token=&tool_name=&status=&stream=
                &tools=&errors=&since=&until=&refresh=
 GET /api/call?id=<request_id>
+GET /api/stats?range=today|7d|30d|ytd|custom&since=&until=&model=&token=
 GET /healthz
 ```
 
 `since` / `until` are epoch seconds. `refresh=1` forces a re-parse.
 
-`/api/calls` returns `{total, page, page_size, models, tools, items}` — `models`
-and `tools` are the full sets across all records, for populating filter dropdowns.
+`/api/calls` returns `{total, page, page_size, models, tools, tokens, items}` —
+`models`, `tools` and `tokens` are the sets present in the matched records, for
+populating filter dropdowns.
+
+`/api/stats` aggregates from the `.idx` files alone and never opens a record
+body. `model` and `token` are the only filters it accepts, for that reason.
+Its `tokens_by_token` rows are the per-API-token spend breakdown, **ranked by
+quota rather than by request count** — the two disagree routinely, and on one
+measured day the top spender made 13 calls against the busiest token's 150.
+
+Calls with no billing line have no token name and no quota; they are reported
+under `(未命名)` rather than dropped, so the rows always reconcile against
+`requests`. `token_name_count` says how many calls carried a name at all: zero
+against a non-zero `requests` means the index predates the field and needs
+`-reindex`, not that nothing was billed.
+
+```bash
+# spend per token, highest first
+curl -s 'http://localhost:7071/logviewer/api/stats?range=30d' \
+  | jq -r '.data.tokens_by_token[] | [.token, .quota/500000, .requests] | @tsv'
+```
 
 ```bash
 # every call that invoked a given tool, as JSON
