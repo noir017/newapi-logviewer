@@ -64,6 +64,11 @@ type Record struct {
 	TS        string `json:"ts"`
 	Epoch     int64  `json:"epoch"`
 
+	// V is the archive record version. Absent (0) means v1: the request is
+	// inline. v2 lifts the request's repeated bulk into the day's blob pool and
+	// leaves pointers in its place; fetch reinlines them. See blob.go.
+	V int `json:"v,omitempty"`
+
 	Request  Raw `json:"request"`
 	Response Raw `json:"response"`
 	Billing  Raw `json:"billing"`
