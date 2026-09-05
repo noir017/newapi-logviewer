@@ -56,6 +56,14 @@ type archive struct {
 	data *os.File
 	idx  *os.File
 	off  int64 // bytes written to data, i.e. offset of the next member
+
+	// The v2 blob pool for the open day (see blob.go). blobs is the write-side
+	// dedup map, content hash -> pointer, rebuilt from blobIdx when a day is
+	// (re)opened. blobOff is the offset of the next pool member.
+	blobData *os.File
+	blobIdx  *os.File
+	blobOff  int64
+	blobs    map[string]blobRef
 }
 
 // idxEntry is the list-row projection, persisted alongside the offset needed to
@@ -168,6 +176,11 @@ func (a *archive) paths(day string) (string, string) {
 		filepath.Join(a.dir, "arc-"+day+".idx")
 }
 
+func (a *archive) blobPaths(day string) (string, string) {
+	return filepath.Join(a.dir, "arc-"+day+".blob.gz"),
+		filepath.Join(a.dir, "arc-"+day+".blob.idx")
+}
+
 // open switches the open file pair to day, creating it if needed.
 // Caller holds a.mu.
 func (a *archive) openDay(day string) error {
@@ -194,7 +207,44 @@ func (a *archive) openDay(day string) error {
 		inf.Close()
 		return err
 	}
+
+	// Open the day's blob pool alongside the record pair and rebuild the dedup
+	// map from its index, so writes into a reopened day keep deduplicating
+	// against blobs already stored. A failure here must not leak the record
+	// handles opened above.
+	bp, bip := a.blobPaths(day)
+	bf, err := os.OpenFile(bp, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		df.Close()
+		inf.Close()
+		return err
+	}
+	bif, err := os.OpenFile(bip, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		df.Close()
+		inf.Close()
+		bf.Close()
+		return err
+	}
+	bst, err := bf.Stat()
+	if err != nil {
+		df.Close()
+		inf.Close()
+		bf.Close()
+		bif.Close()
+		return err
+	}
+	blobs, err := loadBlobMap(bip)
+	if err != nil {
+		df.Close()
+		inf.Close()
+		bf.Close()
+		bif.Close()
+		return err
+	}
+
 	a.day, a.data, a.idx, a.off = day, df, inf, st.Size()
+	a.blobData, a.blobIdx, a.blobOff, a.blobs = bf, bif, bst.Size(), blobs
 	return nil
 }
 
@@ -207,6 +257,15 @@ func (a *archive) closeLocked() {
 		a.idx.Close()
 		a.idx = nil
 	}
+	if a.blobData != nil {
+		a.blobData.Close()
+		a.blobData = nil
+	}
+	if a.blobIdx != nil {
+		a.blobIdx.Close()
+		a.blobIdx = nil
+	}
+	a.blobOff, a.blobs = 0, nil
 	a.day = ""
 }
 
@@ -221,7 +280,29 @@ func (a *archive) Close() {
 // points at it, so a torn write can leave an unreferenced member (harmless)
 // but never an index entry pointing at bytes that were never written.
 func (a *archive) Append(r *Record) error {
-	body, err := json.Marshal(r)
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if err := a.openDay(dayOf(r.TS)); err != nil {
+		return err
+	}
+
+	// v2: lift the request's repeated bulk (history, tools, system) into the
+	// day's blob pool before the record is framed, so every blob is durable
+	// before the record that points at it - a torn write can leave an
+	// unreferenced blob (harmless) but never a record pointing at bytes that
+	// were never written. The caller's record is untouched: a shallow copy
+	// carries the rewritten request and the version marker, and the index below
+	// is still built from the original, whose list-row scalars are unaffected by
+	// lifting.
+	rec := *r
+	lifted, err := splitRequest(r.Request, a.putBlobLocked)
+	if err != nil {
+		return err
+	}
+	rec.Request = lifted
+	rec.V = archiveVersion
+
+	body, err := json.Marshal(&rec)
 	if err != nil {
 		return err
 	}
@@ -241,11 +322,6 @@ func (a *archive) Append(r *Record) error {
 		return err
 	}
 
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if err := a.openDay(dayOf(r.TS)); err != nil {
-		return err
-	}
 	n, err := a.data.Write(buf.Bytes())
 	if err != nil {
 		// A short write leaves the offset wrong for every later record, so
@@ -269,6 +345,44 @@ func (a *archive) Append(r *Record) error {
 	}
 	a.off += int64(n)
 	return a.idx.Sync()
+}
+
+// putBlobLocked stores one lifted value in the open day's pool and returns the
+// pointer to write in its place, deduplicating: a content hash already seen this
+// day returns the existing pointer without writing. Caller holds a.mu (it is
+// called from splitRequest inside Append).
+func (a *archive) putBlobLocked(content []byte) (blobRef, error) {
+	h := blobHash(content)
+	if ref, ok := a.blobs[h]; ok {
+		return ref, nil
+	}
+	member, err := gzipBlob(content)
+	if err != nil {
+		return blobRef{}, err
+	}
+	n, err := a.blobData.Write(member)
+	if err != nil {
+		if st, serr := a.blobData.Stat(); serr == nil {
+			a.blobOff = st.Size()
+		}
+		return blobRef{}, err
+	}
+	if err := a.blobData.Sync(); err != nil {
+		return blobRef{}, err
+	}
+	ref := blobRef{Off: a.blobOff, Len: int64(n)}
+	a.blobOff += int64(n)
+	a.blobs[h] = ref
+	// Persist hash -> pointer so a reopened day rebuilds the dedup map. This is
+	// non-critical: the blob is already durable, and a torn index line only
+	// costs a re-stored duplicate later, never a wrong read - so a failed index
+	// append does not fail the blob.
+	if l, merr := json.Marshal(blobIdxLine{H: h, Off: ref.Off, Len: ref.Len}); merr == nil {
+		if _, werr := a.blobIdx.Write(append(l, '\n')); werr == nil {
+			a.blobIdx.Sync()
+		}
+	}
+	return ref, nil
 }
 
 // ---- reading ---------------------------------------------------------------
@@ -373,6 +487,36 @@ func (a *archive) fetch(day string, e idxEntry) (*Record, error) {
 	var rec Record
 	if err := json.NewDecoder(zr).Decode(&rec); err != nil {
 		return nil, err
+	}
+
+	// v2: reinline the request's lifted parts from the day's blob pool, so every
+	// caller sees the original request bytes and neither knows nor cares that it
+	// was stored deduplicated. v1 records (V==0) have no pointers and skip this.
+	// The pool file is opened lazily on the first pointer and once per record,
+	// not once per pointer - a full transcript is a hundred pointers into one
+	// file.
+	if rec.V >= archiveVersion {
+		var bf *os.File
+		defer func() {
+			if bf != nil {
+				bf.Close()
+			}
+		}()
+		joined, jerr := joinRequest(rec.Request, func(ref blobRef) ([]byte, error) {
+			if bf == nil {
+				bp, _ := a.blobPaths(day)
+				pf, oerr := os.Open(bp)
+				if oerr != nil {
+					return nil, oerr
+				}
+				bf = pf
+			}
+			return readBlobAt(bf, ref)
+		})
+		if jerr != nil {
+			return nil, jerr
+		}
+		rec.Request = joined
 	}
 	return &rec, nil
 }
