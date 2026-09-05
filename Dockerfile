@@ -9,6 +9,7 @@ FROM ${BUILDER} AS build
 WORKDIR /src
 COPY go.mod ./
 COPY *.go ui.html ./
+COPY assets ./assets
 # Tests are excluded from the image by .dockerignore, so build only.
 # CGO off => no libc dependency, so the binary runs on an empty filesystem.
 # -s -w strips the symbol table and DWARF; this is not a debuggable target.

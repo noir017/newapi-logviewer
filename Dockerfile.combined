@@ -16,6 +16,7 @@ FROM ${BUILDER} AS build
 WORKDIR /src
 COPY go.mod ./
 COPY *.go ui.html ./
+COPY assets ./assets
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /logviewer .
 
 FROM ${NEWAPI_IMAGE}
