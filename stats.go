@@ -48,6 +48,13 @@ type bucket struct {
 	Unknown  int    `json:"unknown"`
 	Quota    int64  `json:"quota"` // raw units; the UI divides (see fmtQ)
 	Tokens   int64  `json:"tokens"`
+
+	// Input/output split of Tokens, so the usage trend can stack the two rather
+	// than plot one opaque total. Carried per bucket for the same reason Tokens
+	// is: both come straight off PT/CT in the index, so splitting them costs a
+	// second add, not a body read.
+	PromptTokens     int64 `json:"prompt_tokens"`
+	CompletionTokens int64 `json:"completion_tokens"`
 }
 
 // modelStat is one row of the model breakdown.
@@ -56,6 +63,11 @@ type modelStat struct {
 	Requests int    `json:"requests"`
 	Quota    int64  `json:"quota"`
 	Tokens   int64  `json:"tokens"`
+
+	// Split, so the breakdown can rank by token volume and still show what the
+	// volume is made of. Same index-only cost as the bucket fields above.
+	PromptTokens     int64 `json:"prompt_tokens"`
+	CompletionTokens int64 `json:"completion_tokens"`
 }
 
 // tokenStat is one row of the per-token spend breakdown.
@@ -69,6 +81,11 @@ type tokenStat struct {
 	Requests int    `json:"requests"`
 	Quota    int64  `json:"quota"`
 	Tokens   int64  `json:"tokens"`
+
+	// Split, so the per-token view can be ranked by token volume as well as by
+	// spend - the two invert exactly as often here as they do for models.
+	PromptTokens     int64 `json:"prompt_tokens"`
+	CompletionTokens int64 `json:"completion_tokens"`
 }
 
 // statsResult is the wire contract with the browser.
@@ -296,6 +313,8 @@ func foldModels(m map[string]*modelStat, limit int) []modelStat {
 		rest.Requests += s.Requests
 		rest.Quota += s.Quota
 		rest.Tokens += s.Tokens
+		rest.PromptTokens += s.PromptTokens
+		rest.CompletionTokens += s.CompletionTokens
 	}
 	return append(out[:limit:limit], rest)
 }
@@ -335,6 +354,8 @@ func foldTokens(m map[string]*tokenStat, limit int) []tokenStat {
 		rest.Requests += s.Requests
 		rest.Quota += s.Quota
 		rest.Tokens += s.Tokens
+		rest.PromptTokens += s.PromptTokens
+		rest.CompletionTokens += s.CompletionTokens
 	}
 	return append(out[:limit:limit], rest)
 }
@@ -378,7 +399,7 @@ func (q *query) stats(f statsFilter, loc *time.Location) statsResult {
 			res.Unknown++
 		}
 
-		var q64, tok int64
+		var q64, tok, pt, ct int64
 		if e.Quota != nil {
 			// Accumulate in the raw integer unit and divide once, at the edge.
 			// Converting per record would round 600k times.
@@ -388,13 +409,14 @@ func (q *query) stats(f statsFilter, loc *time.Location) statsResult {
 		}
 		if e.PT != nil || e.CT != nil {
 			if e.PT != nil {
-				res.PromptTokens += int64(*e.PT)
-				tok += int64(*e.PT)
+				pt = int64(*e.PT)
+				res.PromptTokens += pt
 			}
 			if e.CT != nil {
-				res.CompletionTokens += int64(*e.CT)
-				tok += int64(*e.CT)
+				ct = int64(*e.CT)
+				res.CompletionTokens += ct
 			}
+			tok = pt + ct
 			res.Tokens += tok
 			res.TokenCount++
 		}
@@ -408,6 +430,8 @@ func (q *query) stats(f statsFilter, loc *time.Location) statsResult {
 		b.Requests++
 		b.Quota += q64
 		b.Tokens += tok
+		b.PromptTokens += pt
+		b.CompletionTokens += ct
 		switch entryOutcome(e) {
 		case outcomeOK:
 			b.OK++
@@ -429,6 +453,8 @@ func (q *query) stats(f statsFilter, loc *time.Location) statsResult {
 		ms.Requests++
 		ms.Quota += q64
 		ms.Tokens += tok
+		ms.PromptTokens += pt
+		ms.CompletionTokens += ct
 
 		// Per-token spend. The name is counted before it is defaulted, so
 		// TokenNameCount measures index coverage rather than the label the row
@@ -447,6 +473,8 @@ func (q *query) stats(f statsFilter, loc *time.Location) statsResult {
 		ts.Requests++
 		ts.Quota += q64
 		ts.Tokens += tok
+		ts.PromptTokens += pt
+		ts.CompletionTokens += ct
 	})
 
 	// Emit the axis from the requested range so quiet periods are drawn as

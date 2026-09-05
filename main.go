@@ -20,6 +20,15 @@ import (
 //go:embed ui.html
 var indexHTML []byte
 
+// The stats view's charts. Vendored rather than fetched: the container is a
+// scratch image on an air-gapped LAN, so a CDN <script> would simply fail to
+// load. Kept a separate asset (not inlined into ui.html) so it carries an
+// immutable cache header and does not bloat every page load of the list view.
+// Not under vendor/, which `go mod vendor` owns and would wipe.
+//
+//go:embed assets/chart.umd.min.js
+var chartJS []byte
+
 func main() {
 	cfg := loadConfig()
 	log.SetOutput(os.Stdout)

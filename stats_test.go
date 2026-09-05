@@ -807,3 +807,60 @@ func TestReindexBackfillsTokenName(t *testing.T) {
 		t.Errorf("laptop quota = %d, want 500", got.TokenStats[0].Quota)
 	}
 }
+
+// The token dimension ranks its breakdowns by usage, so the per-row input/output
+// split has to reconcile exactly the way the spend rows already do: each row's
+// prompt+completion must equal its own Tokens, and every breakdown's split must
+// sum back to the page totals. A zero-filled empty bucket contributes zero and
+// so does not disturb the sum.
+//
+// BREAK 15: drop `b.PromptTokens += pt` (or the model/token twin) from stats().
+// The usage-sorted breakdown then ranks on zeros while the totals stay correct -
+// the failure this dimension exists to avoid, and invisible without this check.
+func TestTokenSplitReconcilesAcrossBreakdowns(t *testing.T) {
+	recs := []*Record{
+		statRec("Spl0000000000000000001", "2026/03/04 01:00:00", 100,
+			withModel("m1"), withToken("alpha"), withUsage(40, 10)),
+		statRec("Spl0000000000000000002", "2026/03/04 01:30:00", 200,
+			withModel("m2"), withToken("beta"), withUsage(300, 25)),
+		statRec("Spl0000000000000000003", "2026/03/04 02:00:00", 300,
+			withModel("m1"), withToken("alpha"), withUsage(7, 3)),
+	}
+	got := archivedQuery(t, recs).stats(span("20260304", "20260304"), time.Local)
+
+	const wantPrompt, wantCompletion, wantTokens = int64(347), int64(38), int64(385)
+	if got.PromptTokens != wantPrompt || got.CompletionTokens != wantCompletion || got.Tokens != wantTokens {
+		t.Fatalf("totals prompt/completion/tokens = %d/%d/%d, want %d/%d/%d",
+			got.PromptTokens, got.CompletionTokens, got.Tokens,
+			wantPrompt, wantCompletion, wantTokens)
+	}
+
+	type row struct{ pt, ct, tok int64 }
+	check := func(name string, rows []row) {
+		var sp, sc, st int64
+		for _, r := range rows {
+			if r.pt+r.ct != r.tok {
+				t.Errorf("%s: a row's pt+ct = %d, want its tokens %d", name, r.pt+r.ct, r.tok)
+			}
+			sp, sc, st = sp+r.pt, sc+r.ct, st+r.tok
+		}
+		if sp != wantPrompt || sc != wantCompletion || st != wantTokens {
+			t.Errorf("%s: split sums to %d/%d/%d, want %d/%d/%d",
+				name, sp, sc, st, wantPrompt, wantCompletion, wantTokens)
+		}
+	}
+
+	var brows, mrows, trows []row
+	for _, b := range got.Series {
+		brows = append(brows, row{b.PromptTokens, b.CompletionTokens, b.Tokens})
+	}
+	for _, m := range got.Models {
+		mrows = append(mrows, row{m.PromptTokens, m.CompletionTokens, m.Tokens})
+	}
+	for _, tk := range got.TokenStats {
+		trows = append(trows, row{tk.PromptTokens, tk.CompletionTokens, tk.Tokens})
+	}
+	check("series", brows)
+	check("models", mrows)
+	check("tokens", trows)
+}
