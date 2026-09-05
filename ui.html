@@ -120,13 +120,11 @@ body.view-stats .split{display:none}
 .card2 .hd .grow{flex:1}
 .lg{display:flex;gap:12px;align-items:center;flex-wrap:wrap;font-size:11.5px;color:var(--dim)}
 .lg i{width:9px;height:9px;border-radius:2px;display:inline-block;margin-right:4px;vertical-align:-1px}
-.chart{width:100%;display:block;overflow:visible}
-.chart text{fill:var(--dim2);font-size:10px}
-.chart .gl{stroke:var(--grid);stroke-width:1}
-.chart .hit{fill:transparent;cursor:pointer}
-.chart .bar{transition:opacity .1s}
-.chart g.on .bar{opacity:.72}
-.chart .cross{stroke:var(--dim2);stroke-width:1;opacity:0;pointer-events:none}
+/* Chart.js draws into a canvas that needs an explicitly sized, positioned parent;
+   it fills the box and resizes with the window from there. */
+.chartbox{position:relative;height:200px;width:100%}
+/* Sort toggle on the breakdown cards: a pair of small pills reusing .seg. */
+.sortsel button{font-size:11px;padding:3px 9px}
 
 /* Model rows are a list, not an SVG: names run long and HTML ellipsis handles
    that far better than tspan arithmetic. */
@@ -166,13 +164,6 @@ body.view-stats .split{display:none}
 .lnk{background:none;border:none;color:var(--dim2);font-size:11.5px;padding:2px 4px;cursor:pointer}
 .lnk:hover{color:var(--acc)}
 
-#tip{position:fixed;z-index:40;pointer-events:none;opacity:0;transition:opacity .08s;
-  background:#0b0e14;border:1px solid var(--line);border-radius:7px;padding:7px 9px;
-  font-size:11.5px;box-shadow:0 6px 20px #0009;max-width:260px}
-#tip .tt{color:var(--dim2);margin-bottom:3px}
-#tip .rw{display:flex;align-items:center;gap:6px;justify-content:space-between}
-#tip .rw b{font-variant-numeric:tabular-nums}
-#tip .k{width:10px;height:2px;border-radius:2px;display:inline-block;vertical-align:2px;margin-right:5px}
 .note{color:var(--dim2);font-size:11.5px;margin:-4px 0 12px}
 .warnbox{background:#1d1a0e;border:1px solid #4a3a12;color:#e3b341;border-radius:8px;
   padding:8px 11px;font-size:11.5px;margin-bottom:12px}
@@ -353,7 +344,6 @@ pre.j{background:#0d1017;border:1px solid var(--line);border-radius:7px;padding:
 </header>
 
 <div class="stats" id="stats"><div class="spin">加载中…</div></div>
-<div id="tip"></div>
 
 <div class="split">
   <div class="left" id="left">
@@ -367,6 +357,10 @@ pre.j{background:#0d1017;border:1px solid var(--line);border-radius:7px;padding:
   <div class="right" id="detail"><div class="ph">← 从左侧选择一次调用查看详情</div></div>
 </div>
 
+<!-- Vendored chart library, served from /assets by the binary itself (see the
+     go:embed in main.go) — never a CDN: the image is scratch on an air-gapped
+     LAN, so an external <script> would simply fail to load. -->
+<script src="assets/chart.umd.min.js"></script>
 <script>
 const $ = s => document.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c =>
@@ -960,13 +954,18 @@ $('#auto').onchange = e => {
 
 // ===================== stats view =====================
 //
-// Charts are hand-written SVG. The viewer ships as one static binary with the
-// UI embedded, so there is no library to load and nothing to serve off disk —
-// a charting dependency would mean either a CDN call from an air-gapped LAN box
-// or a second asset path to keep in sync.
+// Charts are Chart.js, vendored and served from the binary (see main.go's
+// embed) — not a CDN, since the image is scratch on an air-gapped LAN. It
+// replaced a hand-written SVG renderer once this page grew a second stacked-bar
+// chart and the token dimension: the axis-thinning, tooltips and responsive
+// resize that were being reimplemented by hand are what a chart library is for.
 
-const SVGNS = 'http://www.w3.org/2000/svg';
-let statsData = null, statsBusy = false;
+let statsData = null, statsBusy = false, statsCharts = [];
+// Which metric each breakdown is ranked by. The server sorts models by request
+// volume and tokens by spend before folding the tail; these let the reader flip
+// to a token-volume ranking, which inverts the order once cache-heavy or
+// long-context callers enter the mix — the reason the token dimension exists.
+let modelSort = 'requests', tokenSort = 'quota';
 
 // Must match stats.go's tokenUnnamed exactly. It is a label the server sends,
 // not a sentinel the client invents, so the two only need to agree on the string
@@ -988,151 +987,145 @@ function compact(n){
 // never disagree about what a quota unit is worth.
 const money = q => '$' + (q / 500000).toFixed(4);
 
-function el(tag, attrs, parent){
-  const n = document.createElementNS(SVGNS, tag);
-  for (const k in attrs) n.setAttribute(k, attrs[k]);
-  if (parent) parent.appendChild(n);
-  return n;
-}
+// Chart palette pulled from the CSS custom properties, so the charts follow the
+// same colours — and the measured CVD separation behind them — as the rest of
+// the page instead of hardcoding a second copy.
+function cssVar(n){ return getComputedStyle(document.documentElement).getPropertyValue(n).trim(); }
+const CT = {
+  spend:  cssVar('--c-1'),
+  input:  cssVar('--c-1'),    // 输入 token
+  output: cssVar('--tool'),   // 输出 token — blue+amber is the colour-blind-safe
+                              // pair; NOT --c-1/--c-err, which would read as ok/fail
+  ok:  cssVar('--c-1'), err: cssVar('--c-err'), unk: cssVar('--c-unk'),
+  grid: cssVar('--grid'), line: cssVar('--line'), dim2: cssVar('--dim2'), fg: cssVar('--fg'),
+};
 
-// Round an axis maximum up to a clean number, so ticks read 0 / 500 / 1,000
-// rather than 0 / 437 / 874.
-function niceMax(v){
-  if (v <= 0) return 1;
-  const mag = Math.pow(10, Math.floor(Math.log10(v)));
-  const norm = v / mag;
-  const step = norm <= 1 ? 1 : norm <= 2 ? 2 : norm <= 5 ? 5 : 10;
-  return step * mag;
-}
+// destroyCharts releases the previous render's Chart instances. renderStats
+// rebuilds the DOM (host.innerHTML), detaching the old canvases; without this
+// their resize observers and animation state would leak on every refetch.
+function destroyCharts(){ statsCharts.forEach(c => c.destroy()); statsCharts = []; }
 
-const tip = () => document.getElementById('tip');
-function showTip(evt, html){
-  const t = tip();
-  t.innerHTML = html;
-  t.style.opacity = '1';
-  const r = t.getBoundingClientRect();
-  let x = evt.clientX + 14, y = evt.clientY - r.height - 10;
-  if (x + r.width > window.innerWidth - 8) x = evt.clientX - r.width - 14;
-  if (y < 8) y = evt.clientY + 18;
-  t.style.left = x + 'px';
-  t.style.top = y + 'px';
-}
-const hideTip = () => { tip().style.opacity = '0'; };
-
-// A bar with its data-end rounded and its baseline square.
+// trendChart draws one time-bucketed stacked bar chart into a canvas.
 //
-// An SVG rect's rx rounds all four corners, which detaches the bar from its own
-// baseline and makes a stack read as separate floating pills. Only the end that
-// encodes the value gets the radius.
-function barPath(x, y, w, h, r){
-  r = Math.max(0, Math.min(r, w / 2, h));
-  if (r <= 0) return `M${x} ${y}h${w}v${h}h${-w}z`;
-  return `M${x} ${y + h}V${y + r}a${r} ${r} 0 0 1 ${r} ${-r}h${w - 2 * r}` +
-         `a${r} ${r} 0 0 1 ${r} ${r}V${y + h}z`;
-}
-
-// barChart draws one time-bucketed chart into a host element.
-//
-// series: the API's buckets. keys: which fields to stack, in draw order.
-// Every bar carries its own hover/focus target sized to the whole band, not to
-// the painted pixels — a 3px bar in a 365-day range is otherwise unhittable.
-function barChart(host, series, keys, colors, labels, fmt){
-  host.innerHTML = '';
-  const W = Math.max(host.clientWidth || 720, 320), H = 190;
-  const padL = 52, padR = 10, padT = 10, padB = 26;
-  const iw = W - padL - padR, ih = H - padT - padB;
-
-  const svg = el('svg', {class: 'chart', viewBox: `0 0 ${W} ${H}`,
-    width: '100%', height: H, role: 'img'}, host);
-
-  const totals = series.map(b => keys.reduce((s, k) => s + (b[k] || 0), 0));
-  const max = niceMax(Math.max(1, ...totals));
-
-  // Gridlines + y ticks. Solid hairlines, one step off the surface: dashed
-  // reads as "threshold" when it is just a grid.
-  for (let i = 0; i <= 4; i++){
-    const y = padT + ih - (ih * i / 4);
-    el('line', {class: 'gl', x1: padL, y1: y, x2: W - padR, y2: y}, svg);
-    const t = el('text', {x: padL - 7, y: y + 3, 'text-anchor': 'end'}, svg);
-    t.textContent = fmt ? fmt(max * i / 4, true) : nfmt(Math.round(max * i / 4));
-  }
-
-  const n = series.length || 1;
-  const band = iw / n;
-  // Cap the bar so the band always keeps some air; never fill the slot.
-  const bw = Math.max(1, Math.min(24, band - (band > 6 ? 2 : 0.5)));
-
-  series.forEach((b, i) => {
-    const cx = padL + band * i + band / 2;
-    const g = el('g', {}, svg);
-    let acc = 0;
-    keys.forEach((k, ki) => {
-      const v = b[k] || 0;
-      if (v <= 0) return;
-      const h = (v / max) * ih;
-      const y = padT + ih - h - acc;
-      // 4px rounded data-end on the topmost segment only; the rest stay square
-      // so a stack does not look like separate floating pills.
-      const isTop = keys.slice(ki + 1).every(kk => !(b[kk] > 0));
-      const hh = Math.max(h, v > 0 ? 1 : 0);
-      el('path', {class: 'bar', d: barPath(cx - bw / 2, y, bw, hh, isTop ? 4 : 0),
-        fill: colors[ki]}, g);
-      // 2px surface gap between stacked segments — white doing the separating,
-      // never a stroke around the mark.
-      acc += h + (h > 2 ? 2 : 0);
-    });
-
-    // The hit target is the whole band and the full height, so the pointer only
-    // has to be near the right date.
-    const hit = el('rect', {class: 'hit', x: padL + band * i, y: padT,
-      width: band, height: ih, tabindex: '0'}, g);
-    const rows = keys.map((k, ki) =>
-      `<div class="rw"><span><i class="k" style="background:${colors[ki]}"></i>${
-        esc(labels[ki])}</span><b>${fmt ? fmt(b[k] || 0) : nfmt(b[k] || 0)}</b></div>`).join('');
-    const html = `<div class="tt">${esc(b.label)}</div>${rows}`;
-    const show = e => { g.classList.add('on'); showTip(e, html); };
-    hit.addEventListener('pointerenter', show);
-    hit.addEventListener('pointermove', show);
-    hit.addEventListener('focus', () => {
-      const r = hit.getBoundingClientRect();
-      show({clientX: r.left + r.width / 2, clientY: r.top});
-    });
-    hit.addEventListener('pointerleave', () => { g.classList.remove('on'); hideTip(); });
-    hit.addEventListener('blur', () => { g.classList.remove('on'); hideTip(); });
+// labels: bucket labels. datasets: {label, data, color}. fmt(v, axis): how a
+// value reads — dollars, token counts or plain counts — compact on the axis and
+// full in the tooltip. A single-dataset call (spend) just leaves one layer.
+function trendChart(canvas, labels, datasets, fmt){
+  const stacked = datasets.length > 1;
+  const c = new Chart(canvas, {
+    type: 'bar',
+    data: { labels, datasets: datasets.map(d => ({
+      label: d.label, data: d.data, backgroundColor: d.color,
+      borderRadius: stacked ? 2 : 4, borderSkipped: false, maxBarThickness: 34,
+    })) },
+    options: {
+      responsive: true, maintainAspectRatio: false, animation: false,
+      interaction: { mode: 'index', intersect: false },
+      scales: {
+        x: { stacked: true, grid: { display: false }, border: { color: CT.line },
+             ticks: { color: CT.dim2, font: { size: 10 }, maxRotation: 0,
+                      autoSkip: true, autoSkipPadding: 14 } },
+        y: { stacked: true, beginAtZero: true, grid: { color: CT.grid },
+             border: { display: false },
+             ticks: { color: CT.dim2, font: { size: 10 }, callback: v => fmt(v, true) } },
+      },
+      plugins: {
+        legend: { display: false },
+        tooltip: { backgroundColor: '#0b0e14', borderColor: CT.line, borderWidth: 1,
+          titleColor: CT.dim2, bodyColor: CT.fg, padding: 8,
+          callbacks: { label: ctx => `${ctx.dataset.label}: ${fmt(ctx.parsed.y)}` } },
+      },
+    },
   });
-
-  // X labels, thinned to whatever fits. A label that would collide with its
-  // neighbour is dropped rather than shrunk or rotated: the axis exists to
-  // orient the reader, and the exact value of every bucket is in the tooltip
-  // and the table twin.
-  //
-  // Widths are MEASURED, not assumed. A guessed constant is what put "22:00"
-  // and "23:00" on top of each other: the estimate was 46px and the hourly
-  // label actually renders at ~68. getComputedTextLength reports what the
-  // browser will really draw, so the rule holds for any label format.
-  let lastRight = -Infinity;
-  const place = i => {
-    const x = padL + band * i + band / 2;
-    const t = el('text', {x, y: H - 8, 'text-anchor': 'middle'}, svg);
-    t.textContent = series[i].label;
-    let w;
-    try { w = t.getComputedTextLength(); } catch { w = series[i].label.length * 5.6; }
-    if (x - w / 2 < lastRight + 6 || x + w / 2 > W - padR + 4){
-      svg.removeChild(t);                    // would collide, or overflow the plot
-      return;
-    }
-    lastRight = x + w / 2;
-  };
-  // Stride from a measured sample rather than a constant.
-  const probe = el('text', {x: -999, y: -999}, svg);
-  probe.textContent = series.length ? series[0].label : '';
-  let lw;
-  try { lw = probe.getComputedTextLength() || 46; } catch { lw = 46; }
-  svg.removeChild(probe);
-  const every = Math.max(1, Math.ceil(n / Math.max(1, Math.floor(iw / (lw + 16)))));
-  for (let i = 0; i < n; i += every) place(i);
-  if (n > 1 && (n - 1) % every) place(n - 1);     // always try the last bucket
+  statsCharts.push(c);
 }
+
+// sortRows re-ranks the already-folded breakdown rows by a chosen field. The
+// server folds the long tail into one "other" row before sending, so this
+// reorders only the named rows — "other" (and an unnamed-token gap) stay pinned
+// to the bottom as the residual, and the rows still sum to the totals.
+function sortRows(rows, key, tail){
+  const k = r => r.model ?? r.token;
+  const named = rows.filter(r => !tail.includes(k(r)));
+  const rest  = rows.filter(r =>  tail.includes(k(r)));
+  named.sort((a, b) => (b[key] - a[key]) || (b.requests - a.requests));
+  return named.concat(rest);
+}
+
+// modelCard renders the model breakdown, rankable by request volume or token
+// volume. The bar is scaled to whichever metric it is sorted by, so the visual
+// order always matches the number beside it.
+function modelCard(models){
+  const byTok = modelSort === 'tokens';
+  const rows = sortRows(models, byTok ? 'tokens' : 'requests', ['other', '(unknown)']);
+  const metric = r => byTok ? r.tokens : r.requests;
+  const max = Math.max(1, ...rows.map(metric));
+  return `<div class="card2">
+    <div class="hd"><div><h3>模型分布</h3>
+      <div class="cap">按${byTok ? 'Token 量' : '请求数'}排序 · 点击可在列表中筛选</div></div>
+      <span class="grow"></span>
+      <div class="seg sortsel">
+        <button data-msort="requests" class="${byTok ? '' : 'on'}">请求数</button>
+        <button data-msort="tokens" class="${byTok ? 'on' : ''}">Token 量</button>
+      </div></div>
+    ${rows.length ? rows.map(m => `
+      <div class="mrow tkrow" data-model="${esc(m.model)}">
+        <div>
+          <div class="nm" title="${esc(m.model)}">${esc(m.model)}</div>
+          <div class="track"><div class="fill" style="width:${
+            Math.max(1, 100 * metric(m) / max)}%"></div></div>
+        </div>
+        <div class="vv">${byTok ? compact(m.tokens) : nfmt(m.requests)}<br>
+          <span style="color:var(--dim2)">${byTok ? nfmt(m.requests) + ' 次' : money(m.quota)}</span></div>
+      </div>`).join('') : '<div class="cap">此范围内没有调用</div>'}
+  </div>`;
+}
+
+// tokenCard renders the per-API-token breakdown, rankable by spend or token
+// volume — the two invert exactly as they do for models.
+function tokenCard(tks, d){
+  const byTok = tokenSort === 'tokens';
+  const rows = sortRows(tks, byTok ? 'tokens' : 'quota', ['other', TOKEN_UNNAMED]);
+  const metric = r => byTok ? r.tokens : r.quota;
+  const max = Math.max(1, ...rows.map(metric));
+  return `<div class="card2">
+    <div class="hd"><div><h3>令牌用量</h3>
+      <div class="cap">按${byTok ? 'Token 量' : '花费'}排序 · 点击可在列表中筛选</div></div>
+      <span class="grow"></span>
+      <div class="seg sortsel">
+        <button data-tsort="quota" class="${byTok ? '' : 'on'}">花费</button>
+        <button data-tsort="tokens" class="${byTok ? 'on' : ''}">Token 量</button>
+      </div>
+      <button class="lnk" data-tbl="t-token">表格</button></div>
+    ${d.requests > 0 && d.token_name_count === 0 ? `<div class="warnbox">
+      索引中暂无令牌名称。运行 <code>logviewer -reindex</code> 可从已归档的记录中回填；
+      在此之前所有调用都归入「${esc(TOKEN_UNNAMED)}」。</div>` : ''}
+    ${rows.length ? rows.map(t => {
+      // An unnamed row is a measurement gap, not a filterable token — the name
+      // is exactly what is missing. It carries no spend (name and bill arrive
+      // together), so in the spend view it shows its request count rather than a
+      // $0.0000 that reads as real.
+      const na = t.token === TOKEN_UNNAMED;
+      const primary = byTok ? (t.tokens ? compact(t.tokens) : '—')
+                            : (na ? '—' : money(t.quota));
+      const sub = byTok ? (na ? '' : money(t.quota)) : nfmt(t.requests) + ' 次';
+      return `<div class="mrow tkrow ${na ? 'na' : ''}"${
+        na ? '' : ` data-token="${esc(t.token)}"`}>
+        <div>
+          <div class="nm" title="${esc(t.token)}">${esc(t.token)}</div>
+          <div class="track"><div class="fill" style="width:${
+            Math.max(1, 100 * metric(t) / max)}%"></div></div>
+        </div>
+        <div class="vv">${primary}<br><span style="color:var(--dim2)">${sub}</span></div>
+      </div>`;
+    }).join('') : '<div class="cap">此范围内没有调用</div>'}
+    <div class="tblwrap" id="t-token"></div>
+  </div>`;
+}
+
+// (The hand-written SVG bar renderer, its tooltip positioner and axis-label
+// thinner lived here until Chart.js took over; see the note at the top of this
+// section.)
 
 function kpi(label, value, sub, cls){
   return `<div class="kpi ${cls || ''}">
@@ -1147,12 +1140,25 @@ function renderStats(d, rng){
   const s = d.series || [], models = d.models || [];
   const gran = {hour: '每小时', day: '每天', week: '每周'}[d.granularity] || d.granularity;
 
+  destroyCharts();
+
   // Success rate is over calls whose outcome the log actually recorded. 63% of
   // this archive predates the outcome field, and ok/total would render that
   // silence as a 37% success rate — a number someone would escalate on.
   const known = d.ok + d.err;
   const rate = known ? (100 * d.ok / known).toFixed(1) + '%' : '—';
   const avg = d.quota_count ? money(d.quota / d.quota_count) : '—';
+
+  // Token-dimension figures. All averaged over token_count, never over requests:
+  // the index carries no tokens for records written before the field existed, so
+  // dividing by every request would deflate the average as history dilutes it —
+  // the rule the KPI subtitles already follow for spend.
+  const perCall = d.token_count ? compact(Math.round(d.tokens / d.token_count)) : '—';
+  // $/1M tokens = dollars / tokens × 1e6, and dollars = quota / 500000, so this
+  // is quota / (0.5 × tokens). Only meaningful when a bill and a usage figure
+  // both exist for the window.
+  const unit = (d.quota && d.tokens)
+    ? '$' + (d.quota / (500000 * d.tokens) * 1e6).toFixed(2) : '—';
 
   const parts = [];
 
@@ -1167,27 +1173,47 @@ function renderStats(d, rng){
       <code>logviewer -reindex</code> 可从已归档的记录中回填。</div>`);
   }
 
+  // Spend and token volume are co-heroes: the whole point of this page is that
+  // the two do not track each other (a cache-read token is billed at a fraction
+  // of a fresh one), so neither is a subtitle of the other.
   parts.push(`<div class="kpis">
     ${kpi('总花费', money(d.quota), `${nfmt(d.quota_count)} 次计费`, 'hero')}
+    ${kpi('Token 总量', d.token_count ? compact(d.tokens) : '—',
+      d.token_count ? `入 ${compact(d.prompt_tokens)} · 出 ${compact(d.completion_tokens)}`
+                    : '索引未记录', 'hero')}
     ${kpi('请求数', nfmt(d.requests), gran + ' · ' + s.length + ' 个区间')}
     ${kpi('成功率', rate, known ? `${nfmt(d.ok)} 成功 / ${nfmt(d.err)} 失败` : '无可用状态')}
-    ${kpi('平均单价', avg, d.quota_count ? '按已计费调用' : '无计费记录')}
-    ${kpi('Token 总量', d.token_count ? compact(d.tokens) : '—',
-      d.token_count ? `${nfmt(d.token_count)} 次上报 · 入 ${compact(d.prompt_tokens)} / 出 ${compact(d.completion_tokens)}`
-                    : '索引未记录')}
+    ${kpi('平均每调用', perCall === '—' ? '—' : perCall + ' tok',
+      d.token_count ? `${nfmt(d.token_count)} 次上报` : '索引未记录')}
+    ${kpi('单位成本', unit, unit === '—' ? '无计费或用量' : '每百万 token')}
+    ${kpi('平均单价', avg, d.quota_count ? '每次已计费调用' : '无计费记录')}
   </div>`);
 
-  // Two charts, one axis each. Spend and request count are different units, and
-  // overlaying them on twin y-scales would invent a correlation out of the
-  // arbitrary alignment of two ranges.
+  // Spend trend.
   parts.push(`<div class="card2">
     <div class="hd"><div><h3>花费趋势</h3><div class="cap">${gran} · 单位美元</div></div>
       <span class="grow"></span>
       <button class="lnk" data-tbl="t-spend">表格</button></div>
-    <div id="c-spend"></div>
+    <div class="chartbox"><canvas id="c-spend"></canvas></div>
     <div class="tblwrap" id="t-spend"></div>
   </div>`);
 
+  // Token usage trend — the headline of the new dimension. Stacks input over
+  // output so the shape shows both the volume and its composition; the two are
+  // billed very differently, so one opaque total would hide the mix.
+  parts.push(`<div class="card2">
+    <div class="hd"><div><h3>Token 用量趋势</h3><div class="cap">${gran} · 输入 / 输出堆叠</div></div>
+      <span class="grow"></span>
+      <div class="lg">
+        <span><i style="background:var(--c-1)"></i>输入</span>
+        <span><i style="background:var(--tool)"></i>输出</span>
+      </div>
+      <button class="lnk" data-tbl="t-tok">表格</button></div>
+    <div class="chartbox"><canvas id="c-tok"></canvas></div>
+    <div class="tblwrap" id="t-tok"></div>
+  </div>`);
+
+  // Request volume.
   parts.push(`<div class="card2">
     <div class="hd"><div><h3>请求量</h3><div class="cap">${gran} · 按结束状态分层</div></div>
       <span class="grow"></span>
@@ -1197,60 +1223,12 @@ function renderStats(d, rng){
         <span><i style="background:var(--c-unk)"></i>未记录</span>
       </div>
       <button class="lnk" data-tbl="t-req">表格</button></div>
-    <div id="c-req"></div>
+    <div class="chartbox"><canvas id="c-req"></canvas></div>
     <div class="tblwrap" id="t-req"></div>
   </div>`);
 
-  const maxReq = Math.max(1, ...models.map(m => m.requests));
-  parts.push(`<div class="card2">
-    <div class="hd"><div><h3>模型分布</h3>
-      <div class="cap">按请求数排序 · 点击可在列表中筛选</div></div></div>
-    ${models.length ? models.map(m => `
-      <div class="mrow" data-model="${esc(m.model)}">
-        <div>
-          <div class="nm" title="${esc(m.model)}">${esc(m.model)}</div>
-          <div class="track"><div class="fill" style="width:${
-            Math.max(1, 100 * m.requests / maxReq)}%"></div></div>
-        </div>
-        <div class="vv">${nfmt(m.requests)}<br><span style="color:var(--dim2)">${money(m.quota)}</span></div>
-      </div>`).join('') : '<div class="cap">此范围内没有调用</div>'}
-  </div>`);
-
-  // Per-token spend. Ranked by cost, not by volume — the server sorts, and the
-  // bar is scaled to the top row's quota so the visual order matches the number
-  // beside it. On the production archive the two orderings genuinely invert
-  // (13 calls outspending 150 by 17x), which is the whole reason this card
-  // exists separately from 模型分布.
-  const tks = d.tokens_by_token || [];
-  const maxTQ = Math.max(1, ...tks.map(t => t.quota));
-  const named = tks.filter(t => t.token !== TOKEN_UNNAMED && t.token !== 'other');
-  parts.push(`<div class="card2">
-    <div class="hd"><div><h3>令牌用量</h3>
-      <div class="cap">按花费排序 · 点击可在列表中筛选</div></div>
-      <span class="grow"></span>
-      <button class="lnk" data-tbl="t-token">表格</button></div>
-    ${d.requests > 0 && d.token_name_count === 0 ? `<div class="warnbox">
-      索引中暂无令牌名称。运行 <code>logviewer -reindex</code> 可从已归档的记录中回填；
-      在此之前所有调用都归入「${esc(TOKEN_UNNAMED)}」。</div>` : ''}
-    ${tks.length ? tks.map(t => {
-      // An unnamed row is a gap in the measurement, not a token you can filter
-      // by — the name is precisely what is missing. It carries no quota either
-      // (the name and the billing line arrive together), so it is labelled with
-      // its request count rather than a $0.0000 that reads as a real figure.
-      const na = t.token === TOKEN_UNNAMED;
-      return `<div class="mrow tkrow ${na ? 'na' : ''}"${
-        na ? '' : ` data-token="${esc(t.token)}"`}>
-        <div>
-          <div class="nm" title="${esc(t.token)}">${esc(t.token)}</div>
-          <div class="track"><div class="fill" style="width:${
-            Math.max(1, 100 * t.quota / maxTQ)}%"></div></div>
-        </div>
-        <div class="vv">${na ? '—' : money(t.quota)}<br><span style="color:var(--dim2)">${
-          nfmt(t.requests)} 次</span></div>
-      </div>`;
-    }).join('') : '<div class="cap">此范围内没有调用</div>'}
-    <div class="tblwrap" id="t-token"></div>
-  </div>`);
+  parts.push(modelCard(models));
+  parts.push(tokenCard(d.tokens_by_token || [], d));
 
   if (d.unknown_time > 0){
     parts.push(`<div class="note">另有 ${nfmt(d.unknown_time)} 条记录没有可用时间戳，
@@ -1260,22 +1238,38 @@ function renderStats(d, rng){
 
   host.innerHTML = parts.join('');
 
-  barChart($('#c-spend'), s, ['quota'], ['var(--c-1)'], ['花费'],
-    (v, axis) => axis ? '$' + (v / 500000).toFixed(v / 500000 >= 10 ? 0 : 2) : money(v));
-  barChart($('#c-req'), s, ['ok', 'err', 'unknown'],
-    ['var(--c-1)', 'var(--c-err)', 'var(--c-unk)'], ['成功', '失败', '未记录']);
+  // Draw the charts now the canvases exist. Each formatter reads compact on the
+  // axis and full in the tooltip.
+  const dollars = (v, axis) => axis ? '$' + (v >= 10 ? v.toFixed(0) : v.toFixed(2))
+                                    : '$' + v.toFixed(4);
+  const toks = (v, axis) => axis ? compact(v) : nfmt(v);
+  const count = v => nfmt(v);
 
-  // Table twins. Built with textContent, never innerHTML concatenation: model
-  // names come from the request body a client sent, so they are untrusted.
+  trendChart($('#c-spend'), s.map(b => b.label),
+    [{label: '花费', data: s.map(b => b.quota / 500000), color: CT.spend}], dollars);
+  trendChart($('#c-tok'), s.map(b => b.label), [
+    {label: '输入', data: s.map(b => b.prompt_tokens), color: CT.input},
+    {label: '输出', data: s.map(b => b.completion_tokens), color: CT.output},
+  ], toks);
+  trendChart($('#c-req'), s.map(b => b.label), [
+    {label: '成功', data: s.map(b => b.ok), color: CT.ok},
+    {label: '失败', data: s.map(b => b.err), color: CT.err},
+    {label: '未记录', data: s.map(b => b.unknown), color: CT.unk},
+  ], count);
+
+  // Table twins. Built with textContent (see fillTable), never innerHTML: model
+  // and token names come from what a client sent, so they are untrusted.
   fillTable($('#t-spend'), ['时间', '花费', '请求'],
     s.map(b => [b.label, money(b.quota), nfmt(b.requests)]));
+  fillTable($('#t-tok'), ['时间', '输入', '输出', '合计'],
+    s.map(b => [b.label, nfmt(b.prompt_tokens), nfmt(b.completion_tokens), nfmt(b.tokens)]));
   fillTable($('#t-req'), ['时间', '成功', '失败', '未记录', '合计'],
     s.map(b => [b.label, nfmt(b.ok), nfmt(b.err), nfmt(b.unknown), nfmt(b.requests)]));
-  // Token names are chosen by whoever created the token, so they go through
-  // textContent like the model names do.
-  fillTable($('#t-token'), ['令牌', '花费', '请求', 'Token'],
+  const tks = d.tokens_by_token || [];
+  fillTable($('#t-token'), ['令牌', '花费', '请求', '输入', '输出', 'Token'],
     tks.map(t => [t.token, t.token === TOKEN_UNNAMED ? '—' : money(t.quota),
-                  nfmt(t.requests), t.tokens ? compact(t.tokens) : '—']));
+                  nfmt(t.requests), nfmt(t.prompt_tokens), nfmt(t.completion_tokens),
+                  t.tokens ? compact(t.tokens) : '—']));
 }
 
 function fillTable(host, head, rows){
@@ -1390,6 +1384,15 @@ $('#stats').addEventListener('click', e => {
     tb.textContent = w.classList.contains('on') ? '收起表格' : '表格';
     return;
   }
+  // Breakdown sort toggle. Re-render from the cached response — the reorder is
+  // display-only (see sortRows), so there is nothing to refetch.
+  const so = e.target.closest('[data-msort],[data-tsort]');
+  if (so){
+    if (so.dataset.msort) modelSort = so.dataset.msort;
+    else tokenSort = so.dataset.tsort;
+    if (statsData) renderStats(statsData.data, statsData.range);
+    return;
+  }
   // Drill-down: a model or token row hands its slice to the list view, which
   // already does per-call inspection well. The stats page does not duplicate it.
   const row = e.target.closest('[data-model],[data-token]');
@@ -1418,14 +1421,9 @@ $('#stats').addEventListener('click', e => {
   page = 1; load(true);
 });
 
-// Redraw on resize: the SVG viewBox is computed from the host's pixel width, so
-// a resized window would otherwise leave the bars at their old scale.
-let rz;
-window.addEventListener('resize', () => {
-  if (!document.body.classList.contains('view-stats') || !statsData) return;
-  clearTimeout(rz);
-  rz = setTimeout(() => renderStats(statsData.data, statsData.range), 150);
-});
+// Chart.js resizes each canvas to its container on its own (responsive +
+// maintainAspectRatio:false over a fixed-height .chartbox), so window resize
+// needs no manual redraw — the reason the old SVG viewBox handler is gone.
 
 load();
 if (localStorage.getItem('lv-view') === 'stats') setView('stats');

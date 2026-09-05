@@ -18,6 +18,7 @@ type server struct {
 	auth  *authenticator
 	ch    *channelResolver
 	index []byte
+	chart []byte
 }
 
 func newServer(cfg Config) *server {
@@ -26,7 +27,7 @@ func newServer(cfg Config) *server {
 	ch := newChannelResolver(cfg.NewAPIURL, cfg.NewAPIToken)
 	return &server{
 		cfg: cfg, q: newQuery(arc, cfg.SearchDays).withChannels(ch), ing: ing,
-		auth: newAuthenticator(cfg), ch: ch, index: indexHTML,
+		auth: newAuthenticator(cfg), ch: ch, index: indexHTML, chart: chartJS,
 	}
 }
 
@@ -64,6 +65,18 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		h["ok"] = code == 200
 		s.writeJSON(w, code, h)
+		return
+	}
+
+	// The vendored chart library. Served before the auth gate and with an
+	// immutable cache: it is a public asset with no data in it, the page that
+	// needs it is already behind auth, and a 401 here would just blank the stats
+	// charts on a session that had merely gone stale between page load and
+	// script fetch.
+	if path == "/assets/chart.umd.min.js" {
+		w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
+		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+		w.Write(s.chart)
 		return
 	}
 
