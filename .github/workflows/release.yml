@@ -1,0 +1,100 @@
+name: release
+
+# Build and publish the viewer images to GHCR for both architectures the fleet
+# runs: linux/amd64 (unraid) and linux/arm64 (oracle). Two images are shipped -
+# the standalone scratch viewer and the combined new-api+viewer that production
+# actually runs - because the marginal cost of the second is one more buildx
+# call and it keeps both deployment models releasable from one tag.
+#
+# Triggers:
+#   - a v* tag   -> a versioned release (vX.Y.Z, X.Y, the tag, the sha, latest)
+#   - manual run -> latest + sha, for cutting an image without tagging
+#
+# calciumion/new-api is itself multi-arch, so the combined image's arm64 variant
+# assembles from the arm64 new-api layers; the go build runs under QEMU.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      newapi_image:
+        description: 'Upstream new-api base image for the combined image'
+        default: 'calciumion/new-api:latest'
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  STANDALONE_IMAGE: ghcr.io/${{ github.repository_owner }}/newapi-logviewer
+  COMBINED_IMAGE: ghcr.io/${{ github.repository_owner }}/newapi-logviewer-combined
+  PLATFORMS: linux/amd64,linux/arm64
+
+jobs:
+  images:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # QEMU lets the arm64 image build on an amd64 runner; buildx drives the
+      # two-platform build and pushes a single multi-arch manifest per image.
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # ---- standalone viewer (scratch, :7070) --------------------------------
+      - name: Metadata (standalone)
+        id: meta_std
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.STANDALONE_IMAGE }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=ref,event=tag
+            type=sha,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build & push standalone
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: ${{ env.PLATFORMS }}
+          push: true
+          tags: ${{ steps.meta_std.outputs.tags }}
+          labels: ${{ steps.meta_std.outputs.labels }}
+          cache-from: type=gha,scope=standalone
+          cache-to: type=gha,mode=max,scope=standalone
+
+      # ---- combined new-api + viewer (what production runs) ------------------
+      - name: Metadata (combined)
+        id: meta_comb
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.COMBINED_IMAGE }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=ref,event=tag
+            type=sha,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build & push combined
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.combined
+          platforms: ${{ env.PLATFORMS }}
+          build-args: |
+            NEWAPI_IMAGE=${{ github.event.inputs.newapi_image || 'calciumion/new-api:latest' }}
+          push: true
+          tags: ${{ steps.meta_comb.outputs.tags }}
+          labels: ${{ steps.meta_comb.outputs.labels }}
+          cache-from: type=gha,scope=combined
+          cache-to: type=gha,mode=max,scope=combined
