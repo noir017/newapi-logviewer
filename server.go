@@ -306,6 +306,7 @@ func (s *server) handleStats(w http.ResponseWriter, r *http.Request) {
 	res := s.q.stats(statsFilter{
 		Since: since, Until: until,
 		Model: q.Get("model"), Token: q.Get("token"),
+		Stream: q.Get("stream"),
 	}, now.Location())
 
 	s.writeJSON(w, 200, map[string]any{

@@ -2,6 +2,7 @@ package main
 
 import (
 	"sort"
+	"strconv"
 	"time"
 )
 
@@ -25,13 +26,18 @@ type statsFilter struct {
 	Until int64
 	Model string
 	Token string
+	// Stream is "1" | "0" | "" - index-answerable (IsStream), so it satisfies
+	// the same rule as Model and Token. It pairs with the stream-share
+	// dimension: a reader who sees 90% streaming can slice to the other 10%.
+	Stream string
 }
 
 // toList projects onto the shared list filter so the walk, the dedupe, and the
 // predicates are literally the same code the list view uses. Only the
 // index-answerable fields are set - see the type comment.
 func (f statsFilter) toList() listFilter {
-	return listFilter{Model: f.Model, Token: f.Token, Since: f.Since, Until: f.Until}
+	return listFilter{Model: f.Model, Token: f.Token, Since: f.Since, Until: f.Until,
+		Stream: f.Stream}
 }
 
 // bucket is one point on the time series.
@@ -55,6 +61,23 @@ type bucket struct {
 	// second add, not a body read.
 	PromptTokens     int64 `json:"prompt_tokens"`
 	CompletionTokens int64 `json:"completion_tokens"`
+
+	// Cache-read and reasoning volume in the bucket, so the token trend can
+	// show how much of the input was served from cache rather than billed as
+	// fresh. Zero on indexes that predate the fields - the totals' CachedCount
+	// tells the UI whether that zero is real or a coverage gap.
+	CachedTokens    int64 `json:"cached_tokens"`
+	ReasoningTokens int64 `json:"reasoning_tokens"`
+
+	// Wall-clock latency (from the GIN line's duration string) and
+	// time-to-first-response (from the billing line's frt), carried as sums
+	// over the entries that reported each. Averages are taken over the counts,
+	// never over Requests - same coverage rule as TokenCount, and on this
+	// deployment LatencyCount is zero because GIN logs elsewhere.
+	LatSumMS int64 `json:"lat_sum_ms"`
+	LatCount int   `json:"lat_count"`
+	FRTSumMS int64 `json:"frt_sum_ms"`
+	FRTCount int   `json:"frt_count"`
 }
 
 // modelStat is one row of the model breakdown.
@@ -68,6 +91,39 @@ type modelStat struct {
 	// volume is made of. Same index-only cost as the bucket fields above.
 	PromptTokens     int64 `json:"prompt_tokens"`
 	CompletionTokens int64 `json:"completion_tokens"`
+
+	// Err and the latency accumulators let the breakdown rank by failure rate
+	// and by speed, not just volume - a model that is cheap but slow, or one
+	// that fails a fifth of its calls, reads very differently from its request
+	// rank. The rate the UI shows is err/(ok+err) per row, never err/requests:
+	// 63% of this archive predates the outcome field, and dividing by every
+	// request would read that silence as failure.
+	OK       int   `json:"ok"`
+	Err      int   `json:"err"`
+	LatSumMS int64 `json:"lat_sum_ms"`
+	LatCount int   `json:"lat_count"`
+	FRTSumMS int64 `json:"frt_sum_ms"`
+	FRTCount int   `json:"frt_count"`
+
+	// Cached input volume, so the model ranking can answer "which model's
+	// prompts are mostly cache reads". Not averaged - the totals carry the
+	// coverage count.
+	CachedTokens int64 `json:"cached_tokens"`
+}
+
+// chanStat is one row of the upstream-channel breakdown.
+//
+// Named by the resolved channel name when the resolver has one, else the
+// upstream host recorded in the index, else the bare id - the same ladder the
+// list view's chip uses. The label is resolved at query time (not stored) so a
+// renamed channel re-labels its history.
+type chanStat struct {
+	Name     string `json:"name"`
+	Requests int    `json:"requests"`
+	OK       int    `json:"ok"`
+	Err      int    `json:"err"`
+	Quota    int64  `json:"quota"`
+	Tokens   int64  `json:"tokens"`
 }
 
 // tokenStat is one row of the per-token spend breakdown.
@@ -109,6 +165,43 @@ type statsResult struct {
 	// QuotaCount is the same idea for spend: calls with no billing line carry
 	// no quota, and the average cost is over those that do.
 	QuotaCount int `json:"quota_count"`
+
+	// Cache-read and reasoning totals, each with its own coverage count -
+	// the pair rule from TokenCount again. CacheHitRate is computed by the UI
+	// as CachedTokens / PromptTokens over the records that reported both, so
+	// PromptTokens stays the denominator it already publishes.
+	CachedTokens    int64 `json:"cached_tokens"`
+	CachedCount     int   `json:"cached_count"`
+	ReasoningTokens int64 `json:"reasoning_tokens"`
+	ReasoningCount  int   `json:"reasoning_count"`
+
+	// Latency totals. LatSumMS/LatMaxMS are over LatCount calls whose GIN
+	// line carried a duration - zero on deployments (like this one) where gin
+	// logs elsewhere. FRT is the fallback that exists here: first-response
+	// time from the billing line, present on most billed calls.
+	LatSumMS int64 `json:"lat_sum_ms"`
+	LatMaxMS int64 `json:"lat_max_ms"`
+	LatCount int   `json:"lat_count"`
+	FRTSumMS int64 `json:"frt_sum_ms"`
+	FRTMaxMS int64 `json:"frt_max_ms"`
+	FRTCount int   `json:"frt_count"`
+
+	// Shape-of-traffic counters. Streamed/Tools count calls, ToolDefs sums
+	// the tool catalogue sizes so the UI can show both "how often tools are
+	// offered" and "how deep the offering is".
+	Streamed int `json:"streamed"`
+	Tools    int `json:"tools"`
+	ToolDefs int `json:"tool_defs"`
+
+	// Hours is requests by local hour of day (24 slots), DowHours by
+	// weekday-x-hour (Monday first), both over the selected range. The
+	// weekday rows let the heatmap keep weekends visible rather than folding
+	// them into one average.
+	Hours    []int   `json:"hours"`
+	DowHours [][]int `json:"dow_hours"`
+
+	// Channels is the upstream-channel breakdown, ranked by requests.
+	Channels []chanStat `json:"channels"`
 
 	// UnknownTime counts entries dropped for having no usable timestamp. They
 	// cannot be placed in a bucket, and matchIndex lets a zero epoch through
@@ -315,8 +408,64 @@ func foldModels(m map[string]*modelStat, limit int) []modelStat {
 		rest.Tokens += s.Tokens
 		rest.PromptTokens += s.PromptTokens
 		rest.CompletionTokens += s.CompletionTokens
+		rest.Err += s.Err
+		rest.OK += s.OK
+		rest.LatSumMS += s.LatSumMS
+		rest.LatCount += s.LatCount
+		rest.FRTSumMS += s.FRTSumMS
+		rest.FRTCount += s.FRTCount
+		rest.CachedTokens += s.CachedTokens
 	}
 	return append(out[:limit:limit], rest)
+}
+
+// topChanLimit bounds the channel breakdown. Same rationale as topTokenLimit:
+// one-colour bars, so the ceiling is vertical space, not palette size.
+const topChanLimit = 10
+
+// chanOther labels both the folded tail and calls that never reached a
+// channel - a request rejected by the distributor has neither id nor host, and
+// folding those into the biggest channel would manufacture its traffic.
+const chanOther = "other"
+const chanNone = "(无渠道)"
+
+func foldChans(m map[string]*chanStat, limit int) []chanStat {
+	out := make([]chanStat, 0, len(m))
+	for _, v := range m {
+		out = append(out, *v)
+	}
+	sort.Slice(out, func(a, b int) bool {
+		if out[a].Requests != out[b].Requests {
+			return out[a].Requests > out[b].Requests
+		}
+		return out[a].Name < out[b].Name
+	})
+	if len(out) <= limit {
+		return out
+	}
+	rest := chanStat{Name: chanOther}
+	for _, s := range out[limit:] {
+		rest.Requests += s.Requests
+		rest.OK += s.OK
+		rest.Err += s.Err
+		rest.Quota += s.Quota
+		rest.Tokens += s.Tokens
+	}
+	return append(out[:limit:limit], rest)
+}
+
+// latencyMS parses the GIN duration string ("1.234s", "58.2ms") into whole
+// milliseconds. Returns false for the empty/absent value so an unmeasured call
+// is a coverage gap, never a zero averaged in.
+func latencyMS(s string) (int64, bool) {
+	if s == "" {
+		return 0, false
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return 0, false
+	}
+	return d.Milliseconds(), true
 }
 
 // foldTokens is foldModels' twin, ranked by spend rather than by volume.
@@ -375,10 +524,15 @@ func (q *query) stats(f statsFilter, loc *time.Location) statsResult {
 	gran := granularityFor(f.Since, f.Until)
 
 	res := statsResult{Granularity: gran, Series: []bucket{}, Models: []modelStat{},
-		TokenStats: []tokenStat{}}
+		TokenStats: []tokenStat{}, Channels: []chanStat{},
+		Hours: make([]int, 24), DowHours: make([][]int, 7)}
+	for i := range res.DowHours {
+		res.DowHours[i] = make([]int, 24)
+	}
 	buckets := map[string]*bucket{}
 	models := map[string]*modelStat{}
 	tokens := map[string]*tokenStat{}
+	chans := map[string]*chanStat{}
 
 	q.eachMatch(f.toList(), func(_ string, e idxEntry) {
 		// No usable timestamp: unplaceable on the axis, and matchIndex lets a
@@ -390,7 +544,8 @@ func (q *query) stats(f statsFilter, loc *time.Location) statsResult {
 		}
 
 		res.Requests++
-		switch entryOutcome(e) {
+		oc := entryOutcome(e)
+		switch oc {
 		case outcomeOK:
 			res.OK++
 		case outcomeErr:
@@ -399,7 +554,39 @@ func (q *query) stats(f statsFilter, loc *time.Location) statsResult {
 			res.Unknown++
 		}
 
-		var q64, tok, pt, ct int64
+		// Shape of traffic. ToolCnt is the catalogue size (tools offered), so
+		// its average over Tools calls is the depth of an average tool call.
+		if e.IsStream {
+			res.Streamed++
+		}
+		if e.HasTools {
+			res.Tools++
+			res.ToolDefs += e.ToolCnt
+		}
+
+		// Latency: the GIN wall-clock when the deployment logs one, plus the
+		// billing line's first-response time. Each keeps its own count; both
+		// can be absent on one record.
+		var latMS, frtMS int64
+		var hasLat, hasFRT bool
+		if ms, ok := latencyMS(e.Latency); ok {
+			latMS, hasLat = ms, true
+			res.LatSumMS += ms
+			res.LatCount++
+			if ms > res.LatMaxMS {
+				res.LatMaxMS = ms
+			}
+		}
+		if e.FRTms != nil {
+			frtMS, hasFRT = int64(*e.FRTms), true
+			res.FRTSumMS += frtMS
+			res.FRTCount++
+			if frtMS > res.FRTMaxMS {
+				res.FRTMaxMS = frtMS
+			}
+		}
+
+		var q64, tok, pt, ct, cached, reasoning int64
 		if e.Quota != nil {
 			// Accumulate in the raw integer unit and divide once, at the edge.
 			// Converting per record would round 600k times.
@@ -420,6 +607,30 @@ func (q *query) stats(f statsFilter, loc *time.Location) statsResult {
 			res.Tokens += tok
 			res.TokenCount++
 		}
+		if e.Cached != nil {
+			cached = int64(*e.Cached)
+			res.CachedTokens += cached
+			res.CachedCount++
+		}
+		if e.Reasoning != nil {
+			reasoning = int64(*e.Reasoning)
+			res.ReasoningTokens += reasoning
+			res.ReasoningCount++
+		}
+
+		// Time-of-day shape. Both the hour histogram and the weekday-x-hour
+		// heatmap read the wall-clock string, not Epoch arithmetic - the same
+		// reason bucketKey does: the day boundary is the log's local clock.
+		if len(e.TS) >= 13 {
+			if h, err := strconv.Atoi(e.TS[11:13]); err == nil && h < 24 {
+				res.Hours[h]++
+				if t, err := time.ParseInLocation("20060102", dayOf(e.TS), loc); err == nil {
+					// Monday-first, matching weekStart.
+					dow := (int(t.Weekday()) + 6) % 7
+					res.DowHours[dow][h]++
+				}
+			}
+		}
 
 		key := bucketKey(e, gran, loc)
 		b := buckets[key]
@@ -432,7 +643,17 @@ func (q *query) stats(f statsFilter, loc *time.Location) statsResult {
 		b.Tokens += tok
 		b.PromptTokens += pt
 		b.CompletionTokens += ct
-		switch entryOutcome(e) {
+		b.CachedTokens += cached
+		b.ReasoningTokens += reasoning
+		if hasLat {
+			b.LatSumMS += latMS
+			b.LatCount++
+		}
+		if hasFRT {
+			b.FRTSumMS += frtMS
+			b.FRTCount++
+		}
+		switch oc {
 		case outcomeOK:
 			b.OK++
 		case outcomeErr:
@@ -455,6 +676,53 @@ func (q *query) stats(f statsFilter, loc *time.Location) statsResult {
 		ms.Tokens += tok
 		ms.PromptTokens += pt
 		ms.CompletionTokens += ct
+		ms.CachedTokens += cached
+		if oc == outcomeErr {
+			ms.Err++
+		} else if oc == outcomeOK {
+			ms.OK++
+		}
+		if hasLat {
+			ms.LatSumMS += latMS
+			ms.LatCount++
+		}
+		if hasFRT {
+			ms.FRTSumMS += frtMS
+			ms.FRTCount++
+		}
+
+		// Channel label: resolved name, else the recorded upstream host, else
+		// the bare id. Resolved here, per query, so a renamed channel
+		// re-labels its history - the index stores only the id.
+		ch := ""
+		if e.Chan != nil {
+			if q.ch != nil {
+				ch = q.ch.name(*e.Chan)
+			}
+			if ch == "" {
+				ch = "#" + strconv.Itoa(*e.Chan)
+			}
+		}
+		if ch == "" {
+			ch = e.Up
+		}
+		if ch == "" {
+			ch = chanNone
+		}
+		cs := chans[ch]
+		if cs == nil {
+			cs = &chanStat{Name: ch}
+			chans[ch] = cs
+		}
+		cs.Requests++
+		cs.Quota += q64
+		cs.Tokens += tok
+		switch oc {
+		case outcomeOK:
+			cs.OK++
+		case outcomeErr:
+			cs.Err++
+		}
 
 		// Per-token spend. The name is counted before it is defaulted, so
 		// TokenNameCount measures index coverage rather than the label the row
@@ -499,5 +767,6 @@ func (q *query) stats(f statsFilter, loc *time.Location) statsResult {
 
 	res.Models = foldModels(models, topModelLimit)
 	res.TokenStats = foldTokens(tokens, topTokenLimit)
+	res.Channels = foldChans(chans, topChanLimit)
 	return res
 }

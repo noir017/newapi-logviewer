@@ -127,6 +127,28 @@ type idxEntry struct {
 	// coverage instead of guessing.
 	PT *int `json:"pt,omitempty"`
 	CT *int `json:"ct,omitempty"`
+
+	// Cache-read and reasoning tokens, split out of PT/CT. Cached is the
+	// prompt_tokens_details.cached_tokens figure - for Anthropic records the
+	// parser has already merged cache_creation + cache_read into it (see
+	// anthropicUsage.toUsage), so there is one cache number, not two. On this
+	// deployment it dwarfs fresh input (a cached agent transcript reads ~500k
+	// tokens against ~100 fresh), which makes the cache hit rate the single
+	// most useful efficiency metric the stats page can show.
+	//
+	// Same pointer rule as PT/CT: nil means the record never reported the
+	// detail, zero means it reported none. Old indexes decode as nil and are
+	// counted as coverage gaps, never as zeroes.
+	Cached    *int `json:"cc,omitempty"`
+	Reasoning *int `json:"rt,omitempty"`
+
+	// Time to first response, milliseconds, from the billing line's frt. This
+	// is the latency signal that actually exists on this deployment: the GIN
+	// line carrying Latency goes to a different sink (see deriveOutcome), so
+	// Latency-based charts are empty here while FRT is on every billed call.
+	// Converted to integer ms at index time so the stats walk never parses a
+	// float per record.
+	FRTms *int `json:"ft,omitempty"`
 }
 
 // makeIdxEntry is the single definition of the list-row projection. reindex
@@ -156,6 +178,20 @@ func makeIdxEntry(r *Record, off, n int64) idxEntry {
 			v := *c
 			e.CT = &v
 		}
+		if d := r.Usage.PromptDetails; d != nil && d.CachedTokens != nil {
+			v := *d.CachedTokens
+			e.Cached = &v
+		}
+		if d := r.Usage.CompletionDetails; d != nil && d.ReasoningTokens != nil {
+			v := *d.ReasoningTokens
+			e.Reasoning = &v
+		}
+	}
+	// FRT arrives as seconds with sub-millisecond precision; the stats page
+	// reads it as ms, and rounding once here keeps the walk integer-only.
+	if r.FRT != nil && *r.FRT >= 0 {
+		v := int(*r.FRT*1000 + 0.5)
+		e.FRTms = &v
 	}
 	return e
 }
