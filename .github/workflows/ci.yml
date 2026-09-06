@@ -42,9 +42,9 @@ jobs:
           for i in $(seq 1 20); do
             curl -sf http://localhost:7070/logviewer/healthz && break || sleep 1
           done
-          # the fixture has 4 real calls; if parsing broke, this returns 0
+          # the fixture has 7 real calls; if parsing broke, this returns 0
           total=$(curl -sf "http://localhost:7070/logviewer/api/calls" | jq .total)
           echo "calls parsed: $total"
-          [ "$total" = "4" ] || { docker logs lv; exit 1; }
+          [ "$total" = "7" ] || { docker logs lv; exit 1; }
           curl -sf http://localhost:7070/logviewer/ | grep -q "New API" || exit 1
           docker rm -f lv
