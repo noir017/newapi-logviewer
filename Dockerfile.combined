@@ -9,7 +9,7 @@
 #
 # Pin the upstream tag rather than tracking :latest, so a rebuild does not
 # silently move New API versions underneath you.
-ARG NEWAPI_IMAGE=calciumion/new-api:latest
+ARG NEWAPI_IMAGE=calciumion/new-api:v1.0.0-rc.33
 ARG BUILDER=golang:1.24-alpine
 
 FROM ${BUILDER} AS build
