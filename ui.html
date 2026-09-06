@@ -201,6 +201,28 @@ body.view-stats .split{display:none}
 .sgrid .card2{margin-bottom:0}
 @media(max-width:980px){.sgrid{grid-template-columns:1fr}}
 
+/* Activity heatmap (weekday x hour). Plain HTML cells, not a canvas: 168
+   nodes is cheap, and a real element per cell gives hover and tooltips
+   without reimplementing hit-testing. Colour alpha carries the value, like
+   keeper's ActivityHeatmapGrid. */
+.hmap{display:grid;grid-template-columns:34px repeat(24,minmax(0,1fr));gap:3px;
+  align-items:center;margin-top:4px}
+.hmap .hl{color:var(--s-faint);font-size:10px;text-align:center;
+  font-variant-numeric:tabular-nums}
+.hmap .rl{color:var(--s-mute);font-size:10.5px;text-align:right;padding-right:2px}
+.hmap .cell{height:16px;border-radius:4px;background:rgba(255,255,255,.045)}
+.hmap .cell[data-v]:hover{outline:1px solid var(--s-line2)}
+.hmaplg{display:flex;align-items:center;gap:4px;color:var(--s-faint);
+  font-size:10.5px;justify-content:flex-end;margin-top:8px}
+.hmaplg i{width:13px;height:10px;border-radius:3px;display:inline-block}
+
+/* Composition doughnuts: two small rings side by side, each with its total in
+   the middle via the legend below the canvas. */
+.dnuts{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.dnut{position:relative;height:168px}
+.dnut .dlab{text-align:center;color:var(--s-mute);font-size:11.5px;margin-top:8px}
+@media(max-width:640px){.dnuts{grid-template-columns:1fr}}
+
 /* Distribution rows: rank numeral, name, a gradient bar with a rounded end,
    and a right-aligned figure. Rows stay HTML (not SVG) because names run long
    and ellipsis handles that far better than tspan arithmetic. */
@@ -437,6 +459,7 @@ pre.j{background:#0d1017;border:1px solid var(--line);border-radius:7px;padding:
     <span class="sep"></span>
     <select id="smodel"><option value="">全部模型</option></select>
     <select id="stoken"><option value="">全部令牌</option></select>
+    <select id="sstream"><option value="">流式+非流式</option><option value="1">仅流式</option><option value="0">仅非流式</option></select>
     <span class="who" id="srangelabel"></span>
   </div>
 </header>
@@ -1085,6 +1108,15 @@ function compact(n){
 // never disagree about what a quota unit is worth.
 const money = q => '$' + (q / 500000).toFixed(4);
 
+// Milliseconds read as seconds once they pass one: 1234ms is not scanned as a
+// duration, 1.2s is. Kept to one decimal at the small end so jitter reads as
+// jitter, not as false precision.
+const fmtMS = ms => ms == null ? '—'
+  : ms >= 60000 ? (ms / 60000).toFixed(1) + 'min'
+  : ms >= 1000 ? (ms / 1000).toFixed(1) + 's'
+  : Math.round(ms) + 'ms';
+const pct = (a, b) => b > 0 ? (100 * a / b).toFixed(1) + '%' : '—';
+
 // Chart palette for the stats view's warm dark surfaces (the --s-* custom
 // properties). Hardcoded here rather than read back from getComputedStyle so
 // the charts don't depend on the scoped cascade resolving at boot. The
@@ -1186,33 +1218,139 @@ function trendChart(canvas, labels, datasets, fmt){
   statsCharts.push(c);
 }
 
-// sortRows re-ranks the already-folded breakdown rows by a chosen field. The
+// lineChart draws rate/latency trends - the cases where a bar implies a volume
+// and the series is actually a ratio or a duration. fmt is the same
+// axis/tooltip formatter contract as trendChart's.
+function lineChart(canvas, labels, datasets, fmt, opts){
+  const o = opts || {};
+  const c = new Chart(canvas, {
+    type: 'line',
+    data: { labels, datasets: datasets.map(d => ({
+      label: d.label, data: d.data, borderColor: d.color,
+      backgroundColor: d.color + '22', borderWidth: 1.8,
+      pointRadius: 0, pointHitRadius: 8, tension: .3, spanGaps: false,
+    })) },
+    options: {
+      responsive: true, maintainAspectRatio: false, animation: false,
+      interaction: { mode: 'index', intersect: false },
+      scales: {
+        x: { grid: { display: false }, border: { color: CT.line },
+             ticks: { color: CT.dim2, font: { size: 10 }, maxRotation: 0,
+                      autoSkip: true, autoSkipPadding: 14 } },
+        y: { beginAtZero: true, max: o.max, grid: { color: CT.grid },
+             border: { display: false },
+             ticks: { color: CT.dim2, font: { size: 10 }, callback: v => fmt(v, true) } },
+      },
+      plugins: {
+        legend: { display: false },
+        tooltip: { backgroundColor: '#262320', borderColor: CT.line, borderWidth: 1,
+          titleColor: CT.dim2, bodyColor: CT.fg, padding: 10, cornerRadius: 10,
+          callbacks: { label: ctx => `${ctx.dataset.label}: ${fmt(ctx.parsed.y)}` } },
+      },
+    },
+  });
+  statsCharts.push(c);
+}
+
+// doughnutChart draws one composition ring. Centre text carries the headline
+// figure so the ring shows the split and the number survives without a hover.
+function doughnutChart(canvas, parts, center){
+  const c = new Chart(canvas, {
+    type: 'doughnut',
+    data: { labels: parts.map(p => p.label), datasets: [{
+      data: parts.map(p => p.value),
+      backgroundColor: parts.map(p => p.color),
+      borderColor: '#1d1b18', borderWidth: 2,
+    }] },
+    options: {
+      responsive: true, maintainAspectRatio: false, animation: false, cutout: '68%',
+      plugins: {
+        legend: { display: false },
+        tooltip: { backgroundColor: '#262320', borderColor: CT.line, borderWidth: 1,
+          titleColor: CT.dim2, bodyColor: CT.fg, padding: 10, cornerRadius: 10 },
+      },
+    },
+    plugins: [{
+      id: 'ctext',
+      afterDraw(ch){
+        const {ctx, chartArea: a} = ch;
+        if (!a) return;
+        ctx.save();
+        ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+        ctx.fillStyle = CT.fg; ctx.font = '700 17px system-ui';
+        ctx.fillText(center, (a.left + a.right) / 2, (a.top + a.bottom) / 2);
+        ctx.restore();
+      },
+    }],
+  });
+  statsCharts.push(c);
+}
+
+
+// sortRows re-ranks the already-folded breakdown rows by a chosen metric. The
 // server folds the long tail into one "other" row before sending, so this
 // reorders only the named rows — "other" (and an unnamed-token gap) stay pinned
 // to the bottom as the residual, and the rows still sum to the totals.
-function sortRows(rows, key, tail){
-  const k = r => r.model ?? r.token;
+// `metric` is an accessor rather than a field name because two of the model
+// rankings (error rate, average latency) are ratios of two fields each.
+function sortRows(rows, metric, tail){
+  const k = r => r.model ?? r.token ?? r.name;
   const named = rows.filter(r => !tail.includes(k(r)));
   const rest  = rows.filter(r =>  tail.includes(k(r)));
-  named.sort((a, b) => (b[key] - a[key]) || (b.requests - a.requests));
+  named.sort((a, b) => (metric(b) - metric(a)) || (b.requests - a.requests));
   return named.concat(rest);
 }
 
-// modelCard renders the model breakdown, rankable by request volume or token
-// volume. The bar is scaled to whichever metric it is sorted by, so the visual
-// order always matches the number beside it.
+// Per-model averages. Wall-clock latency is preferred where the deployment
+// logs it (GIN); otherwise the billing line's first-response time is the only
+// latency signal that exists — see the lat_sum_ms field comment in stats.go.
+const modelAvgMS = m => m.lat_count ? m.lat_sum_ms / m.lat_count
+                    : m.frt_count ? m.frt_sum_ms / m.frt_count : null;
+// Failure rate over recorded outcomes only. 63% of this archive predates the
+// outcome field; err/requests would read that silence as failure.
+const modelErrRate = m => (m.ok + m.err) ? m.err / (m.ok + m.err) : 0;
+
+// modelCard renders the model breakdown, rankable by request volume, token
+// volume, failure rate, or average latency. The bar is scaled to whichever
+// metric it is sorted by, so the visual order always matches the number
+// beside it.
 function modelCard(models){
-  const byTok = modelSort === 'tokens';
-  const rows = sortRows(models, byTok ? 'tokens' : 'requests', ['other', '(unknown)']);
-  const metric = r => byTok ? r.tokens : r.requests;
-  const max = Math.max(1, ...rows.map(metric));
+  const rows = sortRows(models, {
+    requests: m => m.requests,
+    tokens:   m => m.tokens,
+    err:      m => modelErrRate(m),
+    lat:      m => modelAvgMS(m) ?? -1,   // unmeasured sinks below measured-zero
+  }[modelSort] || (m => m.requests), ['other', '(unknown)']);
+  const metric = {
+    requests: m => m.requests,
+    tokens:   m => m.tokens,
+    err:      m => modelErrRate(m),
+    lat:      m => modelAvgMS(m) ?? 0,
+  }[modelSort] || (m => m.requests);
+  const max = Math.max(1e-9, ...rows.map(metric));
+  const label = {requests: '请求数', tokens: 'Token 量', err: '错误率', lat: '平均延迟'}[modelSort];
+  const main = {
+    requests: m => nfmt(m.requests),
+    tokens:   m => compact(m.tokens),
+    err:      m => pct(m.err, m.ok + m.err),
+    lat:      m => modelAvgMS(m) == null ? '—' : fmtMS(modelAvgMS(m)),
+  }[modelSort];
+  const sub = {
+    requests: m => money(m.quota),
+    tokens:   m => nfmt(m.requests) + ' 次',
+    err:      m => `${nfmt(m.err)} 失败 / ${nfmt(m.ok + m.err)} 次已记录`,
+    lat:      m => (m.lat_count ? `${nfmt(m.lat_count)} 次计时` :
+                    m.frt_count ? `首字 · ${nfmt(m.frt_count)} 次计时` : '无计时数据'),
+  }[modelSort];
   return `<div class="card2">
     <div class="hd"><div><h3>模型分布</h3>
-      <div class="cap">按${byTok ? 'Token 量' : '请求数'}排序 · 点击可在列表中筛选</div></div>
+      <div class="cap">按${label}排序 · 点击可在列表中筛选</div></div>
       <span class="grow"></span>
       <div class="segp sortsel">
-        <button data-msort="requests" class="${byTok ? '' : 'on'}">请求数</button>
-        <button data-msort="tokens" class="${byTok ? 'on' : ''}">Token 量</button>
+        <button data-msort="requests" class="${modelSort === 'requests' ? 'on' : ''}">请求数</button>
+        <button data-msort="tokens" class="${modelSort === 'tokens' ? 'on' : ''}">Token 量</button>
+        <button data-msort="err" class="${modelSort === 'err' ? 'on' : ''}">错误率</button>
+        <button data-msort="lat" class="${modelSort === 'lat' ? 'on' : ''}">延迟</button>
       </div></div>
     ${rows.length ? rows.map((m, i) => `
       <div class="mrow tkrow" data-model="${esc(m.model)}">
@@ -1222,8 +1360,8 @@ function modelCard(models){
           <div class="track"><div class="fill" style="width:${
             Math.max(1, 100 * metric(m) / max)}%"></div></div>
         </div>
-        <div class="vv">${byTok ? compact(m.tokens) : nfmt(m.requests)}<br>
-          <span class="vs">${byTok ? nfmt(m.requests) + ' 次' : money(m.quota)}</span></div>
+        <div class="vv">${main(m)}<br>
+          <span class="vs">${sub(m)}</span></div>
       </div>`).join('') : '<div class="cap">此范围内没有调用</div>'}
   </div>`;
 }
@@ -1232,7 +1370,7 @@ function modelCard(models){
 // volume — the two invert exactly as they do for models.
 function tokenCard(tks, d){
   const byTok = tokenSort === 'tokens';
-  const rows = sortRows(tks, byTok ? 'tokens' : 'quota', ['other', TOKEN_UNNAMED]);
+  const rows = sortRows(tks, byTok ? (t => t.tokens) : (t => t.quota), ['other', TOKEN_UNNAMED]);
   const metric = r => byTok ? r.tokens : r.quota;
   const max = Math.max(1, ...rows.map(metric));
   return `<div class="card2">
@@ -1271,6 +1409,59 @@ function tokenCard(tks, d){
   </div>`;
 }
 
+// chanCard renders the upstream-channel breakdown. Rows are NOT clickable:
+// the list view has no channel filter, so there is nothing to drill into, and
+// a dead affordance is worse than none.
+function chanCard(chans){
+  const max = Math.max(1, ...chans.map(c => c.requests));
+  return `<div class="card2">
+    <div class="hd"><div><h3>上游渠道</h3>
+      <div class="cap">按请求数排序 · 渠道名实时解析，改名会回溯生效</div></div></div>
+    ${chans.length ? chans.map((c, i) => {
+      const known = c.ok + c.err;
+      return `<div class="mrow tkrow" style="--ka:var(--s-green);cursor:default">
+        <span class="rk">${i + 1}</span>
+        <div>
+          <div class="nm" title="${esc(c.name)}">${esc(c.name)}</div>
+          <div class="track"><div class="fill" style="width:${
+            Math.max(1, 100 * c.requests / max)}%"></div></div>
+        </div>
+        <div class="vv">${nfmt(c.requests)} 次<br>
+          <span class="vs">${known ? pct(c.err, known) + ' 失败 · ' : ''}${money(c.quota)}</span></div>
+      </div>`;
+    }).join('') : '<div class="cap">此范围内没有调用</div>'}
+  </div>`;
+}
+
+// heatmapCard renders the weekday-x-hour activity grid. Colour alpha encodes
+// the count relative to the busiest cell, so the scale survives both a quiet
+// week and a launch day without a legend per range.
+function heatmapCard(dowHours){
+  const days = ['周一', '周二', '周三', '周四', '周五', '周六', '周日'];
+  const max = Math.max(1, ...dowHours.flat());
+  const total = dowHours.flat().reduce((a, b) => a + b, 0);
+  const head = [''].concat([...Array(24).keys()].map(h =>
+    `<span class="hl">${h % 6 === 0 ? h : ''}</span>`)).join('');
+  const rows = dowHours.map((row, d) =>
+    `<span class="rl">${days[d]}</span>` + row.map((v, h) => {
+      if (!v) return '<span class="cell"></span>';
+      const a = 0.15 + 0.85 * v / max;
+      return `<span class="cell" data-v="1" title="${days[d]} ${String(h).padStart(2, '0')}:00 · ${
+        nfmt(v)} 次" style="background:color-mix(in srgb,var(--s-blue) ${
+        Math.round(a * 100)}%,transparent)"></span>`;
+    }).join('')).join('');
+  return `<div class="card2">
+    <div class="hd"><div><h3>活动热力图</h3>
+      <div class="cap">星期 × 小时 · 共 ${nfmt(total)} 次 · 悬停查看单格</div></div></div>
+    <div class="hmap">${head}${rows}</div>
+    <div class="hmaplg">少
+      ${[0.15, 0.36, 0.57, 0.78, 1].map(a =>
+        `<i style="background:color-mix(in srgb,var(--s-blue) ${Math.round(a * 100)}%,transparent)"></i>`).join('')}
+      多</div>
+  </div>`;
+}
+
+
 // (The hand-written SVG bar renderer, its tooltip positioner and axis-label
 // thinner lived here until Chart.js took over; see the note at the top of this
 // section.)
@@ -1284,6 +1475,11 @@ const ICONS = {
   check: '<svg viewBox="0 0 24 24"><path d="M22 11.1V12a10 10 0 1 1-5.9-9.1"/><path d="M22 4 12 14l-3-3"/></svg>',
   bars: '<svg viewBox="0 0 24 24"><path d="M18 20V10M12 20V4M6 20v-6"/></svg>',
   percent: '<svg viewBox="0 0 24 24"><path d="M19 5 5 19"/><circle cx="6.5" cy="6.5" r="2.5"/><circle cx="17.5" cy="17.5" r="2.5"/></svg>',
+  clock: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>',
+  zap: '<svg viewBox="0 0 24 24"><path d="M13 2 3 14h7l-1 8 10-12h-7l1-8z"/></svg>',
+  wrench: '<svg viewBox="0 0 24 24"><path d="M14.7 6.3a4 4 0 0 0-5.4 5.4L3 18l3 3 6.3-6.3a4 4 0 0 0 5.4-5.4l-2.8 2.8-2.1-2.1 2.9-2.7z"/></svg>',
+  db: '<svg viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v14c0 1.7 3.6 3 8 3s8-1.3 8-3V5"/><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></svg>',
+  gauge: '<svg viewBox="0 0 24 24"><path d="M12 15l4-6"/><path d="M3.5 15a9 9 0 1 1 17 0"/></svg>',
 };
 
 // o: {cls, ka, icon, spark} — accent colour, icon, and an optional sparkline
@@ -1323,6 +1519,25 @@ function renderStats(d, rng){
   const unit = (d.quota && d.tokens)
     ? '$' + (d.quota / (500000 * d.tokens) * 1e6).toFixed(2) : '—';
 
+  // Cache hit rate: cache reads over total input, over records that reported
+  // tokens at all. prompt_tokens already includes the cached share (both
+  // OpenAI's accounting and the Anthropic merge in the parser), so the
+  // denominator is prompt_tokens as published.
+  const hitRate = (d.cached_count && d.prompt_tokens)
+    ? pct(d.cached_tokens, d.prompt_tokens) : '—';
+
+  // Daily averages over the resolved window — keeper's DailyAverageCard. Days
+  // are calendar days touched, not elapsed 24h periods, matching the bucket
+  // axis the reader is looking at.
+  const days = rng && rng.since ? Math.max(1, Math.round((rng.until - rng.since + 1) / 86400)) : 0;
+  const perDay = v => days ? compact(Math.round(v / days)) : '—';
+
+  // Latency figures. The GIN wall-clock is preferred where it exists; on this
+  // deployment it never does (gin logs to another sink), and the billing
+  // line's first-response time is the only latency signal — see stats.go.
+  const avgLat = d.lat_count ? d.lat_sum_ms / d.lat_count : null;
+  const avgFRT = d.frt_count ? d.frt_sum_ms / d.frt_count : null;
+
   const parts = [];
 
   if (d.unknown > 0){
@@ -1335,11 +1550,21 @@ function renderStats(d, rng){
     parts.push(`<div class="warnbox">索引中暂无 token 数据。运行
       <code>logviewer -reindex</code> 可从已归档的记录中回填。</div>`);
   }
+  // The cache/reasoning dimensions ride on the same one-time reindex. Shown
+  // only when the window has calls but no coverage, so an old index says why
+  // the hero reads "—" instead of rendering an honest-looking 0%.
+  if (d.cached_count === 0 && d.requests > 0){
+    parts.push(`<div class="warnbox">索引中暂无缓存/推理 token 数据。运行
+      <code>logviewer -reindex</code> 可从已归档的记录中回填（全量约 5-10 分钟，
+      需停机窗口）；在此之前相关区块显示为「—」。</div>`);
+  }
 
   // Spend and token volume are co-heroes: the whole point of this page is that
   // the two do not track each other (a cache-read token is billed at a fraction
-  // of a fresh one), so neither is a subtitle of the other. Each carries a
-  // sparkline of its own series so the headline shows its shape.
+  // of a fresh one), so neither is a subtitle of the other. The cache hit rate
+  // joins them as the third hero: on this deployment cache reads dwarf fresh
+  // input, and the rate is the one number that says whether the caching is
+  // working at all. Each carries a sparkline of its own series.
   parts.push(`<div class="kpis heros">
     ${kpi('总花费', money(d.quota), `${nfmt(d.quota_count)} 次计费`,
       {cls: 'hero', ka: 'var(--s-blue)', icon: 'dollar', spark: 'c-spark-spend'})}
@@ -1347,6 +1572,10 @@ function renderStats(d, rng){
       d.token_count ? `入 ${compact(d.prompt_tokens)} · 出 ${compact(d.completion_tokens)}`
                     : '索引未记录',
       {cls: 'hero', ka: 'var(--s-violet)', icon: 'layers', spark: 'c-spark-tok'})}
+    ${kpi('缓存命中率', hitRate,
+      d.cached_count ? `缓存读 ${compact(d.cached_tokens)} / 输入 ${compact(d.prompt_tokens)}`
+                     : '索引未记录',
+      {cls: 'hero', ka: 'var(--s-green)', icon: 'db', spark: 'c-spark-cache'})}
   </div>`);
   parts.push(`<div class="kpis">
     ${kpi('请求数', nfmt(d.requests), gran + ' · ' + s.length + ' 个区间',
@@ -1362,6 +1591,41 @@ function renderStats(d, rng){
       {ka: 'var(--s-blue)', icon: 'dollar'})}
   </div>`);
 
+  // Performance and shape-of-traffic row. Each tile carries its own coverage
+  // count so a "—" is attributable: the number missing is never the number
+  // the deployment is too quiet to produce, it is the one the log never wrote.
+  parts.push(`<div class="kpis">
+    ${kpi('平均延迟', avgLat == null ? '—' : fmtMS(avgLat),
+      d.lat_count ? `${nfmt(d.lat_count)} 次计时 · 峰值 ${fmtMS(d.lat_max_ms)}`
+                  : '本部署无 GIN 行，见首字延迟',
+      {ka: 'var(--s-amber)', icon: 'clock'})}
+    ${kpi('平均首字延迟', avgFRT == null ? '—' : fmtMS(avgFRT),
+      d.frt_count ? `${nfmt(d.frt_count)} 次计时 · 峰值 ${fmtMS(d.frt_max_ms)}` : '无计费记录',
+      {ka: 'var(--s-amber)', icon: 'gauge'})}
+    ${kpi('流式占比', pct(d.streamed, d.requests),
+      d.requests ? `${nfmt(d.streamed)} 流式 / ${nfmt(d.requests - d.streamed)} 非流式` : '',
+      {ka: 'var(--s-blue)', icon: 'zap'})}
+    ${kpi('工具调用占比', pct(d.tools, d.requests),
+      d.tools ? `平均每次携带 ${(d.tool_defs / d.tools).toFixed(1)} 个工具定义` : '无工具调用',
+      {ka: 'var(--s-violet)', icon: 'wrench'})}
+    ${kpi('推理 Token', d.reasoning_count ? compact(d.reasoning_tokens) : '—',
+      d.reasoning_count ? `占输出 ${pct(d.reasoning_tokens, d.completion_tokens)}` : '索引未记录',
+      {ka: 'var(--s-violet)', icon: 'layers'})}
+  </div>`);
+
+  // Daily averages — keeper's DailyAverageCard, computed over the resolved
+  // window rather than fetched, so they follow the custom range exactly.
+  parts.push(`<div class="kpis">
+    ${kpi('日均请求', perDay(d.requests), `窗口 ${days || '—'} 天`,
+      {ka: 'var(--s-green)', icon: 'activity'})}
+    ${kpi('日均 Token', d.token_count ? perDay(d.tokens) : '—', '按已上报记录',
+      {ka: 'var(--s-violet)', icon: 'layers'})}
+    ${kpi('日均缓存读', d.cached_count ? perDay(d.cached_tokens) : '—', '缓存命中节省的主要来源',
+      {ka: 'var(--s-green)', icon: 'db'})}
+    ${kpi('日均花费', d.quota_count ? money(Math.round(d.quota / Math.max(days, 1))) : '—',
+      `${nfmt(d.quota_count)} 次计费`, {ka: 'var(--s-blue)', icon: 'dollar'})}
+  </div>`);
+
   // Spend trend.
   parts.push(`<div class="card2">
     <div class="hd"><div><h3>花费趋势</h3><div class="cap">${gran} · 单位美元</div></div>
@@ -1372,15 +1636,27 @@ function renderStats(d, rng){
   </div>`);
 
   // Token usage trend and request volume share one two-column band. The token
-  // chart stacks input over output so the shape shows both the volume and its
-  // composition; the two are billed very differently, so one opaque total would
-  // hide the mix.
+  // chart stacks 缓存读 / 新输入 / 输出 once the cache fields have coverage:
+  // prompt_tokens already includes the cached share, so splitting it out is
+  // what makes "the cache is doing the work" visible instead of inflating the
+  // input bar. Without coverage it falls back to the plain input/output split.
+  const hasCache = (d.cached_count || 0) > 0;
+  const tokDatasets = hasCache ? [
+    {label: '缓存读', data: s.map(b => b.cached_tokens), color: '#34d399'},
+    {label: '新输入', data: s.map(b => Math.max(0, b.prompt_tokens - b.cached_tokens)), color: CT.input},
+    {label: '输出', data: s.map(b => b.completion_tokens), color: CT.output},
+  ] : [
+    {label: '输入', data: s.map(b => b.prompt_tokens), color: CT.input},
+    {label: '输出', data: s.map(b => b.completion_tokens), color: CT.output},
+  ];
   parts.push(`<div class="sgrid">
     <div class="card2">
-      <div class="hd"><div><h3>Token 用量趋势</h3><div class="cap">${gran} · 输入 / 输出堆叠</div></div>
+      <div class="hd"><div><h3>Token 用量趋势</h3>
+        <div class="cap">${gran} · ${hasCache ? '缓存读 / 新输入 / 输出' : '输入 / 输出'} 堆叠</div></div>
         <span class="grow"></span>
         <div class="lg">
-          <span><i style="background:var(--s-blue)"></i>输入</span>
+          ${hasCache ? '<span><i style="background:var(--s-green)"></i>缓存读</span>' : ''}
+          <span><i style="background:var(--s-blue)"></i>${hasCache ? '新输入' : '输入'}</span>
           <span><i style="background:var(--s-amber)"></i>输出</span>
         </div>
         <button class="lnk" data-tbl="t-tok">表格</button></div>
@@ -1401,7 +1677,53 @@ function renderStats(d, rng){
     </div>
   </div>`);
 
+  // Rates and durations trend as lines, not bars: a bar implies a volume, and
+  // neither a success rate nor a latency is one. Success rate uses the same
+  // known-outcome denominator as the KPI; buckets with no recorded outcome are
+  // null and break the line rather than plotting a fabricated 0%.
+  parts.push(`<div class="sgrid">
+    <div class="card2">
+      <div class="hd"><div><h3>成功率趋势</h3><div class="cap">${gran} · 仅计已记录状态的调用</div></div>
+        <span class="grow"></span>
+        <button class="lnk" data-tbl="t-perf">表格</button></div>
+      <div class="chartbox"><canvas id="c-ok"></canvas></div>
+      <div class="tblwrap" id="t-perf"></div>
+    </div>
+    <div class="card2">
+      <div class="hd"><div><h3>延迟趋势</h3>
+        <div class="cap">${gran} · 平均延迟（GIN）与平均首字延迟（计费）</div></div>
+        <span class="grow"></span>
+        <div class="lg">
+          <span><i style="background:var(--s-amber)"></i>平均延迟</span>
+          <span><i style="background:var(--s-violet)"></i>平均首字</span>
+        </div></div>
+      <div class="chartbox"><canvas id="c-lat"></canvas></div>
+    </div>
+  </div>`);
+
+  // Time-of-day shape and call composition. The hours histogram is the range's
+  // own; the doughnuts show the stream/tools mix that their KPI tiles count.
+  parts.push(`<div class="sgrid">
+    <div class="card2">
+      <div class="hd"><div><h3>时段分布</h3><div class="cap">24 小时 · 本时区</div></div></div>
+      <div class="chartbox" style="height:170px"><canvas id="c-hours"></canvas></div>
+    </div>
+    <div class="card2">
+      <div class="hd"><div><h3>调用构成</h3><div class="cap">流式与工具调用占比</div></div></div>
+      <div class="dnuts">
+        <div><div class="dnut"><canvas id="c-dstream"></canvas></div>
+          <div class="dlab">流式 ${nfmt(d.streamed)} · 非流式 ${nfmt(d.requests - d.streamed)}</div></div>
+        <div><div class="dnut"><canvas id="c-dtools"></canvas></div>
+          <div class="dlab">含工具 ${nfmt(d.tools)} · 不含 ${nfmt(d.requests - d.tools)}</div></div>
+      </div>
+    </div>
+  </div>`);
+
+  parts.push(heatmapCard(d.dow_hours || []));
+
   parts.push(`<div class="sgrid">${modelCard(models)}${tokenCard(d.tokens_by_token || [], d)}</div>`);
+
+  parts.push(chanCard(d.channels || []));
 
   if (d.unknown_time > 0){
     parts.push(`<div class="note">另有 ${nfmt(d.unknown_time)} 条记录没有可用时间戳，
@@ -1420,21 +1742,49 @@ function renderStats(d, rng){
 
   trendChart($('#c-spend'), s.map(b => b.label),
     [{label: '花费', data: s.map(b => b.quota / 500000), color: CT.spend, grad: true}], dollars);
-  trendChart($('#c-tok'), s.map(b => b.label), [
-    {label: '输入', data: s.map(b => b.prompt_tokens), color: CT.input},
-    {label: '输出', data: s.map(b => b.completion_tokens), color: CT.output},
-  ], toks);
+  trendChart($('#c-tok'), s.map(b => b.label), tokDatasets, toks);
   trendChart($('#c-req'), s.map(b => b.label), [
     {label: '成功', data: s.map(b => b.ok), color: CT.ok},
     {label: '失败', data: s.map(b => b.err), color: CT.err},
     {label: '未记录', data: s.map(b => b.unknown), color: CT.unk},
   ], count);
 
+  // Success rate per bucket over recorded outcomes; a bucket with none is a
+  // gap in the line, not a 0% someone would escalate on.
+  lineChart($('#c-ok'), s.map(b => b.label), [{
+    label: '成功率', color: '#34d399',
+    data: s.map(b => (b.ok + b.err) ? 100 * b.ok / (b.ok + b.err) : null),
+  }], (v, axis) => axis ? v.toFixed(0) + '%' : v.toFixed(1) + '%', {max: 100});
+
+  // Latency trend: the GIN wall-clock where it exists, the billing first-
+  // response time as the always-present fallback. Both datasets are drawn and
+  // the empty one simply leaves no line.
+  lineChart($('#c-lat'), s.map(b => b.label), [
+    {label: '平均延迟', color: '#fbbf24',
+     data: s.map(b => b.lat_count ? b.lat_sum_ms / b.lat_count : null)},
+    {label: '平均首字', color: '#a78bfa',
+     data: s.map(b => b.frt_count ? b.frt_sum_ms / b.frt_count : null)},
+  ], (v, axis) => axis ? fmtMS(v) : fmtMS(v));
+
+  trendChart($('#c-hours'), [...Array(24).keys()].map(h => h + ':00'),
+    [{label: '请求', data: d.hours || [], color: CT.spend, grad: true}], count);
+
+  doughnutChart($('#c-dstream'), [
+    {label: '流式', value: d.streamed, color: '#6ea8fe'},
+    {label: '非流式', value: d.requests - d.streamed, color: '#3a3530'},
+  ], pct(d.streamed, d.requests));
+  doughnutChart($('#c-dtools'), [
+    {label: '含工具', value: d.tools, color: '#a78bfa'},
+    {label: '不含工具', value: d.requests - d.tools, color: '#3a3530'},
+  ], pct(d.tools, d.requests));
+
   // Hero sparklines — one point per bucket, so a single-bucket range draws
   // nothing meaningful and is skipped.
   if (s.length > 1){
     sparkline($('#c-spark-spend'), s.map(b => b.quota / 500000), CT.spend);
     sparkline($('#c-spark-tok'), s.map(b => b.tokens), '#a78bfa');
+    sparkline($('#c-spark-cache'),
+      s.map(b => b.prompt_tokens ? 100 * b.cached_tokens / b.prompt_tokens : 0), '#34d399');
   }
 
   // Table twins. Built with textContent (see fillTable), never innerHTML: model
@@ -1480,7 +1830,7 @@ function statsParams(){
   const btn = document.querySelector('#srange button.on');
   const r = btn ? btn.dataset.r : '7d';
   const p = new URLSearchParams({range: r, model: $('#smodel').value,
-                                 token: $('#stoken').value});
+                                 token: $('#stoken').value, stream: $('#sstream').value});
   if (r === 'custom'){
     const a = toEpoch($('#sfrom').value), b = toEpoch($('#sto').value);
     if (a) p.set('since', a);
@@ -1553,7 +1903,7 @@ $('#srange').addEventListener('click', e => {
   loadStats();
 });
 
-['#sfrom', '#sto', '#smodel', '#stoken'].forEach(s =>
+['#sfrom', '#sto', '#smodel', '#stoken', '#sstream'].forEach(s =>
   $(s).addEventListener('change', () => loadStats()));
 
 $('#stats').addEventListener('click', e => {
