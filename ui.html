@@ -96,45 +96,129 @@ label.ck input{width:13px;height:13px;accent-color:var(--acc)}
 /* Its own scroll container. body is overflow:hidden and .split is sized from
    --hdr, so a stats pane that grew the document would be unscrollable — content
    below the fold simply unreachable. */
-.stats{height:calc(100vh - var(--hdr));overflow-y:auto;padding:16px 20px 48px;display:none}
+.stats{height:calc(100vh - var(--hdr));overflow-y:auto;display:none;
+  background:
+    radial-gradient(1100px 460px at 12% -10%, rgba(91,157,255,.10), transparent 58%),
+    radial-gradient(820px 420px at 100% 0%, rgba(163,113,247,.07), transparent 52%),
+    var(--bg)}
 body.view-stats .stats{display:block}
 body.view-stats .split{display:none}
 /* Refetch holds the previous render rather than flashing a skeleton. */
 .stats.busy{opacity:.55;transition:opacity .12s}
 
-.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;margin-bottom:16px}
-.kpi{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px 14px}
-.kpi .lb{color:var(--dim2);font-size:11.5px;margin-bottom:5px}
+/* Keeper-derived design layer, scoped to the stats view so the list/detail
+   pages keep their own palette: warm dark surfaces, wide radii, pill controls,
+   and a centred measure instead of the list's edge-to-edge density. */
+.swrap{max-width:1220px;margin:0 auto;padding:22px 20px 56px}
+.stats, #statsfilters{
+  --s-card:#1d1b18; --s-card2:#262320; --s-line:#3a3530; --s-line2:#4a453f;
+  --s-text:#f6f4f1; --s-dim:#c9c3bb; --s-mute:#9c958d; --s-faint:#6f6962;
+  --s-blue:#6ea8fe; --s-violet:#a78bfa; --s-amber:#fbbf24;
+  --s-green:#34d399; --s-red:#f87171; --s-grey:#8a857d;
+  --s-r:20px;
+}
+.stats{color:var(--s-text)}
+
+/* Pill segmented control (keeper's connected tab bar): a rounded shell holding
+   capsule buttons, the active one raised on a lighter surface. */
+.segp{display:inline-flex;align-items:center;gap:2px;padding:3px;
+  border:1px solid var(--s-line);border-radius:999px;
+  background:var(--s-card);box-shadow:inset 0 1px 0 rgba(255,255,255,.04)}
+.segp button{border:none;border-radius:999px;background:transparent;
+  color:var(--s-mute);font-size:11.5px;font-weight:600;padding:4px 12px;
+  cursor:pointer;transition:background .15s,color .15s;white-space:nowrap}
+.segp button:hover{color:var(--s-text);background:rgba(255,255,255,.05)}
+.segp button.on{background:var(--s-card2);color:var(--s-text);
+  box-shadow:0 2px 8px rgba(0,0,0,.35)}
+
+/* The stats filter row reuses the header's one-line budget (--hdr is fixed),
+   so the pills here stay at the header's control height, not the page's. */
+#statsfilters .seg{border:none;background:none;padding:0}
+#statsfilters select{background:var(--s-card);border-color:var(--s-line);
+  border-radius:999px;padding:5px 12px;color:var(--s-dim)}
+#statsfilters select:focus{border-color:var(--s-blue)}
+#statsfilters input[type=datetime-local]{background:var(--s-card);
+  border-color:var(--s-line);border-radius:999px;padding:4px 10px;color:var(--s-dim)}
+#srangelabel{color:var(--s-faint)}
+
+/* KPI cards: keeper's stat card — accent strip bleeding in from the top-left
+   corner, a radial glow of the same hue, wide radius, and a hover lift. The
+   accent hue is per-card via --acc-* custom properties. */
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(168px,1fr));
+  gap:12px;margin-bottom:14px}
+/* The co-hero pair gets its own wider band above the secondary grid. */
+.kpis.heros{grid-template-columns:repeat(auto-fit,minmax(280px,1fr))}
+.kpi{position:relative;overflow:hidden;background:var(--s-card);
+  border:1px solid var(--s-line);border-radius:var(--s-r);
+  padding:14px 16px 13px;display:flex;flex-direction:column;gap:2px;
+  transition:transform .15s ease,border-color .15s ease,box-shadow .15s ease}
+.kpi::before{content:"";position:absolute;top:0;left:0;right:0;height:3px;
+  background:linear-gradient(90deg,transparent,var(--ka,var(--s-blue)) 18%,
+    color-mix(in srgb,var(--ka,var(--s-blue)) 55%,transparent) 55%,transparent 88%)}
+.kpi::after{content:"";position:absolute;inset:0;pointer-events:none;
+  background:radial-gradient(130% 120% at 10% 0%,
+    color-mix(in srgb,var(--ka,var(--s-blue)) 13%,transparent),transparent 60%)}
+.kpi:hover{transform:translateY(-2px);border-color:var(--s-line2);
+  box-shadow:0 12px 30px rgba(0,0,0,.35)}
+.kpi>*{position:relative}
+.kpi .lb{color:var(--s-mute);font-size:11.5px;font-weight:600;letter-spacing:.02em;
+  display:flex;align-items:center;gap:7px;margin-bottom:6px}
+.kpi .ic{width:24px;height:24px;border-radius:8px;display:grid;place-items:center;
+  flex:none;color:var(--ka,var(--s-blue));
+  background:color-mix(in srgb,var(--ka,var(--s-blue)) 14%,var(--s-card));
+  border:1px solid color-mix(in srgb,var(--ka,var(--s-blue)) 30%,transparent)}
+.kpi .ic svg{width:13px;height:13px;stroke:currentColor;fill:none;
+  stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
 /* Proportional figures, not tabular: tabular-nums gives every digit the width of
    a zero, which reads loose at display sizes. Tabular is for the table below. */
-.kpi .vl{font-size:23px;font-weight:600;line-height:1.15;letter-spacing:-.2px}
-.kpi .sub{color:var(--dim2);font-size:11px;margin-top:3px}
-.kpi.hero .vl{font-size:34px}
-.kpi .vl.dim{color:var(--dim2);font-weight:500}
+.kpi .vl{font-size:22px;font-weight:700;line-height:1.15;letter-spacing:-.3px;
+  color:var(--s-text)}
+.kpi .sub{color:var(--s-faint);font-size:11px;margin-top:3px}
+.kpi.hero .vl{font-size:30px;font-weight:800}
+.kpi .vl.dim{color:var(--s-faint);font-weight:500}
+/* The hero pair carries a sparkline of its own series, so the headline number
+   shows its shape, not just its size. */
+.kpi .spark{margin:8px -4px -4px;height:40px;position:relative}
 
-.card2{background:var(--panel);border:1px solid var(--line);border-radius:10px;
-  padding:13px 15px 15px;margin-bottom:14px}
-.card2 h3{font-size:12.5px;margin:0 0 2px;font-weight:600}
-.card2 .cap{color:var(--dim2);font-size:11.5px;margin-bottom:10px}
+/* Section cards. */
+.card2{background:var(--s-card);border:1px solid var(--s-line);
+  border-radius:var(--s-r);padding:16px 18px 16px;margin-bottom:14px}
+.card2 h3{font-size:13.5px;margin:0 0 2px;font-weight:700;color:var(--s-text)}
+.card2 .cap{color:var(--s-faint);font-size:11.5px;margin-bottom:12px}
 .card2 .hd{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
 .card2 .hd .grow{flex:1}
-.lg{display:flex;gap:12px;align-items:center;flex-wrap:wrap;font-size:11.5px;color:var(--dim)}
-.lg i{width:9px;height:9px;border-radius:2px;display:inline-block;margin-right:4px;vertical-align:-1px}
+.lg{display:flex;gap:12px;align-items:center;flex-wrap:wrap;font-size:11.5px;color:var(--s-mute)}
+.lg i{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:5px}
 /* Chart.js draws into a canvas that needs an explicitly sized, positioned parent;
    it fills the box and resizes with the window from there. */
-.chartbox{position:relative;height:200px;width:100%}
-/* Sort toggle on the breakdown cards: a pair of small pills reusing .seg. */
-.sortsel button{font-size:11px;padding:3px 9px}
+.chartbox{position:relative;height:220px;width:100%}
+/* Sort toggle on the breakdown cards reuses the pill segmented control. */
+.sortsel button{font-size:11px;padding:3px 11px}
+/* Two-column band for paired cards (token trend + request volume, model +
+   token breakdowns): same information, half the scroll. */
+.sgrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;
+  margin-bottom:14px}
+.sgrid .card2{margin-bottom:0}
+@media(max-width:980px){.sgrid{grid-template-columns:1fr}}
 
-/* Model rows are a list, not an SVG: names run long and HTML ellipsis handles
-   that far better than tspan arithmetic. */
-.mrow{display:grid;grid-template-columns:1fr 76px;gap:10px;align-items:center;
-  padding:5px 0;cursor:pointer;border-radius:5px}
-.mrow:hover{background:var(--panel2)}
-.mrow .nm{font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.mrow .track{height:7px;background:#20242e;border-radius:4px;overflow:hidden;margin-top:4px}
-.mrow .fill{height:100%;background:var(--c-1);border-radius:4px}
-.mrow .vv{text-align:right;font-size:11.5px;color:var(--dim);font-variant-numeric:tabular-nums}
+/* Distribution rows: rank numeral, name, a gradient bar with a rounded end,
+   and a right-aligned figure. Rows stay HTML (not SVG) because names run long
+   and ellipsis handles that far better than tspan arithmetic. */
+.mrow{display:grid;grid-template-columns:22px 1fr 86px;gap:10px;align-items:center;
+  padding:6px 8px;margin:0 -8px;cursor:pointer;border-radius:10px}
+.mrow:hover{background:var(--s-card2)}
+.mrow .rk{color:var(--s-faint);font-size:10.5px;font-weight:700;text-align:center;
+  font-variant-numeric:tabular-nums}
+.mrow .nm{font-size:12.5px;color:var(--s-text);overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap}
+.mrow .track{height:6px;background:rgba(255,255,255,.06);border-radius:99px;
+  overflow:hidden;margin-top:5px}
+.mrow .fill{height:100%;border-radius:99px;
+  background:linear-gradient(90deg,
+    color-mix(in srgb,var(--ka,var(--s-blue)) 62%,transparent),var(--ka,var(--s-blue)))}
+.mrow .vv{text-align:right;font-size:12px;color:var(--s-dim);line-height:1.35;
+  font-variant-numeric:tabular-nums}
+.mrow .vv .vs{color:var(--s-faint);font-size:10.5px}
 
 /* Token rows reuse .mrow's geometry with a wider value column: the figure there
    is money ("$12.3456"), not a request count, and it must not wrap under its own
@@ -144,27 +228,41 @@ body.view-stats .split{display:none}
    colour (green, see .tk/.tv/.tn below), and a token row wearing it inherited
    green names from a rule about pretty-printed JSON. Two different meanings of
    "token" in one stylesheet; this one spells out which. */
-.mrow.tkrow{grid-template-columns:1fr 104px}
+.mrow.tkrow{grid-template-columns:22px 1fr 112px}
+.mrow{--ka:var(--s-violet)}
+.mrow.tkrow{--ka:var(--s-amber)}
 /* The unnamed row is a measurement gap, not a token. Grey it the same way the
    charts grey an unrecorded outcome, and drop the affordance: there is nothing
    to filter by, since the name is exactly what is missing. */
 .mrow.na{cursor:default}
-.mrow.na .nm{color:var(--dim2)}
-.mrow.na .fill{background:var(--c-unk)}
+.mrow.na .nm{color:var(--s-faint)}
+.mrow.na .fill{background:var(--s-grey)}
 .mrow.na:hover{background:none}
 
 /* The table twin. Every value a tooltip shows is reachable here without
    hovering, which is what keeps the charts from gating their own data. */
 .tbl{width:100%;border-collapse:collapse;font-size:11.5px;font-variant-numeric:tabular-nums}
-.tbl th,.tbl td{text-align:right;padding:3px 8px;border-bottom:1px solid #1e222b;white-space:nowrap}
+.tbl th,.tbl td{text-align:right;padding:6px 10px;white-space:nowrap;
+  border-bottom:1px solid color-mix(in srgb,var(--s-line) 55%,transparent)}
+.tbl tbody tr:last-child td{border-bottom:none}
 .tbl th:first-child,.tbl td:first-child{text-align:left}
-.tbl th{color:var(--dim2);font-weight:500;position:sticky;top:0;background:var(--panel)}
-.tblwrap{max-height:260px;overflow:auto;margin-top:8px;display:none}
+.tbl th{color:var(--s-mute);font-weight:600;position:sticky;top:0;
+  background:var(--s-card2)}
+.tbl td{color:var(--s-dim)}
+.tbl tbody tr{transition:background .12s}
+.tbl tbody tr:hover{background:var(--s-card2)}
+.tblwrap{max-height:280px;overflow:auto;margin-top:10px;display:none;
+  border:1px solid var(--s-line);border-radius:12px}
 .tblwrap.on{display:block}
-.lnk{background:none;border:none;color:var(--dim2);font-size:11.5px;padding:2px 4px;cursor:pointer}
-.lnk:hover{color:var(--acc)}
+.lnk{background:transparent;border:1px solid var(--s-line);border-radius:999px;
+  color:var(--s-mute);font-size:11px;font-weight:600;padding:3px 11px;cursor:pointer;
+  transition:color .15s,border-color .15s}
+.lnk:hover{color:var(--s-text);border-color:var(--s-line2)}
 
-.note{color:var(--dim2);font-size:11.5px;margin:-4px 0 12px}
+.note{color:var(--s-faint);font-size:11.5px;margin:2px 0 12px}
+.stats .warnbox{background:rgba(210,153,34,.10);border:1px solid rgba(210,153,34,.35);
+  color:#e3b341;border-radius:12px;padding:9px 13px;font-size:11.5px;margin-bottom:12px}
+.stats .warnbox code{color:#f0c36a}
 .warnbox{background:#1d1a0e;border:1px solid #4a3a12;color:#e3b341;border-radius:8px;
   padding:8px 11px;font-size:11.5px;margin-bottom:12px}
 
@@ -326,7 +424,7 @@ pre.j{background:#0d1017;border:1px solid var(--line);border-radius:7px;padding:
        96px that .split and .stats both subtract from the viewport, so a taller
        row would push content past the bottom of an unscrollable body. -->
   <div class="filters" id="statsfilters" style="display:none">
-    <div class="seg" id="srange">
+    <div class="seg segp" id="srange">
       <button data-r="today">今天</button>
       <button data-r="7d" class="on">7 日</button>
       <button data-r="30d">30 日</button>
@@ -987,36 +1085,84 @@ function compact(n){
 // never disagree about what a quota unit is worth.
 const money = q => '$' + (q / 500000).toFixed(4);
 
-// Chart palette pulled from the CSS custom properties, so the charts follow the
-// same colours — and the measured CVD separation behind them — as the rest of
-// the page instead of hardcoding a second copy.
-function cssVar(n){ return getComputedStyle(document.documentElement).getPropertyValue(n).trim(); }
+// Chart palette for the stats view's warm dark surfaces (the --s-* custom
+// properties). Hardcoded here rather than read back from getComputedStyle so
+// the charts don't depend on the scoped cascade resolving at boot. The
+// input/output pair stays blue+amber: it is the colour-blind-safe pair, and
+// blue+red would read as ok/fail.
 const CT = {
-  spend:  cssVar('--c-1'),
-  input:  cssVar('--c-1'),    // 输入 token
-  output: cssVar('--tool'),   // 输出 token — blue+amber is the colour-blind-safe
-                              // pair; NOT --c-1/--c-err, which would read as ok/fail
-  ok:  cssVar('--c-1'), err: cssVar('--c-err'), unk: cssVar('--c-unk'),
-  grid: cssVar('--grid'), line: cssVar('--line'), dim2: cssVar('--dim2'), fg: cssVar('--fg'),
+  spend:  '#6ea8fe',
+  input:  '#6ea8fe',    // 输入 token
+  output: '#fbbf24',    // 输出 token
+  ok:  '#6ea8fe', err: '#f87171', unk: '#8a857d',
+  grid: 'rgba(255,255,255,.055)', line: '#3a3530', dim2: '#6f6962', fg: '#f6f4f1',
 };
+
+// A vertical fade for single-series bars: solid at the data end, translucent
+// at the baseline, so the mark reads as rising out of the grid rather than
+// sitting on it. Scriptable because the gradient needs the drawn chart area.
+function vgrad(hex){
+  return c => {
+    const a = c.chart.chartArea;
+    if (!a) return hex;
+    const g = c.chart.ctx.createLinearGradient(0, a.top, 0, a.bottom);
+    g.addColorStop(0, hex);
+    g.addColorStop(1, hex + '3d');      // ~24% alpha at the baseline
+    return g;
+  };
+}
 
 // destroyCharts releases the previous render's Chart instances. renderStats
 // rebuilds the DOM (host.innerHTML), detaching the old canvases; without this
 // their resize observers and animation state would leak on every refetch.
 function destroyCharts(){ statsCharts.forEach(c => c.destroy()); statsCharts = []; }
 
+// sparkline draws the KPI hero's own series as a small filled area under the
+// headline figure — the number shows its shape, not just its size.
+function sparkline(canvas, values, color){
+  const c = new Chart(canvas, {
+    type: 'line',
+    data: { labels: values.map((_, i) => i), datasets: [{
+      data: values, borderColor: color, borderWidth: 1.5,
+      pointRadius: 0, tension: .35, fill: true,
+      backgroundColor: ctx => {
+        const a = ctx.chart.chartArea;
+        if (!a) return 'transparent';
+        const g = ctx.chart.ctx.createLinearGradient(0, a.top, 0, a.bottom);
+        g.addColorStop(0, color + '38');
+        g.addColorStop(1, color + '00');
+        return g;
+      },
+    }] },
+    options: {
+      responsive: true, maintainAspectRatio: false, animation: false,
+      events: [],                        // decorative: no hover, no tooltip
+      scales: { x: {display: false}, y: {display: false, beginAtZero: true} },
+      plugins: { legend: {display: false}, tooltip: {enabled: false} },
+      layout: { padding: { top: 4 } },
+    },
+  });
+  statsCharts.push(c);
+}
+
 // trendChart draws one time-bucketed stacked bar chart into a canvas.
 //
-// labels: bucket labels. datasets: {label, data, color}. fmt(v, axis): how a
-// value reads — dollars, token counts or plain counts — compact on the axis and
-// full in the tooltip. A single-dataset call (spend) just leaves one layer.
+// labels: bucket labels. datasets: {label, data, color, grad}. fmt(v, axis):
+// how a value reads — dollars, token counts or plain counts — compact on the
+// axis and full in the tooltip. A single-dataset call (spend) just leaves one
+// layer, and gets the vertical gradient.
 function trendChart(canvas, labels, datasets, fmt){
   const stacked = datasets.length > 1;
   const c = new Chart(canvas, {
     type: 'bar',
     data: { labels, datasets: datasets.map(d => ({
-      label: d.label, data: d.data, backgroundColor: d.color,
-      borderRadius: stacked ? 2 : 4, borderSkipped: false, maxBarThickness: 34,
+      label: d.label, data: d.data,
+      backgroundColor: d.grad ? vgrad(d.color) : d.color,
+      // Square baseline: rounding the bottom detaches a stacked segment from
+      // the bar below it, and on a single series floats it off the axis.
+      borderRadius: stacked ? 2 : { topLeft: 6, topRight: 6 },
+      borderSkipped: stacked ? false : 'bottom',
+      maxBarThickness: 34,
     })) },
     options: {
       responsive: true, maintainAspectRatio: false, animation: false,
@@ -1031,8 +1177,8 @@ function trendChart(canvas, labels, datasets, fmt){
       },
       plugins: {
         legend: { display: false },
-        tooltip: { backgroundColor: '#0b0e14', borderColor: CT.line, borderWidth: 1,
-          titleColor: CT.dim2, bodyColor: CT.fg, padding: 8,
+        tooltip: { backgroundColor: '#262320', borderColor: CT.line, borderWidth: 1,
+          titleColor: CT.dim2, bodyColor: CT.fg, padding: 10, cornerRadius: 10,
           callbacks: { label: ctx => `${ctx.dataset.label}: ${fmt(ctx.parsed.y)}` } },
       },
     },
@@ -1064,19 +1210,20 @@ function modelCard(models){
     <div class="hd"><div><h3>模型分布</h3>
       <div class="cap">按${byTok ? 'Token 量' : '请求数'}排序 · 点击可在列表中筛选</div></div>
       <span class="grow"></span>
-      <div class="seg sortsel">
+      <div class="segp sortsel">
         <button data-msort="requests" class="${byTok ? '' : 'on'}">请求数</button>
         <button data-msort="tokens" class="${byTok ? 'on' : ''}">Token 量</button>
       </div></div>
-    ${rows.length ? rows.map(m => `
+    ${rows.length ? rows.map((m, i) => `
       <div class="mrow tkrow" data-model="${esc(m.model)}">
+        <span class="rk">${i + 1}</span>
         <div>
           <div class="nm" title="${esc(m.model)}">${esc(m.model)}</div>
           <div class="track"><div class="fill" style="width:${
             Math.max(1, 100 * metric(m) / max)}%"></div></div>
         </div>
         <div class="vv">${byTok ? compact(m.tokens) : nfmt(m.requests)}<br>
-          <span style="color:var(--dim2)">${byTok ? nfmt(m.requests) + ' 次' : money(m.quota)}</span></div>
+          <span class="vs">${byTok ? nfmt(m.requests) + ' 次' : money(m.quota)}</span></div>
       </div>`).join('') : '<div class="cap">此范围内没有调用</div>'}
   </div>`;
 }
@@ -1092,7 +1239,7 @@ function tokenCard(tks, d){
     <div class="hd"><div><h3>令牌用量</h3>
       <div class="cap">按${byTok ? 'Token 量' : '花费'}排序 · 点击可在列表中筛选</div></div>
       <span class="grow"></span>
-      <div class="seg sortsel">
+      <div class="segp sortsel">
         <button data-tsort="quota" class="${byTok ? '' : 'on'}">花费</button>
         <button data-tsort="tokens" class="${byTok ? 'on' : ''}">Token 量</button>
       </div>
@@ -1100,7 +1247,7 @@ function tokenCard(tks, d){
     ${d.requests > 0 && d.token_name_count === 0 ? `<div class="warnbox">
       索引中暂无令牌名称。运行 <code>logviewer -reindex</code> 可从已归档的记录中回填；
       在此之前所有调用都归入「${esc(TOKEN_UNNAMED)}」。</div>` : ''}
-    ${rows.length ? rows.map(t => {
+    ${rows.length ? rows.map((t, i) => {
       // An unnamed row is a measurement gap, not a filterable token — the name
       // is exactly what is missing. It carries no spend (name and bill arrive
       // together), so in the spend view it shows its request count rather than a
@@ -1111,12 +1258,13 @@ function tokenCard(tks, d){
       const sub = byTok ? (na ? '' : money(t.quota)) : nfmt(t.requests) + ' 次';
       return `<div class="mrow tkrow ${na ? 'na' : ''}"${
         na ? '' : ` data-token="${esc(t.token)}"`}>
+        <span class="rk">${i + 1}</span>
         <div>
           <div class="nm" title="${esc(t.token)}">${esc(t.token)}</div>
           <div class="track"><div class="fill" style="width:${
             Math.max(1, 100 * metric(t) / max)}%"></div></div>
         </div>
-        <div class="vv">${primary}<br><span style="color:var(--dim2)">${sub}</span></div>
+        <div class="vv">${primary}<br><span class="vs">${sub}</span></div>
       </div>`;
     }).join('') : '<div class="cap">此范围内没有调用</div>'}
     <div class="tblwrap" id="t-token"></div>
@@ -1127,11 +1275,26 @@ function tokenCard(tks, d){
 // thinner lived here until Chart.js took over; see the note at the top of this
 // section.)
 
-function kpi(label, value, sub, cls){
-  return `<div class="kpi ${cls || ''}">
-    <div class="lb">${esc(label)}</div>
+// Small inline SVG icons for the KPI cards (stroke inherits --ka). No icon
+// font, no sprite sheet — five paths is smaller than either.
+const ICONS = {
+  dollar: '<svg viewBox="0 0 24 24"><path d="M12 2v20M17 6.5c0-2-2.2-3.2-5-3.2s-5 1.2-5 3.2 2 2.7 5 3.3 5 1.4 5 3.4-2.2 3.3-5 3.3-5-1.2-5-3.2"/></svg>',
+  layers: '<svg viewBox="0 0 24 24"><path d="M12 2 2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>',
+  activity: '<svg viewBox="0 0 24 24"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>',
+  check: '<svg viewBox="0 0 24 24"><path d="M22 11.1V12a10 10 0 1 1-5.9-9.1"/><path d="M22 4 12 14l-3-3"/></svg>',
+  bars: '<svg viewBox="0 0 24 24"><path d="M18 20V10M12 20V4M6 20v-6"/></svg>',
+  percent: '<svg viewBox="0 0 24 24"><path d="M19 5 5 19"/><circle cx="6.5" cy="6.5" r="2.5"/><circle cx="17.5" cy="17.5" r="2.5"/></svg>',
+};
+
+// o: {cls, ka, icon, spark} — accent colour, icon, and an optional sparkline
+// canvas id (drawn by renderStats once the canvas exists).
+function kpi(label, value, sub, o){
+  o = o || {};
+  return `<div class="kpi ${o.cls || ''}" ${o.ka ? `style="--ka:${o.ka}"` : ''}>
+    <div class="lb">${o.icon ? `<span class="ic">${ICONS[o.icon]}</span>` : ''}${esc(label)}</div>
     <div class="vl ${value === '—' ? 'dim' : ''}">${esc(String(value))}</div>
     ${sub ? `<div class="sub">${esc(sub)}</div>` : ''}
+    ${o.spark ? `<div class="spark"><canvas id="${o.spark}"></canvas></div>` : ''}
   </div>`;
 }
 
@@ -1175,18 +1338,28 @@ function renderStats(d, rng){
 
   // Spend and token volume are co-heroes: the whole point of this page is that
   // the two do not track each other (a cache-read token is billed at a fraction
-  // of a fresh one), so neither is a subtitle of the other.
-  parts.push(`<div class="kpis">
-    ${kpi('总花费', money(d.quota), `${nfmt(d.quota_count)} 次计费`, 'hero')}
+  // of a fresh one), so neither is a subtitle of the other. Each carries a
+  // sparkline of its own series so the headline shows its shape.
+  parts.push(`<div class="kpis heros">
+    ${kpi('总花费', money(d.quota), `${nfmt(d.quota_count)} 次计费`,
+      {cls: 'hero', ka: 'var(--s-blue)', icon: 'dollar', spark: 'c-spark-spend'})}
     ${kpi('Token 总量', d.token_count ? compact(d.tokens) : '—',
       d.token_count ? `入 ${compact(d.prompt_tokens)} · 出 ${compact(d.completion_tokens)}`
-                    : '索引未记录', 'hero')}
-    ${kpi('请求数', nfmt(d.requests), gran + ' · ' + s.length + ' 个区间')}
-    ${kpi('成功率', rate, known ? `${nfmt(d.ok)} 成功 / ${nfmt(d.err)} 失败` : '无可用状态')}
+                    : '索引未记录',
+      {cls: 'hero', ka: 'var(--s-violet)', icon: 'layers', spark: 'c-spark-tok'})}
+  </div>`);
+  parts.push(`<div class="kpis">
+    ${kpi('请求数', nfmt(d.requests), gran + ' · ' + s.length + ' 个区间',
+      {ka: 'var(--s-green)', icon: 'activity'})}
+    ${kpi('成功率', rate, known ? `${nfmt(d.ok)} 成功 / ${nfmt(d.err)} 失败` : '无可用状态',
+      {ka: 'var(--s-green)', icon: 'check'})}
     ${kpi('平均每调用', perCall === '—' ? '—' : perCall + ' tok',
-      d.token_count ? `${nfmt(d.token_count)} 次上报` : '索引未记录')}
-    ${kpi('单位成本', unit, unit === '—' ? '无计费或用量' : '每百万 token')}
-    ${kpi('平均单价', avg, d.quota_count ? '每次已计费调用' : '无计费记录')}
+      d.token_count ? `${nfmt(d.token_count)} 次上报` : '索引未记录',
+      {ka: 'var(--s-amber)', icon: 'bars'})}
+    ${kpi('单位成本', unit, unit === '—' ? '无计费或用量' : '每百万 token',
+      {ka: 'var(--s-amber)', icon: 'percent'})}
+    ${kpi('平均单价', avg, d.quota_count ? '每次已计费调用' : '无计费记录',
+      {ka: 'var(--s-blue)', icon: 'dollar'})}
   </div>`);
 
   // Spend trend.
@@ -1198,37 +1371,37 @@ function renderStats(d, rng){
     <div class="tblwrap" id="t-spend"></div>
   </div>`);
 
-  // Token usage trend — the headline of the new dimension. Stacks input over
-  // output so the shape shows both the volume and its composition; the two are
-  // billed very differently, so one opaque total would hide the mix.
-  parts.push(`<div class="card2">
-    <div class="hd"><div><h3>Token 用量趋势</h3><div class="cap">${gran} · 输入 / 输出堆叠</div></div>
-      <span class="grow"></span>
-      <div class="lg">
-        <span><i style="background:var(--c-1)"></i>输入</span>
-        <span><i style="background:var(--tool)"></i>输出</span>
-      </div>
-      <button class="lnk" data-tbl="t-tok">表格</button></div>
-    <div class="chartbox"><canvas id="c-tok"></canvas></div>
-    <div class="tblwrap" id="t-tok"></div>
+  // Token usage trend and request volume share one two-column band. The token
+  // chart stacks input over output so the shape shows both the volume and its
+  // composition; the two are billed very differently, so one opaque total would
+  // hide the mix.
+  parts.push(`<div class="sgrid">
+    <div class="card2">
+      <div class="hd"><div><h3>Token 用量趋势</h3><div class="cap">${gran} · 输入 / 输出堆叠</div></div>
+        <span class="grow"></span>
+        <div class="lg">
+          <span><i style="background:var(--s-blue)"></i>输入</span>
+          <span><i style="background:var(--s-amber)"></i>输出</span>
+        </div>
+        <button class="lnk" data-tbl="t-tok">表格</button></div>
+      <div class="chartbox"><canvas id="c-tok"></canvas></div>
+      <div class="tblwrap" id="t-tok"></div>
+    </div>
+    <div class="card2">
+      <div class="hd"><div><h3>请求量</h3><div class="cap">${gran} · 按结束状态分层</div></div>
+        <span class="grow"></span>
+        <div class="lg">
+          <span><i style="background:var(--s-blue)"></i>成功</span>
+          <span><i style="background:var(--s-red)"></i>失败</span>
+          <span><i style="background:var(--s-grey)"></i>未记录</span>
+        </div>
+        <button class="lnk" data-tbl="t-req">表格</button></div>
+      <div class="chartbox"><canvas id="c-req"></canvas></div>
+      <div class="tblwrap" id="t-req"></div>
+    </div>
   </div>`);
 
-  // Request volume.
-  parts.push(`<div class="card2">
-    <div class="hd"><div><h3>请求量</h3><div class="cap">${gran} · 按结束状态分层</div></div>
-      <span class="grow"></span>
-      <div class="lg">
-        <span><i style="background:var(--c-1)"></i>成功</span>
-        <span><i style="background:var(--c-err)"></i>失败</span>
-        <span><i style="background:var(--c-unk)"></i>未记录</span>
-      </div>
-      <button class="lnk" data-tbl="t-req">表格</button></div>
-    <div class="chartbox"><canvas id="c-req"></canvas></div>
-    <div class="tblwrap" id="t-req"></div>
-  </div>`);
-
-  parts.push(modelCard(models));
-  parts.push(tokenCard(d.tokens_by_token || [], d));
+  parts.push(`<div class="sgrid">${modelCard(models)}${tokenCard(d.tokens_by_token || [], d)}</div>`);
 
   if (d.unknown_time > 0){
     parts.push(`<div class="note">另有 ${nfmt(d.unknown_time)} 条记录没有可用时间戳，
@@ -1236,7 +1409,7 @@ function renderStats(d, rng){
   }
   parts.push(`<div class="note">时间范围 ${fmtRange(rng)} · 时区 ${esc(rng.tz || '')}</div>`);
 
-  host.innerHTML = parts.join('');
+  host.innerHTML = '<div class="swrap">' + parts.join('') + '</div>';
 
   // Draw the charts now the canvases exist. Each formatter reads compact on the
   // axis and full in the tooltip.
@@ -1246,7 +1419,7 @@ function renderStats(d, rng){
   const count = v => nfmt(v);
 
   trendChart($('#c-spend'), s.map(b => b.label),
-    [{label: '花费', data: s.map(b => b.quota / 500000), color: CT.spend}], dollars);
+    [{label: '花费', data: s.map(b => b.quota / 500000), color: CT.spend, grad: true}], dollars);
   trendChart($('#c-tok'), s.map(b => b.label), [
     {label: '输入', data: s.map(b => b.prompt_tokens), color: CT.input},
     {label: '输出', data: s.map(b => b.completion_tokens), color: CT.output},
@@ -1256,6 +1429,13 @@ function renderStats(d, rng){
     {label: '失败', data: s.map(b => b.err), color: CT.err},
     {label: '未记录', data: s.map(b => b.unknown), color: CT.unk},
   ], count);
+
+  // Hero sparklines — one point per bucket, so a single-bucket range draws
+  // nothing meaningful and is skipped.
+  if (s.length > 1){
+    sparkline($('#c-spark-spend'), s.map(b => b.quota / 500000), CT.spend);
+    sparkline($('#c-spark-tok'), s.map(b => b.tokens), '#a78bfa');
+  }
 
   // Table twins. Built with textContent (see fillTable), never innerHTML: model
   // and token names come from what a client sent, so they are untrusted.
