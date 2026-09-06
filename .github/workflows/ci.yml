@@ -35,7 +35,7 @@ jobs:
           cp testdata/sample.log /tmp/logs/
           docker run -d --name lv -p 7070:7070 \
             -v /tmp/logs:/logs:ro \
-            -e LOG_DIR=/logs -e BASE_PATH=/logviewer -e TZ=UTC \
+            -e LOG_DIR=/logs -e BASE_PATH=/logviewer -e ARCHIVE_DIR=/tmp -e TZ=UTC \
             newapi-logviewer:ci
           for i in $(seq 1 20); do
             curl -sf http://localhost:7070/logviewer/healthz && break || sleep 1
