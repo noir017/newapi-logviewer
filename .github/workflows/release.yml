@@ -19,7 +19,7 @@ on:
     inputs:
       newapi_image:
         description: 'Upstream new-api base image for the combined image'
-        default: 'calciumion/new-api:v1.0.0-rc.33'
+        default: 'ghcr.io/noir017/new-api:v1.0.0-rc.35-cachefix'
 
 permissions:
   contents: read
@@ -92,7 +92,7 @@ jobs:
           file: Dockerfile.combined
           platforms: ${{ env.PLATFORMS }}
           build-args: |
-            NEWAPI_IMAGE=${{ github.event.inputs.newapi_image || 'calciumion/new-api:v1.0.0-rc.33' }}
+            NEWAPI_IMAGE=${{ github.event.inputs.newapi_image || 'ghcr.io/noir017/new-api:v1.0.0-rc.35-cachefix' }}
           push: true
           tags: ${{ steps.meta_comb.outputs.tags }}
           labels: ${{ steps.meta_comb.outputs.labels }}
