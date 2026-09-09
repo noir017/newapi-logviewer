@@ -5,6 +5,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 	// Timestamps in the log are wall-clock local time, and the UI's time filter
 	// sends epoch seconds - so the process must be able to resolve $TZ. A
@@ -49,6 +50,11 @@ func main() {
 	if runRepair(cfg) {
 		return
 	}
+	// Maintenance mode: merge another pod's archive into this one, for the
+	// history that predates push mode.
+	if runImport(cfg) {
+		return
+	}
 
 	handler := newServer(cfg)
 	srv := &http.Server{
@@ -67,6 +73,26 @@ func main() {
 
 	log.Printf("log viewer on %s base=%s spool=%s archive=%s auth=%s",
 		cfg.Addr, cfg.Base, cfg.LogDir, cfg.ArchiveDir, cfg.AuthMode)
+	// Which half of push mode this process is, said once at startup. Both are
+	// silent when they are working, and "the other pod's calls are missing" is
+	// otherwise impossible to diagnose from the log.
+	if cfg.PushURL != "" {
+		log.Printf("push mode: records are pushed to %s as pod %q, not archived locally",
+			cfg.PushURL, cfg.PodName)
+		if cfg.PushToken == "" {
+			log.Printf("warning: PUSH_URL is set but PUSH_TOKEN is empty; the receiver will reject every push")
+		} else if strings.HasPrefix(cfg.PushURL, "http://") {
+			// The token is a bearer credential in a header. Worth one line at
+			// startup: the deployment this exists for reaches the other pod
+			// over the public internet, where http:// hands the token to
+			// anything on the path.
+			log.Printf("warning: PUSH_URL is http://, so PUSH_TOKEN and every prompt in the batch cross the network in the clear")
+		}
+	}
+	if cfg.PushToken != "" {
+		log.Printf("push receiver at %s%s, accepting pods %v (empty means any)",
+			cfg.Base, pushPath, cfg.PushPods)
+	}
 	if err := srv.ListenAndServe(); err != nil {
 		log.Fatal(err)
 	}
