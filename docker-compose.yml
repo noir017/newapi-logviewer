@@ -48,6 +48,16 @@ services:
       # Full-text search reads bodies, so it is bounded. Listing and filtering
       # only read the index and are not affected.
       - SEARCH_DAYS=${SEARCH_DAYS:-7}
+      # Several pods behind one database: one pod archives and the others push
+      # their folded records to it. All four are inert when unset, which is the
+      # single-machine configuration - see README "Several pods, one archive".
+      #
+      # On the archiving pod set PUSH_TOKEN (and optionally PUSH_PODS); on every
+      # other pod set PUSH_URL and the same PUSH_TOKEN.
+      - POD_NAME=${POD_NAME:-}
+      - PUSH_URL=${PUSH_URL:-}
+      - PUSH_TOKEN=${PUSH_TOKEN:-}
+      - PUSH_PODS=${PUSH_PODS:-}
     networks:
       - default
 

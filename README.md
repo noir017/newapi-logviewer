@@ -134,6 +134,18 @@ All configuration is environment variables. Only `LOG_DIR` matters for a basic r
 | `LOGVIEWER_ENABLED` | `true` | Combined image only: `false` runs New API alone |
 | `AUTH_TTL` | `120` | Seconds to cache a token verdict |
 
+Multi-pod aggregation — all optional, and unset means single-machine behaviour.
+See [Several pods, one archive](#several-pods-one-archive).
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PUSH_URL` | *(unset)* | Set on a **sender**: folded records are pushed here instead of archived locally. The viewer's mount root or the `/api/push` endpoint itself, either spelling |
+| `PUSH_TOKEN` | *(unset)* | Shared secret. Presented by the sender; on the **receiver** it is what enables the endpoint at all — unset, every push is refused |
+| `POD_NAME` | hostname | Which pod a record came from. Sent with every push, required by the receiver, and stored on the record as provenance |
+| `PUSH_PODS` | *(unset)* | Receiver: comma-separated `POD_NAME`s to accept. Empty accepts any named pod |
+| `PUSH_TIMEOUT_SEC` | `60` | Sender: HTTP timeout for one batch |
+| `PUSH_MAX_MB` | `64` | Receiver: largest accepted batch, compressed |
+
 ## Storage
 
 New API with `DEBUG=true` writes a lot, and almost none of it is information.
@@ -245,6 +257,82 @@ Measured on the damaged production archive: 18,145 tool calls collapsed to 580,
 to 256. The 8 that remain end mid-value with no second copy in the log — a real
 limit, and `-repair` deliberately leaves visibly broken arguments alone rather
 than guessing.
+
+### Several pods, one archive
+
+A New API cluster can run as several pods behind one database. Each pod writes
+its own DEBUG log, so each viewer folds only the calls its own pod served — and
+a list, a search or a spend total computed from half the traffic is not a smaller
+answer, it is a wrong one.
+
+Push mode makes one pod the only writer. The other pods keep folding their own
+log exactly as before, but instead of archiving locally they POST the finished
+records to the archiving pod, which appends them to the same `arc-DAY` pair it
+writes its own records into. Nothing else changes: same format, same per-day
+blob pool, same index, same queries. A pushed record is indistinguishable from a
+locally folded one once it lands.
+
+```
+# the archiving pod ("unraid"): receives, and is the only writer
+POD_NAME=unraid
+PUSH_TOKEN=<shared secret>
+PUSH_PODS=oracle                 # optional: only accept this sender
+
+# every other pod ("oracle"): folds and pushes, archives nothing locally
+POD_NAME=oracle
+PUSH_TOKEN=<the same secret>
+PUSH_URL=https://unraid.example/logviewer          # or …/logviewer/api/push
+```
+
+`PUSH_URL` unset is the single-machine configuration and is unchanged in every
+respect — the push code is not on that path at all.
+
+Three properties make this safe to run over a network:
+
+- **The spool stays the buffer.** A record is forgotten only once the receiver
+  has acknowledged it, and while a push is failing the sender stops consuming
+  its spool entirely. An outage costs spool space, not records: the read offsets
+  live in memory, so a restart re-reads the log from the start and rebuilds
+  every unacknowledged record. `/healthz` reports `push_fails` and returns 503
+  throughout, and `SPOOL_MAX_MB` still bounds the spool.
+- **Retries are safe.** The receiver is idempotent on `request_id`, so a push
+  that lands and then loses its ACK is re-sent and skipped rather than counted
+  twice. Duplicates are reported as `push_duplicate` on the receiver's
+  `/healthz`. This is what lets the transport be at-least-once — which is the
+  only kind that never loses a record.
+- **gzip on the wire.** The batch is gzipped NDJSON, one record per line. These
+  are the same bodies that compress ~10:1 in the archive, and the link between
+  two pods is usually the internet.
+
+Failures back off from 2s to 5 minutes and retry indefinitely. A 2xx alone is
+not treated as an ACK: the receiver's own count of stored + duplicate records
+has to cover the batch, so a reverse proxy's 200 or a captive portal cannot make
+the sender discard a batch that never arrived.
+
+The receiving endpoint is `POST {BASE_PATH}/api/push`. It sits outside
+`AUTH_MODE` — the caller is another pod's viewer, not a browser, and bearer mode
+validates per-user New API tokens this process cannot hold — and authenticates
+with `PUSH_TOKEN` instead. **A receiver with no `PUSH_TOKEN` refuses every push**
+(503) rather than accepting unauthenticated writes into the permanent store.
+
+History that predates the switch is merged separately, since turning on
+`PUSH_URL` only redirects records from that moment on:
+
+```bash
+logviewer -import -src /path/to/other-pods/archive [-day 20260901] [-pod oracle]
+```
+
+It reads the other archive's index, reassembles each record — v1 or v2, blob
+pool and all — and appends it through the same idempotent path a push takes. So
+a run interrupted half way through is resumed by running it again, and a second
+full run reports every record as already present and writes nothing. `-day`
+imports one day at a time; `-pod` labels the imported records with their origin.
+Records the source cannot read are skipped and counted rather than aborting the
+day.
+
+`ARCHIVE_DIR` is the destination, so this runs with the same configuration as
+the server, and like `-reindex` it should run as the archive's owner. Unlike
+`-reindex` it only appends, so it is safe to run against a live archive.
 
 ### Which channel served a call
 

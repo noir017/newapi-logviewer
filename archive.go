@@ -64,6 +64,12 @@ type archive struct {
 	blobIdx  *os.File
 	blobOff  int64
 	blobs    map[string]blobRef
+
+	// Request ids already archived for the open day, for AppendNew's
+	// idempotency check. Loaded from the day's index on first use and nil until
+	// then: the local write path does not need it (the ingester tracks what it
+	// wrote), so a single-machine install never reads the index to append.
+	rids map[string]struct{}
 }
 
 // idxEntry is the list-row projection, persisted alongside the offset needed to
@@ -302,6 +308,7 @@ func (a *archive) closeLocked() {
 		a.blobIdx = nil
 	}
 	a.blobOff, a.blobs = 0, nil
+	a.rids = nil
 	a.day = ""
 }
 
@@ -321,7 +328,73 @@ func (a *archive) Append(r *Record) error {
 	if err := a.openDay(dayOf(r.TS)); err != nil {
 		return err
 	}
+	return a.appendLocked(r)
+}
 
+// AppendNew is Append with request-id idempotency: a record whose id is already
+// archived that day is skipped, and reported as (false, nil).
+//
+// This is the entry point for records that did not come from this pod's own
+// spool - a push from another pod (receive.go) or -import of another pod's
+// archive - where the same record legitimately arrives more than once. A sender
+// whose push lands and then loses its ACK has no way to know the first attempt
+// succeeded, so it re-sends; that must not produce a second copy. Not because a
+// duplicate row looks untidy: eachMatch already collapses repeated ids so that
+// a corrected record supersedes its predecessor, and a duplicate would silently
+// consume that mechanism - the last write would win over a record identical to
+// it, which is harmless, right up until a genuine correction arrives and cannot
+// tell which copy it is superseding.
+//
+// Append deliberately keeps its old behaviour instead of doing this itself. The
+// local ingester already tracks what it has written, and making every append
+// consult the index would put a file read in front of the hot write path for a
+// guarantee it does not need.
+//
+// The dedup set is loaded from the day's index on first use and then maintained
+// by both append paths, so on the primary pod - which folds its own log AND
+// receives pushes into the same day - neither path can smuggle a duplicate past
+// the other.
+func (a *archive) AppendNew(r *Record) (bool, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	day := dayOf(r.TS)
+	if err := a.openDay(day); err != nil {
+		return false, err
+	}
+	if a.rids == nil {
+		ids, err := a.ridsOf(day)
+		if err != nil {
+			return false, err
+		}
+		a.rids = ids
+	}
+	if _, dup := a.rids[r.RequestID]; dup {
+		return false, nil
+	}
+	if err := a.appendLocked(r); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// ridsOf reads the request ids already archived for one day. A day with no
+// index is a day with nothing in it, not an error - which is the normal case
+// for the first record of a day.
+func (a *archive) ridsOf(day string) (map[string]struct{}, error) {
+	entries, err := a.index(day)
+	if err != nil && !os.IsNotExist(err) {
+		return nil, err
+	}
+	ids := make(map[string]struct{}, len(entries))
+	for _, e := range entries {
+		ids[e.RID] = struct{}{}
+	}
+	return ids, nil
+}
+
+// appendLocked is the write itself. Caller holds a.mu and has already opened
+// the record's day.
+func (a *archive) appendLocked(r *Record) error {
 	// v2: lift the request's repeated bulk (history, tools, system) into the
 	// day's blob pool before the record is framed, so every blob is durable
 	// before the record that points at it - a torn write can leave an
@@ -380,6 +453,12 @@ func (a *archive) Append(r *Record) error {
 		return err
 	}
 	a.off += int64(n)
+	// Remember the id if the dedup set is live, so a local append into a day
+	// that is also receiving pushes cannot leave the set stale and let the same
+	// record in twice. Nil - the single-machine case - costs nothing.
+	if a.rids != nil {
+		a.rids[r.RequestID] = struct{}{}
+	}
 	return a.idx.Sync()
 }
 

@@ -52,6 +52,13 @@ type ingester struct {
 	archived map[string]struct{} // ids already written, so a retry cannot double-write
 	stop     chan struct{}
 
+	// push, when set, replaces the local archive as the destination: folded
+	// records go to another pod's viewer over HTTP and are only forgotten once
+	// it has acknowledged them. Nil is the single-machine case and the one this
+	// file was written for - every branch on it below leaves that path exactly
+	// as it was. See push.go.
+	push *pusher
+
 	// Write-side health, for /healthz. Both outages this code has had were
 	// invisible from outside: the container was healthy, pages were fast, and
 	// pending was 0, while the archive recorded nothing for hours. `pending`
@@ -78,6 +85,14 @@ func newIngester(spoolDir string, arc *archive, keep time.Duration, maxBytes int
 	}
 }
 
+// withPusher sends folded records to another pod instead of archiving them
+// locally. A nil pusher (PUSH_URL unset) leaves the ingester in its
+// single-machine configuration.
+func (i *ingester) withPusher(p *pusher) *ingester {
+	i.push = p
+	return i
+}
+
 // Run polls the spool until Stop. Polling rather than inotify: the spool is a
 // handful of files on tmpfs, a stat every second costs nothing, and it keeps
 // the binary dependency-free and identical across platforms.
@@ -101,6 +116,22 @@ func (i *ingester) Stop() { close(i.stop) }
 func (i *ingester) once() {
 	i.mu.Lock()
 	defer i.mu.Unlock()
+
+	// Push mode with the receiver down: stop consuming the spool until it comes
+	// back, and spend this pass retrying the backlog instead.
+	//
+	// The spool is the only buffer. A record read out of it lives in memory
+	// until the receiver acknowledges it, and the read offsets live in memory
+	// too - so a restart mid-outage re-reads the spool from the start and
+	// rebuilds every unacknowledged record. Reading further would trade log
+	// files that can still be re-read for records that a restart would lose,
+	// and pruning during an outage would delete the very bytes the recovery
+	// depends on. The cost is spool space, which /healthz reports and
+	// SPOOL_MAX_MB bounds.
+	if i.push != nil && i.push.failing() {
+		i.flushFinished()
+		return
+	}
 
 	files, _ := filepath.Glob(filepath.Join(i.dir, "*.log"))
 	sort.Slice(files, func(a, b int) bool { return mtime(files[a]).Before(mtime(files[b])) })
@@ -138,8 +169,16 @@ func (i *ingester) once() {
 
 // flushFinished archives every pending call that has its GIN line, and forgets
 // it. Callers hold i.mu.
+//
+// In push mode the destination is another pod rather than the local archive, and
+// the finished calls are shipped as one batch after the walk instead of one at a
+// time inside it: a WAN round trip per record would not keep up with a burst,
+// and a record is only forgotten once the receiver has acknowledged it either
+// way.
 func (i *ingester) flushFinished() {
 	now := time.Now()
+	var batch []*Record
+	var batchBytes int64
 	for rid, rec := range i.pending {
 		done := rec.Status != nil && rec.TS != ""
 		if !done && rec.billingSeen && !rec.lastSeen.IsZero() &&
@@ -183,6 +222,17 @@ func (i *ingester) flushFinished() {
 			delete(i.pending, rid)
 			continue
 		}
+		if i.push != nil {
+			// Collect; the batch goes out below. Whatever does not fit stays
+			// pending and leaves on the next pass, which is also what keeps one
+			// request bounded when a burst finishes at once.
+			if len(batch) >= pushMaxRecords || batchBytes >= pushMaxBytes {
+				continue
+			}
+			batch = append(batch, rec)
+			batchBytes += recordSize(rec)
+			continue
+		}
 		if err := i.arc.Append(rec); err != nil {
 			// Leave it pending: a failed append (disk full, permissions) must
 			// not silently drop the call. It retries next pass.
@@ -197,11 +247,51 @@ func (i *ingester) flushFinished() {
 		i.archived[rid] = struct{}{}
 		delete(i.pending, rid)
 	}
+	if len(batch) > 0 {
+		i.flushPush(batch, now)
+	}
 	// Bound the dedup set. Ids are only revisited within one spool file's
 	// lifetime, so anything older than the retention window cannot recur.
 	if len(i.archived) > 50000 {
 		i.archived = map[string]struct{}{}
 	}
+}
+
+// flushPush ships one batch and consumes the records only on an ACK.
+//
+// A failure leaves every record of the batch pending, which is what makes the
+// spool the buffer: nothing is deleted, nothing is truncated, and the next pass
+// retries the same records rather than reading more. The receiver deduplicates
+// on request id, so a batch that landed and lost its ACK is re-sent safely.
+//
+// The write-side health counters are shared with the local append path: in push
+// mode the push IS the write, and /healthz has to go red for the same reason -
+// records are being folded and not stored anywhere.
+func (i *ingester) flushPush(batch []*Record, now time.Time) {
+	if !i.push.ready(now) {
+		return // inside the backoff window; nothing is consumed
+	}
+	if i.push.pod != "" {
+		for _, rec := range batch {
+			rec.Pod = i.push.pod
+		}
+	}
+	if err := i.push.send(batch); err != nil {
+		i.push.failed(now, err)
+		log.Printf("push %d records to %s: %v (retry in %s; the spool is held until it succeeds)",
+			len(batch), i.push.url, err, time.Until(i.push.nextTry).Round(time.Second))
+		i.appendFails++
+		i.lastErr = err.Error()
+		return
+	}
+	i.push.succeeded(len(batch))
+	for _, rec := range batch {
+		i.archived[rec.RequestID] = struct{}{}
+		delete(i.pending, rec.RequestID)
+	}
+	i.appends += int64(len(batch))
+	i.lastAppend = now
+	i.appendFails, i.lastErr = 0, ""
 }
 
 // worthArchiving keeps dashboard polling out of the permanent record.
@@ -431,12 +521,31 @@ func (i *ingester) health() map[string]any {
 	if i.lastErr != "" {
 		h["last_error"] = i.lastErr
 	}
+	// In push mode the destination is another pod, so the numbers an operator
+	// needs are about the link, not the disk: how many records have been
+	// acknowledged, and whether the sender is currently backing off - which is
+	// also when the spool stops being consumed and starts growing. `pending`
+	// above doubles as the unacknowledged count, since in push mode a folded
+	// record stays pending until the receiver has taken it.
+	if i.push != nil {
+		h["push_url"] = i.push.url
+		h["push_pod"] = i.push.pod
+		h["push_sent"] = i.push.sent
+		if i.push.fails > 0 {
+			h["push_fails"] = i.push.fails
+			h["push_retry_in_sec"] = int(time.Until(i.push.nextTry).Seconds())
+		}
+	}
 
 	ok := true
 	var why []string
 	if i.appendFails > 0 {
 		ok = false
-		why = append(why, "archive appends are failing")
+		if i.push != nil {
+			why = append(why, "pushes to the archiving pod are failing")
+		} else {
+			why = append(why, "archive appends are failing")
+		}
 	}
 	if i.maxBytes > 0 && spool > i.maxBytes {
 		ok = false
