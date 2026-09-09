@@ -143,6 +143,12 @@ type Record struct {
 	// current name on old records rather than a stale one.
 	ChannelName string `json:"channel_name,omitempty"`
 
+	// Pod is which New API pod served the call, stamped by the sender when a
+	// viewer runs in push mode (see push.go). Provenance only: nothing keys off
+	// it, it is not projected into the index, and a single-pod install never
+	// sets it - so omitempty keeps it out of every record archived locally.
+	Pod string `json:"pod,omitempty"`
+
 	ToolNames   []string `json:"tool_names"`
 	CalledTools []string `json:"called_tools"`
 	Preview     string   `json:"preview"`

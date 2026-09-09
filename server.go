@@ -19,11 +19,16 @@ type server struct {
 	ch    *channelResolver
 	index []byte
 	chart []byte
+
+	// receiveStats counts records pushed in by other pods, for /healthz. Only
+	// populated when this viewer is a receiver.
+	receiveStats receiveStats
 }
 
 func newServer(cfg Config) *server {
 	arc := newArchive(cfg.ArchiveDir)
-	ing := newIngester(cfg.LogDir, arc, cfg.SpoolKeep, cfg.SpoolMaxBytes)
+	ing := newIngester(cfg.LogDir, arc, cfg.SpoolKeep, cfg.SpoolMaxBytes).
+		withPusher(newPusher(cfg))
 	ch := newChannelResolver(cfg.NewAPIURL, cfg.NewAPIToken)
 	return &server{
 		cfg: cfg, q: newQuery(arc, cfg.SearchDays).withChannels(ch), ing: ing,
@@ -59,12 +64,25 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// pages. Returns 503 when ingest is broken so a container healthcheck or
 		// an uptime monitor actually fires.
 		h := s.ing.health()
+		if s.cfg.PushToken != "" {
+			s.receiveStats.report(h)
+		}
 		code := 200
 		if ok, _ := h["archive_ok"].(bool); !ok {
 			code = 503
 		}
 		h["ok"] = code == 200
 		s.writeJSON(w, code, h)
+		return
+	}
+
+	// The push receiver, ahead of the auth gate: the caller is another pod's
+	// viewer rather than a browser, and it authenticates with the shared
+	// PUSH_TOKEN instead of a New API access token, which is a per-user
+	// credential this process cannot hold. Refuses everything unless PUSH_TOKEN
+	// is set - see receive.go.
+	if path == pushPath {
+		s.handlePush(w, r)
 		return
 	}
 
