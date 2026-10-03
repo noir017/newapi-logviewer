@@ -600,7 +600,7 @@ file. Relying on GIN alone makes every call wait out the stall deadline and land
 in the archive marked "stalled" — a 10-minute delay on every record plus a
 "response never finished" badge on calls that finished perfectly.
 
-Streaming chunks arrive in three different shapes, and folding is lossy, so an
+Streaming chunks arrive in four different shapes, and folding is lossy, so an
 unrecognised one is destroyed rather than merely mis-displayed:
 
 | Channel | Chunk shape |
@@ -608,6 +608,15 @@ unrecognised one is destroyed rather than merely mis-displayed:
 | OpenAI-compatible | `choices[].delta.content` / `.reasoning_content` |
 | Gemini native | `candidates[].content.parts[].text` (`thought` marks reasoning) |
 | Anthropic native | `content_block_delta` → `text_delta` / `thinking_delta` / `input_json_delta` |
+| OpenAI Responses (`/v1/responses` passed through) | `response.output_text.delta` / `response.reasoning_text.delta` / `response.reasoning_summary_text.delta` / `response.function_call_arguments.delta`; usage in `response.completed` |
+
+The Responses API reuses Anthropic's top-level `delta` key with a different
+type — a bare string, not an object — and `encoding/json` rejects the whole
+chunk on that mismatch, so every text delta was filed as an unknown shape and a
+1,056-token answer archived as an empty body. Its `*.done` events restate text
+the deltas already carried and are deliberately skipped, or every answer would
+appear twice. (A `/v1/responses` call that New API converts for another
+upstream, e.g. Gemini, is logged in that upstream's shape instead.)
 
 Anthropic's shape needs cross-line state: a tool call's name arrives in
 `content_block_start` while its arguments stream as `input_json_delta` fragments

@@ -427,3 +427,122 @@ func TestStreamToolCallsWithoutIndex(t *testing.T) {
 		t.Errorf("call 1 = %q %q", got[1].Function.Name, got[1].Function.Arguments)
 	}
 }
+
+// OpenAI Responses API streams, relayed verbatim from an upstream that speaks
+// /v1/responses natively. Shapes are copied from a production modelscope call
+// that archived 1,056 completion tokens as an empty body: the text deltas'
+// string-valued `delta` failed to decode, so every event was an unknown shape.
+// Split across two read passes, as a live stream is.
+func TestResponsesAPIStream(t *testing.T) {
+	const rid = "ResponsesApiStreamAaaaBbbb"
+	calls := map[string]*Record{}
+	line := func(ts, msg string) string {
+		return `[DEBUG] 2026/10/03 - 17:55:` + ts + ` | ` + rid + ` | ` + msg
+	}
+	data := func(ts, body string) string { return line(ts, "stream scanner data: data: "+body+" ") }
+	pass := func(lines ...string) {
+		for _, l := range lines {
+			handleLine(l, calls)
+		}
+		calls[rid].finalize()
+	}
+
+	pass(
+		line("01", `requestBody: {"model":"deepseek-v4-flash","input":[{"role":"user","content":"summarise"}],"instructions":"Report an error if unsure.","stream":true,"tools":[{"type":"function","name":"lookup","parameters":{}}]}`),
+		data("02", `{"response":{"id":"resp_1","object":"response","output":[],"status":"queued","usage":null},"sequence_number":0,"type":"response.created"}`),
+		data("02", `{"response":{"id":"resp_1","object":"response","output":[],"status":"in_progress","usage":null},"sequence_number":1,"type":"response.in_progress"}`),
+		data("02", `{"item":{"id":"msg_r","summary":[],"type":"reasoning"},"output_index":0,"sequence_number":2,"type":"response.output_item.added"}`),
+		data("03", `{"content_index":0,"delta":"好的，","item_id":"msg_r","output_index":0,"sequence_number":3,"type":"response.reasoning_text.delta"}`),
+		data("03", `{"content_index":0,"delta":"读一遍。","item_id":"msg_r","output_index":0,"sequence_number":4,"type":"response.reasoning_text.delta"}`),
+		line("03", "stream scanner data: "),
+		data("03", `{"content_index":0,"item_id":"msg_r","output_index":0,"sequence_number":5,"text":"好的，读一遍。","type":"response.reasoning_text.done"}`),
+		data("03", `{"item":{"id":"msg_r","summary":[{"text":"好的，读一遍。","type":"summary_text"}],"type":"reasoning"},"output_index":0,"sequence_number":6,"type":"response.output_item.done"}`),
+		data("04", `{"item":{"content":[],"id":"msg_a","role":"assistant","status":"in_progress","type":"message"},"output_index":1,"sequence_number":7,"type":"response.output_item.added"}`),
+		data("04", `{"content_index":0,"item_id":"msg_a","output_index":1,"part":{"annotations":[],"text":"","type":"output_text"},"sequence_number":8,"type":"response.content_part.added"}`),
+		data("04", `{"content_index":0,"delta":"{\n","item_id":"msg_a","logprobs":[],"output_index":1,"sequence_number":9,"type":"response.output_text.delta"}`),
+	)
+	pass(
+		data("05", `{"content_index":0,"delta":"  \"梗概\": \"…\"\n}","item_id":"msg_a","logprobs":[],"output_index":1,"sequence_number":10,"type":"response.output_text.delta"}`),
+		data("05", `{"content_index":0,"item_id":"msg_a","logprobs":[],"output_index":1,"sequence_number":11,"text":"{\n  \"梗概\": \"…\"\n}","type":"response.output_text.done"}`),
+		data("05", `{"content_index":0,"item_id":"msg_a","output_index":1,"part":{"annotations":[],"text":"{\n  \"梗概\": \"…\"\n}","type":"output_text"},"sequence_number":12,"type":"response.content_part.done"}`),
+		data("05", `{"item":{"content":[{"annotations":[],"text":"{\n  \"梗概\": \"…\"\n}","type":"output_text"}],"id":"msg_a","role":"assistant","status":"completed","type":"message"},"output_index":1,"sequence_number":13,"type":"response.output_item.done"}`),
+		data("06", `{"item":{"arguments":"","call_id":"call_9","id":"fc_9","name":"lookup","status":"in_progress","type":"function_call"},"output_index":2,"sequence_number":14,"type":"response.output_item.added"}`),
+		data("06", `{"delta":"{\"q\":","item_id":"fc_9","output_index":2,"sequence_number":15,"type":"response.function_call_arguments.delta"}`),
+		data("06", `{"delta":"1}","item_id":"fc_9","output_index":2,"sequence_number":16,"type":"response.function_call_arguments.delta"}`),
+		data("06", `{"arguments":"{\"q\":1}","item_id":"fc_9","output_index":2,"sequence_number":17,"type":"response.function_call_arguments.done"}`),
+		data("06", `{"response":{"id":"resp_1","object":"response","output":[],"status":"completed","usage":{"input_tokens":2940,"input_tokens_details":{"cached_tokens":128},"output_tokens":1056,"output_tokens_details":{"reasoning_tokens":501},"total_tokens":3996}},"sequence_number":18,"type":"response.completed"}`),
+		line("06", "stream scanner data: data: [DONE]"),
+		`[INFO] 2026/10/03 - 17:55:06 | `+rid+` | stream ended: reason=eof `,
+		`[INFO] 2026/10/03 - 17:55:06 | `+rid+` | record consume log: userId=1, params={"channel_id":46,"prompt_tokens":2940,"completion_tokens":1056,"model_name":"deepseek-v4-flash","quota":628,"other":{"stream_status":{"end_reason":"eof","status":"ok"}}}`,
+	)
+	r := calls[rid]
+
+	t.Run("text and reasoning are reassembled, once each", func(t *testing.T) {
+		// The *.done events restate the whole text; counting them as well
+		// would print every answer twice.
+		if got, want := r.StreamContent, "{\n  \"梗概\": \"…\"\n}"; got != want {
+			t.Errorf("stream_content = %q, want %q", got, want)
+		}
+		if got, want := r.StreamReasoning, "好的，读一遍。"; got != want {
+			t.Errorf("stream_reasoning = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("no event is recorded as an unknown shape", func(t *testing.T) {
+		if r.UnknownCount != 0 {
+			t.Errorf("unknown_count = %d, want 0; samples: %v", r.UnknownCount, r.UnknownChunks)
+		}
+		if r.ChunkCount == 0 || !r.IsStream {
+			t.Errorf("chunk_count = %d, is_stream = %v", r.ChunkCount, r.IsStream)
+		}
+		if len(r.Errors) != 0 {
+			t.Errorf("errors = %v, want none", r.Errors)
+		}
+	})
+
+	t.Run("function call is joined by output_index", func(t *testing.T) {
+		if len(r.StreamToolCalls) != 1 {
+			t.Fatalf("stream_tool_calls = %+v, want 1", r.StreamToolCalls)
+		}
+		tc := r.StreamToolCalls[0]
+		if tc.ID != "call_9" || tc.Function.Name != "lookup" || tc.Function.Arguments != `{"q":1}` {
+			t.Errorf("call = %q %q %q, want call_9 lookup {\"q\":1}", tc.ID, tc.Function.Name, tc.Function.Arguments)
+		}
+		if !contains(r.CalledTools, "lookup") {
+			t.Errorf("called_tools = %v", r.CalledTools)
+		}
+	})
+
+	t.Run("usage comes from response.completed, details included", func(t *testing.T) {
+		u := r.Usage
+		if u == nil || u.PromptTokens == nil || u.CompletionTokens == nil || u.TotalTokens == nil {
+			t.Fatalf("usage = %+v", u)
+		}
+		// input_tokens already counts the cache here, unlike Anthropic's.
+		if *u.PromptTokens != 2940 || *u.CompletionTokens != 1056 || *u.TotalTokens != 3996 {
+			t.Errorf("usage = %d/%d/%d, want 2940/1056/3996", *u.PromptTokens, *u.CompletionTokens, *u.TotalTokens)
+		}
+		if u.PromptDetails == nil || u.PromptDetails.CachedTokens == nil || *u.PromptDetails.CachedTokens != 128 {
+			t.Errorf("cached_tokens = %+v, want 128", u.PromptDetails)
+		}
+		if u.CompletionDetails == nil || u.CompletionDetails.ReasoningTokens == nil || *u.CompletionDetails.ReasoningTokens != 501 {
+			t.Errorf("reasoning_tokens = %+v, want 501", u.CompletionDetails)
+		}
+	})
+}
+
+// The Responses API and Anthropic share the top-level "delta" key with
+// different types. Both must keep decoding through the one field.
+func TestChunkDeltaAcceptsStringAndObject(t *testing.T) {
+	_, _, ok := streamChunkOf(`data: {"type":"response.output_text.delta","delta":"hi"}`)
+	if !ok {
+		t.Fatal("string delta failed to decode")
+	}
+	ch, _, ok := streamChunkOf(`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"yo"}}`)
+	if !ok || ch.Delta == nil || ch.Delta.Text != "yo" {
+		t.Fatalf("object delta: ok=%v delta=%+v", ok, ch.Delta)
+	}
+	if c, _, _ := ch.text(); c != "yo" {
+		t.Errorf("anthropic text = %q, want yo", c)
+	}
+}
