@@ -298,14 +298,9 @@ type streamChunk struct {
 	// _start while its arguments dribble in as input_json_delta fragments that
 	// name only the index - so assembly needs state across lines, which is what
 	// anthropicState below carries.
-	Type  string `json:"type"`
-	Index *int   `json:"index"`
-	Delta *struct {
-		Type        string `json:"type"`
-		Text        string `json:"text"`
-		Thinking    string `json:"thinking"`
-		PartialJSON string `json:"partial_json"`
-	} `json:"delta"`
+	Type         string      `json:"type"`
+	Index        *int        `json:"index"`
+	Delta        *chunkDelta `json:"delta"`
 	ContentBlock *struct {
 		Type string `json:"type"`
 		ID   string `json:"id"`
@@ -315,12 +310,89 @@ type streamChunk struct {
 		Usage *anthropicUsage `json:"usage"`
 	} `json:"message"`
 
+	// OpenAI's Responses API shape, logged verbatim when a /v1/responses call
+	// is relayed to an upstream that speaks it natively. Third time for the same
+	// lesson: a 1,056-token DeepSeek answer via modelscope archived 247 unparsed
+	// events and an empty body. Text deltas fail to decode outright - their
+	// `delta` is a bare string where Anthropic's is an object - see chunkDelta.
+	//
+	// Also one event per line, discriminated by Type ("response.*"):
+	//   response.output_text.delta            - visible text, in Delta.Str
+	//   response.reasoning_text.delta         - chain of thought (open models)
+	//   response.reasoning_summary_text.delta - the same, as OpenAI summarises it
+	//   response.output_item.added            - opens a function_call: name, call_id
+	//   response.function_call_arguments.delta - argument fragments for it
+	//   response.completed                    - the whole response, with usage
+	// A function call's name and its arguments arrive on different lines, tied
+	// by output_index, so they are joined in toolAcc like OpenAI's tool deltas.
+	OutputIndex *int `json:"output_index"`
+	Item        *struct {
+		Type   string `json:"type"`
+		CallID string `json:"call_id"`
+		Name   string `json:"name"`
+	} `json:"item"`
+	Response *struct {
+		Usage *responsesUsage `json:"usage"`
+	} `json:"response"`
+
 	// raw is the undecoded chunk body, not a wire field. Anthropic's final
 	// usage sits at the top-level "usage" key - the same key OpenAI uses, but
 	// with different member names - and two struct fields cannot share one json
 	// tag: encoding/json silently drops BOTH on conflict. So message_delta
 	// usage is decoded from raw on demand rather than bound to a second field.
 	raw string
+}
+
+// chunkDelta is the top-level "delta" of a stream event, which two providers
+// spell differently: Anthropic sends an object, the Responses API a bare
+// string. A plain struct field rejects the string, and encoding/json reports
+// that as an error for the WHOLE chunk - so every Responses text delta was
+// filed as an unknown shape and folded away.
+type chunkDelta struct {
+	Type        string `json:"type"`
+	Text        string `json:"text"`
+	Thinking    string `json:"thinking"`
+	PartialJSON string `json:"partial_json"`
+
+	// Str is the delta when it arrived as a string (Responses API).
+	Str string `json:"-"`
+}
+
+func (d *chunkDelta) UnmarshalJSON(b []byte) error {
+	if len(b) > 0 && b[0] == '"' {
+		return json.Unmarshal(b, &d.Str)
+	}
+	type object chunkDelta // drops this method, or Unmarshal would recurse
+	return json.Unmarshal(b, (*object)(d))
+}
+
+// responsesUsage is the Responses API's token accounting. Unlike Anthropic's,
+// input_tokens already includes the cached portion, so it maps onto Usage
+// one-to-one. The detail fields are declared with Usage's exact types so they
+// can be handed over as they are.
+type responsesUsage struct {
+	InputTokens  *int `json:"input_tokens"`
+	OutputTokens *int `json:"output_tokens"`
+	TotalTokens  *int `json:"total_tokens"`
+	InputDetails *struct {
+		CachedTokens *int `json:"cached_tokens,omitempty"`
+	} `json:"input_tokens_details"`
+	OutputDetails *struct {
+		ReasoningTokens *int `json:"reasoning_tokens,omitempty"`
+	} `json:"output_tokens_details"`
+}
+
+func (a *responsesUsage) toUsage() *Usage {
+	if a == nil {
+		return nil
+	}
+	return &Usage{
+		PromptTokens:      a.InputTokens,
+		CompletionTokens:  a.OutputTokens,
+		TotalTokens:       a.TotalTokens,
+		PromptDetails:     a.InputDetails,
+		CompletionDetails: a.OutputDetails,
+	}
 }
 
 // anthropicUsage is Anthropic's token accounting. Cache reads and writes are
@@ -416,6 +488,32 @@ func (ch *streamChunk) text() (content, reasoning string, tools []ToolCall) {
 			r.WriteString(ch.Delta.Thinking)
 		}
 	}
+	// Responses API. Unlike Anthropic's, its tool calls ARE returned here, as
+	// OpenAI-shaped fragments keyed by output_index: the opener carries the
+	// name and call_id, each arguments delta one more slice, and toolAcc joins
+	// them across lines and passes exactly as it does for chat completions.
+	switch ch.Type {
+	case "response.output_text.delta", "response.refusal.delta":
+		if ch.Delta != nil {
+			c.WriteString(ch.Delta.Str)
+		}
+	case "response.reasoning_text.delta", "response.reasoning_summary_text.delta":
+		if ch.Delta != nil {
+			r.WriteString(ch.Delta.Str)
+		}
+	case "response.output_item.added":
+		if ch.Item != nil && ch.Item.Type == "function_call" {
+			tc := ToolCall{Index: ch.OutputIndex, ID: ch.Item.CallID, Type: "function"}
+			tc.Function.Name = ch.Item.Name
+			tools = append(tools, tc)
+		}
+	case "response.function_call_arguments.delta":
+		if ch.Delta != nil {
+			tc := ToolCall{Index: ch.OutputIndex}
+			tc.Function.Arguments = ch.Delta.Str
+			tools = append(tools, tc)
+		}
+	}
 	return c.String(), r.String(), tools
 }
 
@@ -440,6 +538,12 @@ func (ch *streamChunk) usage() *Usage {
 		if json.Unmarshal([]byte(ch.raw), &v) == nil {
 			return v.Usage.toUsage()
 		}
+	}
+	// Responses API: usage rides inside the response object, which the
+	// terminal event (completed / incomplete / failed) carries whole. The
+	// earlier response.created copy has usage null, which this skips.
+	if ch.Response != nil && ch.Response.Usage != nil {
+		return ch.Response.Usage.toUsage()
 	}
 	if ch.Usage != nil {
 		return ch.Usage
@@ -469,6 +573,16 @@ func (ch *streamChunk) hasPayload() bool {
 	switch ch.Type {
 	case "message_start", "content_block_start", "content_block_delta", "message_delta":
 		return true
+	case "response.output_text.delta", "response.refusal.delta",
+		"response.reasoning_text.delta", "response.reasoning_summary_text.delta",
+		"response.function_call_arguments.delta",
+		// terminal events, for their usage
+		"response.completed", "response.incomplete", "response.failed":
+		return true
+	case "response.output_item.added":
+		// Only a function_call item carries something the deltas will not: its
+		// name. A message or reasoning item opens empty and falls to isKnownEmpty.
+		return ch.Item != nil && ch.Item.Type == "function_call"
 	}
 	// "ping", "message_stop" and content_block_stop carry no data. They are
 	// real events rather than unknown shapes though, so report them as
@@ -482,6 +596,20 @@ func (ch *streamChunk) hasPayload() bool {
 func (ch *streamChunk) isKnownEmpty() bool {
 	switch ch.Type {
 	case "ping", "message_stop", "content_block_stop", "error":
+		return true
+	// Responses API lifecycle events. They either frame the stream or restate,
+	// in one piece, text the deltas already delivered - folding them in would
+	// double every answer. Listed one by one rather than matched by prefix, so
+	// an output type this parser has not met (audio, web search, ...) still
+	// shows up as an unknown shape instead of vanishing.
+	case "response.created", "response.queued", "response.in_progress",
+		"response.output_item.added", "response.output_item.done",
+		"response.content_part.added", "response.content_part.done",
+		"response.output_text.done", "response.refusal.done",
+		"response.reasoning_text.done",
+		"response.reasoning_summary_part.added", "response.reasoning_summary_part.done",
+		"response.reasoning_summary_text.done",
+		"response.function_call_arguments.done":
 		return true
 	}
 	return false
