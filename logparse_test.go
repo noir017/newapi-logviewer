@@ -764,3 +764,112 @@ func TestGeminiUsageCountsThoughts(t *testing.T) {
 		t.Errorf("plain = %+v", p)
 	}
 }
+
+// Gemini's request is logged in its native shape - contents with roles
+// user/model, text in parts, functions under functionDeclarations - and
+// nothing derived from it: every Gemini call listed with no preview, 0
+// messages and no tools. The native path's own marker, `Gemini request body:`,
+// was not handled at all.
+func TestGeminiRequestShape(t *testing.T) {
+	const rid = "GeminiRequestShapeAaaaBbbb"
+	calls := map[string]*Record{}
+	scanLines(strings.NewReader(`[DEBUG] 2026/10/07 - 09:00:00 | `+rid+` | Gemini request body: {"systemInstruction":{"parts":[{"text":"Report an error if unsure."}]},"contents":[{"role":"user","parts":[{"text":"weather in Paris?"}]},{"role":"model","parts":[{"functionCall":{"name":"get_weather","args":{"city":"Paris"}}}]},{"role":"user","parts":[{"functionResponse":{"name":"get_weather","response":{"c":21}}}]}],"tools":[{"functionDeclarations":[{"name":"get_weather","parameters":{"type":"OBJECT"}},{"name":"get_time"}]},{"googleSearch":{}}]}
+[DEBUG] 2026/10/07 - 09:00:02 | `+rid+` | Gemini native response body: {"candidates":[{"content":{"role":"model","parts":[{"text":"21C"}]}}],"usageMetadata":{"promptTokenCount":50,"candidatesTokenCount":2,"totalTokenCount":52}}
+[INFO] 2026/10/07 - 09:00:02 | `+rid+` | record consume log: userId=1, params={"channel_id":4,"prompt_tokens":50,"completion_tokens":2,"model_name":"gemini-3.5-flash","quota":3}
+`), calls)
+	r := calls[rid]
+	if r == nil {
+		t.Fatal("record missing")
+	}
+	r.finalize()
+
+	if r.Incomplete || r.Request.empty() {
+		t.Fatal("request missing - `Gemini request body:` was not recognised")
+	}
+	if len(r.Errors) != 0 {
+		t.Errorf("errors = %v - the request fell through to the error arm", r.Errors)
+	}
+	// The functionResponse-only content is a tool result, not the prompt.
+	if r.Preview != "weather in Paris?" {
+		t.Errorf("preview = %q, want the user's question", r.Preview)
+	}
+	if r.MsgCount != 3 || r.Turns != 1 {
+		t.Errorf("msg_count/turns = %d/%d, want 3/1", r.MsgCount, r.Turns)
+	}
+	if strings.Join(r.ToolNames, ",") != "get_weather,get_time" || !r.HasTools {
+		t.Errorf("tool_names = %v, has_tools = %v", r.ToolNames, r.HasTools)
+	}
+	if r.Model != "gemini-3.5-flash" {
+		t.Errorf("model = %q, want billing's - the native request names none", r.Model)
+	}
+}
+
+// Rerank calls logged both bodies under markers nothing handled, so every one
+// archived with no request - and so flagged 请求体不在当前日志文件中 - and no
+// result. The request is logged after model mapping, so the model name has to
+// keep coming from billing or the model's history splits in two.
+func TestRerankCall(t *testing.T) {
+	const rid = "RerankCallAaaaBbbbCcccDddd"
+	calls := map[string]*Record{}
+	scanLines(strings.NewReader(`[DEBUG] 2026/10/05 - 21:19:24 | `+rid+` | Rerank request body: {"documents":["the build failed with an error","sunny in Paris"],"model":"BAAI/bge-reranker-v2-m3","query":"why did the build fail","return_documents":false,"top_n":2}
+[DEBUG] 2026/10/05 - 21:19:25 | `+rid+` | reranker response body: {"id":"01a1","results":[{"index":0,"document":null,"relevance_score":0.91},{"index":1,"document":null,"relevance_score":0.02}],"meta":{"tokens":{"input_tokens":30,"output_tokens":0}}}
+[INFO] 2026/10/05 - 21:19:25 | `+rid+` | record consume log: userId=1, params={"channel_id":58,"prompt_tokens":30,"completion_tokens":0,"model_name":"bge-reranker-v2-m3","quota":1}
+`), calls)
+	r := calls[rid]
+	if r == nil {
+		t.Fatal("record missing")
+	}
+	r.finalize()
+
+	if r.Request.empty() || r.Incomplete {
+		t.Error("request missing - `Rerank request body:` was not recognised")
+	}
+	if r.Response.empty() {
+		t.Error("response missing - `reranker response body:` was not recognised")
+	}
+	if len(r.Errors) != 0 {
+		t.Errorf("errors = %v - a body containing \"error\" reached the catch-all", r.Errors)
+	}
+	if r.Model != "bge-reranker-v2-m3" {
+		t.Errorf("model = %q, want billing's bge-reranker-v2-m3", r.Model)
+	}
+	if r.Preview != "why did the build fail" {
+		t.Errorf("preview = %q, want the query", r.Preview)
+	}
+	if r.Usage == nil || r.Usage.PromptTokens == nil || *r.Usage.PromptTokens != 30 {
+		t.Errorf("usage = %+v, want billing's 30 prompt tokens", r.Usage)
+	}
+}
+
+// Gemini streams a function call whole, in one part. Fed through the fragment
+// joiner without an index, a second call to the same tool was glued onto the
+// first. Before that, they were not read at all.
+func TestGeminiStreamFunctionCalls(t *testing.T) {
+	const rid = "GeminiStreamCallsAaaaBbbb"
+	calls := map[string]*Record{}
+	data := func(body string) string {
+		return `[DEBUG] 2026/10/07 - 09:00:01 | ` + rid + ` | stream scanner data: data: ` + body + "\n"
+	}
+	scanLines(strings.NewReader(
+		`[DEBUG] 2026/10/07 - 09:00:00 | `+rid+` | text request body: {"contents":[{"role":"user","parts":[{"text":"read both"}]}]}`+"\n"+
+			data(`{"candidates":[{"content":{"role":"model","parts":[{"text":"Reading."}]}}]}`)+
+			data(`{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"read","args":{"p":"a"}}},{"functionCall":{"name":"read","args":{"p":"b"}}}]}}]}`)+
+			data(`{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"read","args":{"p":"c"}}}]}}],"usageMetadata":{"promptTokenCount":9,"candidatesTokenCount":20,"totalTokenCount":29}}`)), calls)
+	r := calls[rid]
+	r.finalize()
+
+	if len(r.StreamToolCalls) != 3 {
+		t.Fatalf("stream_tool_calls = %+v, want 3 separate calls", r.StreamToolCalls)
+	}
+	for i, want := range []string{`{"p":"a"}`, `{"p":"b"}`, `{"p":"c"}`} {
+		if got := r.StreamToolCalls[i].Function; got.Name != "read" || got.Arguments != want {
+			t.Errorf("call %d = %s %s, want read %s", i, got.Name, got.Arguments, want)
+		}
+	}
+	if r.StreamContent != "Reading." || r.UnknownCount != 0 {
+		t.Errorf("content = %q, unknown = %d", r.StreamContent, r.UnknownCount)
+	}
+	if strings.Join(r.CalledTools, ",") != "read" {
+		t.Errorf("called_tools = %v", r.CalledTools)
+	}
+}

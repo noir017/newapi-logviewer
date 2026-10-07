@@ -184,6 +184,10 @@ type Record struct {
 	// ingester to decide a call has stalled and will never complete.
 	lastSeen time.Time
 
+	// lastTS is the log timestamp of the newest line read for this call, as
+	// written ("2006/01/02 15:04:05"). See ingester.settled.
+	lastTS string
+
 	// anth accumulates Anthropic tool calls across chunk lines and across
 	// incremental read passes, since a tool's name and its arguments arrive on
 	// different lines that may land in different passes.
@@ -200,19 +204,77 @@ type Record struct {
 // ---- partial views over the raw bodies -------------------------------------
 
 type reqView struct {
-	Model    string `json:"model"`
-	Stream   bool   `json:"stream"`
-	Messages []struct {
-		Role    string          `json:"role"`
-		Content json.RawMessage `json:"content"`
-	} `json:"messages"`
-	Tools []struct {
+	Model    string       `json:"model"`
+	Stream   bool         `json:"stream"`
+	Messages []reqMessage `json:"messages"`
+	Tools    []struct {
 		Function struct {
 			Name string `json:"name"`
 		} `json:"function"`
 		Name string `json:"name"` // bare-schema tools (no "function" wrapper)
+		// Gemini groups every function under one tool entry.
+		FunctionDeclarations []struct {
+			Name string `json:"name"`
+		} `json:"functionDeclarations"`
 	} `json:"tools"`
+
+	// Gemini's native request, which every Google-family path logs in place of
+	// the client's: the conversation is `contents`, roles user/model, with text
+	// in parts. See fromGemini.
+	Contents []struct {
+		Role  string `json:"role"`
+		Parts []struct {
+			Text             string          `json:"text"`
+			Thought          bool            `json:"thought"`
+			FunctionResponse json.RawMessage `json:"functionResponse"`
+		} `json:"parts"`
+	} `json:"contents"`
+
+	// A rerank request: one query scored against many documents.
+	Query     string            `json:"query"`
+	Documents []json.RawMessage `json:"documents"`
 }
+
+type reqMessage struct {
+	Role    string          `json:"role"`
+	Content json.RawMessage `json:"content"`
+}
+
+// fromGemini fills Messages from Gemini's contents, so the message count, turns
+// and row preview derive as they do for every other format. Without it a
+// Gemini call listed with an empty preview and 0 messages - hindsight's
+// fact extraction, most of the Gemini traffic here, was unreadable from the
+// list. A content holding only functionResponse parts is the tool result it is
+// in OpenAI's terms, so it is not taken for the user's prompt.
+func (q *reqView) fromGemini() {
+	if len(q.Messages) > 0 || len(q.Contents) == 0 {
+		return
+	}
+	for _, c := range q.Contents {
+		var text []string
+		results := 0
+		for _, p := range c.Parts {
+			switch {
+			case len(p.FunctionResponse) > 0:
+				results++
+			case p.Text != "" && !p.Thought:
+				text = append(text, p.Text)
+			}
+		}
+		role := c.Role
+		switch {
+		case role == "model":
+			role = "assistant"
+		case len(text) == 0 && results > 0:
+			role = "tool"
+		}
+		b, _ := json.Marshal(strings.Join(text, " "))
+		q.Messages = append(q.Messages, reqMessage{Role: role, Content: b})
+	}
+}
+
+// isRerank reports whether the request is a rerank call.
+func (q *reqView) isRerank() bool { return q.Query != "" && len(q.Documents) > 0 }
 
 type respView struct {
 	Choices []struct {
@@ -347,7 +409,8 @@ type streamChunk struct {
 				Text string `json:"text"`
 				// Gemini marks chain-of-thought parts; they belong in the
 				// reasoning field, not mixed into the answer.
-				Thought bool `json:"thought"`
+				Thought      bool        `json:"thought"`
+				FunctionCall *geminiCall `json:"functionCall"`
 			} `json:"parts"`
 		} `json:"content"`
 	} `json:"candidates"`
@@ -463,6 +526,34 @@ func (a *responsesUsage) toUsage() *Usage {
 		PromptDetails:     a.InputDetails,
 		CompletionDetails: a.OutputDetails,
 	}
+}
+
+// geminiCall is a Gemini functionCall part. Unlike every other format's, it
+// arrives whole - name and the complete args object in one part - so there is
+// nothing to join, and two calls to the same tool are two calls.
+type geminiCall struct {
+	ID   string          `json:"id"`
+	Name string          `json:"name"`
+	Args json.RawMessage `json:"args"`
+}
+
+// geminiCalls returns the function calls a Gemini chunk carried, in the
+// OpenAI shape the record stores. They are left out of text(): toolAcc joins
+// index-less fragments onto the call before them when the name repeats, which
+// is right for a stream of fragments and wrong for whole calls.
+func (ch *streamChunk) geminiCalls() []ToolCall {
+	var out []ToolCall
+	for _, cand := range ch.Candidates {
+		for _, p := range cand.Content.Parts {
+			if fc := p.FunctionCall; fc != nil {
+				tc := ToolCall{ID: fc.ID, Type: "function"}
+				tc.Function.Name = fc.Name
+				tc.Function.Arguments = string(fc.Args)
+				out = append(out, tc)
+			}
+		}
+	}
+	return out
 }
 
 // geminiUsage is Gemini's token accounting, the same in a stream chunk and in a
@@ -854,6 +945,19 @@ func (ta *toolAcc) calls() []ToolCall {
 	return out
 }
 
+// addWhole records a call that arrived complete under the next free index, so
+// it can never be merged into the call before it.
+func (ta *toolAcc) addWhole(tc ToolCall) {
+	next := 0
+	for idx := range ta.byIdx {
+		if idx >= next {
+			next = idx + 1
+		}
+	}
+	tc.Index = &next
+	ta.add(tc)
+}
+
 // ---- parsing ---------------------------------------------------------------
 
 func blank(rid string) *Record {
@@ -1025,6 +1129,7 @@ func handleLine(line string, calls map[string]*Record) string {
 		if rec.TS == "" {
 			rec.TS = ts
 		}
+		rec.lastTS = ts
 		return g[2]
 	}
 
@@ -1037,20 +1142,17 @@ func handleLine(line string, calls map[string]*Record) string {
 	if rec.TS == "" {
 		rec.TS = ts
 	}
+	rec.lastTS = ts
 
-	switch n := responseMarker(msg); {
-	case strings.HasPrefix(msg, "text request body:"):
-		rec.Request = parseRaw(strings.TrimSpace(msg[len("text request body:"):]))
-	// Anthropic-native relays log the request under a different marker. Missing
-	// it did more than blank the request pane: the body fell through to the
-	// error arm below, which matches any message containing "error" - and the
-	// Claude Code system prompt contains the word. Every claude-opus-5 prompt
-	// was being filed as an error. Both markers must be handled here, ahead of
-	// that catch-all.
-	case strings.HasPrefix(msg, "requestBody:"):
-		rec.Request = parseRaw(strings.TrimSpace(msg[len("requestBody:"):]))
-	case n > 0:
-		rec.Response = parseRaw(strings.TrimSpace(msg[n:]))
+	switch req, resp := marker(msg, requestMarkers), marker(msg, responseMarkers); {
+	// Every body marker must be handled here, ahead of the error catch-all at the
+	// bottom, which matches any message containing "error". Anthropic's
+	// `requestBody:` was the first lesson: the Claude Code system prompt
+	// contains the word, so every claude-opus-5 prompt was filed as an error.
+	case req > 0:
+		rec.Request = parseRaw(strings.TrimSpace(msg[req:]))
+	case resp > 0:
+		rec.Response = parseRaw(strings.TrimSpace(msg[resp:]))
 	case strings.HasPrefix(msg, "stream scanner data:"):
 		ch, body, ok := streamChunkOf(msg[len("stream scanner data:"):])
 		switch {
@@ -1132,26 +1234,35 @@ func get(calls map[string]*Record, rid string) *Record {
 	return r
 }
 
-// responseMarkers are the prefixes new-api logs a non-streaming response body
-// under. Each relay path spells its own, and only the OpenAI one was handled:
-// the rest fell through to the error arm, where a body is filed as an error if
-// it happens to contain the word and dropped if not. Every non-streaming
-// Gemini and Claude answer was lost that way.
+// requestMarkers and responseMarkers are the prefixes new-api logs a request
+// body and a non-streaming response body under. Each relay path spells its
+// own. Only the OpenAI pair was handled at first: the rest fell through to the
+// error arm, where a body is filed as an error if it happens to contain the
+// word and dropped if not. Every non-streaming Gemini and Claude answer, and
+// every rerank call, was lost that way.
 //
-// Each logs the upstream's own format, which finalize and the UI read in all
-// three shapes - see respView. Verified against new-api v1.0.0-rc.40.
+// Bodies are logged in the upstream's own format, which finalize and the UI
+// read in each shape - see reqView and respView. Verified against new-api
+// v1.0.0-rc.40.
+var requestMarkers = []string{
+	"text request body:",   // OpenAI-compatible (compatible_handler.go)
+	"requestBody:",         // Anthropic /v1/messages, /v1/responses
+	"Gemini request body:", // Gemini, native generateContent
+	"Rerank request body:", // rerank
+}
+
 var responseMarkers = []string{
 	"upstream response body:",         // OpenAI-compatible (relay-openai.go)
 	"Gemini response body:",           // Gemini, via /v1/chat/completions
 	"Gemini native response body:",    // Gemini, native generateContent
 	"Gemini responses response body:", // Gemini, via /v1/responses
 	"responseBody:",                   // Anthropic, /v1/messages
+	"reranker response body:",         // rerank
 }
 
-// responseMarker returns the length of the response-body marker msg starts
-// with, or 0 if it starts with none.
-func responseMarker(msg string) int {
-	for _, m := range responseMarkers {
+// marker returns the length of whichever of markers msg starts with, or 0.
+func marker(msg string, markers []string) int {
+	for _, m := range markers {
 		if strings.HasPrefix(msg, m) {
 			return len(m)
 		}
@@ -1236,6 +1347,7 @@ func (r *Record) finalize() {
 	var req reqView
 	if !r.Request.empty() {
 		json.Unmarshal(r.Request, &req)
+		req.fromGemini()
 	}
 	var resp respView
 	if !r.Response.empty() {
@@ -1249,6 +1361,13 @@ func (r *Record) finalize() {
 
 	r.Model = req.Model
 	if r.Model == "" {
+		r.Model = bill.ModelName
+	}
+	// A rerank request is logged after model mapping ("BAAI/bge-reranker-v2-m3"),
+	// while billing carries the name the client called. Rerank records were
+	// listed under the billing name for as long as their request went unparsed,
+	// so they keep it rather than splitting the model's history in two.
+	if req.isRerank() && bill.ModelName != "" {
 		r.Model = bill.ModelName
 	}
 	r.IsStream = req.Stream || len(r.chunks) > 0 || r.sawChunks
@@ -1272,6 +1391,9 @@ func (r *Record) finalize() {
 			reasoning.WriteString(rs)
 			for _, frag := range tools {
 				r.tacc.add(frag)
+			}
+			for _, tc := range ch.geminiCalls() {
+				r.tacc.addWhole(tc)
 			}
 			if u := ch.usage(); u != nil {
 				r.Usage = mergeUsage(r.Usage, u)
@@ -1318,6 +1440,11 @@ func (r *Record) finalize() {
 		if n != "" {
 			r.ToolNames = append(r.ToolNames, n)
 		}
+		for _, d := range t.FunctionDeclarations {
+			if d.Name != "" {
+				r.ToolNames = append(r.ToolNames, d.Name)
+			}
+		}
 	}
 	called := r.StreamToolCalls
 	if !r.IsStream {
@@ -1348,12 +1475,17 @@ func (r *Record) finalize() {
 	}
 	r.Turns = turns
 
-	// Preview text for the collapsed row: last user message.
+	// Preview text for the collapsed row: last user message, or what a rerank
+	// call was ranking for.
+	r.Preview = ""
 	for i := len(req.Messages) - 1; i >= 0; i-- {
 		if req.Messages[i].Role == "user" {
 			r.Preview = clipRunes(contentText(req.Messages[i].Content), 200)
 			break
 		}
+	}
+	if r.Preview == "" && req.isRerank() {
+		r.Preview = clipRunes(req.Query, 200)
 	}
 	r.Incomplete = r.Request.empty() // truncated/rotated-out request line
 
