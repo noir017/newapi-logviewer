@@ -743,3 +743,39 @@ func TestHealthAllowsOneIngestInterval(t *testing.T) {
 		t.Error("still healthy two hours after the last push of an hourly sender")
 	}
 }
+
+// A billed call whose lines were written well before they were read is settled
+// in the pass that reads them. Read time alone made every call wait for the
+// next pass: an extra hour on the hourly sender, and after a restart its whole
+// re-read spool shipped nothing for an hour.
+func TestHourlySenderShipsWhatItReadsInTheSamePass(t *testing.T) {
+	var got int
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		zr, _ := gzip.NewReader(r.Body)
+		dec, n := json.NewDecoder(zr), 0
+		for {
+			var rec Record
+			if dec.Decode(&rec) != nil {
+				break
+			}
+			n++
+		}
+		got += n
+		json.NewEncoder(w).Encode(pushAck{Success: true, Stored: n})
+	}))
+	defer ts.Close()
+
+	spool := t.TempDir()
+	at := time.Now().Add(-20 * time.Minute).Format("2006/01/02 - 15:04:05")
+	os.WriteFile(filepath.Join(spool, "oneapi.log"), []byte(
+		`[DEBUG] `+at+` | HourlyTickAaaaBbbbCccc00 | requestBody: {"model":"claude-opus-5-5","stream":true,"messages":[{"role":"user","content":"hi"}]}`+"\n"+
+			`[INFO]  `+at+` | HourlyTickAaaaBbbbCccc00 | record consume log: userId=1, params={"model_name":"claude-opus-5-5","quota":5}`+"\n"), 0o644)
+
+	ing := newIngester(spool, newArchive(t.TempDir()), time.Hour, 0).withPusher(newPusher(Config{
+		PushURL: pushEndpoint(ts.URL), PodName: "oracle", PushTimeout: 5 * time.Second,
+	}))
+	ing.once()
+	if got != 1 || len(ing.pending) != 0 {
+		t.Errorf("pushed %d, pending %d after one pass; want 1 and 0 - a call billed 20 minutes ago waited for the next tick", got, len(ing.pending))
+	}
+}

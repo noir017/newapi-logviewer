@@ -1007,10 +1007,15 @@ func TestIngestWaitsForChunksAfterBilling(t *testing.T) {
 	arc := newArchive(arcDir)
 	defer arc.Close()
 
+	// Stamped now, not with a fixed date: the quiet period is also measured on
+	// the log's own clock (ingester.settled), so lines that claim to be weeks
+	// old are rightly treated as long settled. This is the live case - billing
+	// written a second ago, its trailing chunk not yet.
+	at := func(ago time.Duration) string { return time.Now().Add(-ago).Format("2006/01/02 - 15:04:05") }
 	p := filepath.Join(spool, "oneapi-20260811204357.log")
 	os.WriteFile(p, []byte(
-		`[DEBUG] 2026/08/11 - 20:54:02 | SettleAaaaBbbbCcccDddd00 | requestBody: {"model":"claude-opus-5","stream":true,"messages":[]}`+"\n"+
-			`[INFO]  2026/08/11 - 20:54:04 | SettleAaaaBbbbCcccDddd00 | record consume log: userId=1, params={"model_name":"claude-opus-5","quota":42}`+"\n"), 0o644)
+		`[DEBUG] `+at(3*time.Second)+` | SettleAaaaBbbbCcccDddd00 | requestBody: {"model":"claude-opus-5","stream":true,"messages":[]}`+"\n"+
+			`[INFO]  `+at(time.Second)+` | SettleAaaaBbbbCcccDddd00 | record consume log: userId=1, params={"model_name":"claude-opus-5","quota":42}`+"\n"), 0o644)
 
 	ing := newIngester(spool, arc, time.Hour, 0) // settleAfter at its default
 	ing.once()
@@ -1020,7 +1025,7 @@ func TestIngestWaitsForChunksAfterBilling(t *testing.T) {
 
 	// A trailing chunk lands after billing, as it does in the real log.
 	f, _ := os.OpenFile(p, os.O_APPEND|os.O_WRONLY, 0o644)
-	f.WriteString(`[DEBUG] 2026/08/11 - 20:54:05 | SettleAaaaBbbbCcccDddd00 | stream scanner data: data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"trailing"}}` + "\n")
+	f.WriteString(`[DEBUG] ` + at(0) + ` | SettleAaaaBbbbCcccDddd00 | stream scanner data: data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"trailing"}}` + "\n")
 	f.Close()
 
 	ing.settleAfter = 0 // the period has now "elapsed"
