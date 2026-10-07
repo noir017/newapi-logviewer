@@ -10,7 +10,11 @@ const fs = require('fs');
 const assert = require('assert');
 
 const html = fs.readFileSync(__dirname + '/ui.html', 'utf8');
-const script = html.match(/<script>([\s\S]*?)<\/script>/)[1];
+// The LAST inline script: a comment above the chart include contains the tag
+// literally, so a first-match `<script>(...)</script>` landed on that comment
+// and found no functions at all.
+const script = html.slice(html.lastIndexOf('<script>') + '<script>'.length,
+                          html.lastIndexOf('</script>'));
 
 function extract(name) {
   const re = new RegExp(`function ${name}\\(r\\)\\{[\\s\\S]*?\\n\\}`);

@@ -330,6 +330,11 @@ pre.j{background:#0d1017;border:1px solid var(--line);border-radius:7px;padding:
 
 .tc{background:#1a1710;border:1px solid #4a3a12;border-radius:7px;padding:9px 11px;margin-bottom:6px}
 .tc .nm{color:var(--tool);font-weight:600;font-size:13px}
+.rr{display:grid;grid-template-columns:34px 62px 1fr;gap:2px 10px;align-items:baseline;
+  padding:6px 0;border-bottom:1px solid var(--line);font-size:12.5px}
+.rr .rk{color:var(--dim2)}
+.rr .sc{font-weight:600;font-variant-numeric:tabular-nums}
+.rr .txt{white-space:pre-wrap;word-break:break-word}
 .reason{background:#141019;border:1px solid #2e2440;border-radius:7px;padding:9px 11px;
   color:#c9b8e8;font-size:12.5px;white-space:pre-wrap;max-height:240px;overflow-y:auto}
 .usage{display:flex;flex-wrap:wrap;border:1px solid var(--line);border-radius:8px;overflow:hidden}
@@ -659,21 +664,112 @@ function usageHtml(u){
     ${cell('缓存', u.prompt_tokens_details?.cached_tokens)}</div>`;
 }
 
+// The output of a non-streaming call, from whichever wire format the upstream
+// answered in. new-api logs the response as the provider sent it: OpenAI's
+// choices, Gemini's candidates (every Google-family path, whatever API the
+// client called), or Anthropic's content blocks. Only the first was read, so a
+// Gemini or Claude answer showed （无文本内容） while it sat in 原始响应 JSON.
+// Tool calls come back in OpenAI's shape, which is what the renderer takes.
+function respOut(resp){
+  const msg = resp.choices?.[0]?.message;
+  if (msg) return {content: msg.content || '', reasoning: msg.reasoning_content || '',
+                   tcs: msg.tool_calls || []};
+  const out = {content: '', reasoning: '', tcs: []};
+  const call = (id, name, args) => out.tcs.push({id, type: 'function',
+    function: {name, arguments: JSON.stringify(args ?? {})}});
+  for (const p of resp.candidates?.[0]?.content?.parts || []){
+    if (p.functionCall) call(p.functionCall.id, p.functionCall.name, p.functionCall.args);
+    else if (p.thought) out.reasoning += p.text || '';
+    else out.content += p.text || '';
+  }
+  for (const b of Array.isArray(resp.content) ? resp.content : []){
+    if (b.type === 'text') out.content += b.text || '';
+    else if (b.type === 'thinking') out.reasoning += b.thinking || '';
+    else if (b.type === 'tool_use') call(b.id, b.name, b.input);
+  }
+  return out;
+}
+
+// The request as the transcript renderer takes it - OpenAI's messages and
+// tools - from whichever shape it was logged in. Gemini's arrives native on
+// every Google-family path: contents with roles user/model, the system prompt
+// apart in systemInstruction, every function under one functionDeclarations
+// entry. Read as OpenAI's, a Gemini call showed no conversation at all, only
+// raw contents under 请求参数. `slim` is what is left for that section.
+function reqIn(req){
+  const slim = {...req};
+  for (const k of ['messages', 'tools', 'contents', 'systemInstruction', 'documents'])
+    delete slim[k];
+  if (!Array.isArray(req.contents) || req.messages)
+    return {msgs: req.messages || [], tools: req.tools || [], slim};
+
+  const text = parts => parts.filter(p => typeof p.text === 'string' && !p.thought)
+    .map(p => p.text).join('');
+  const msgs = [];
+  const sys = text(req.systemInstruction?.parts || []);
+  if (sys) msgs.push({role: 'system', content: sys});
+  for (const c of req.contents){
+    const parts = c.parts || [];
+    const files = parts.filter(p => p.inlineData || p.fileData)
+      .map(p => `[${(p.inlineData || p.fileData).mimeType || 'file'}]`).join(' ');
+    const body = [text(parts), files].filter(Boolean).join('\n');
+    if (c.role === 'model'){
+      msgs.push({role: 'assistant', content: body,
+        tool_calls: parts.filter(p => p.functionCall).map(p => ({
+          id: p.functionCall.id, type: 'function',
+          function: {name: p.functionCall.name,
+                     arguments: JSON.stringify(p.functionCall.args ?? {})}}))});
+      continue;
+    }
+    // A function's result rides in a user content; in OpenAI's terms it is a
+    // tool message, which is what attaches it to the call that asked for it.
+    const results = parts.filter(p => p.functionResponse);
+    for (const p of results)
+      msgs.push({role: 'tool', name: p.functionResponse.name,
+                 content: JSON.stringify(p.functionResponse.response ?? {})});
+    if (body || !results.length) msgs.push({role: 'user', content: body});
+  }
+  return {msgs, tools: (req.tools || []).flatMap(t => t.functionDeclarations || []), slim};
+}
+
+// A rerank call has no conversation: one query, and the documents as the model
+// ranked them. The response names each document only by index (hindsight sends
+// return_documents: false), so the text comes from the request.
+function rerankHtml(req, resp){
+  const docs = req.documents || [];
+  const docText = d => typeof d === 'string' ? d : d?.text ?? JSON.stringify(d ?? null);
+  const results = resp.results || [];
+  const rows = results.map((x, i) => {
+    const t = docText(x.document != null ? x.document : docs[x.index]);
+    return `<div class="rr"><span class="rk">#${i + 1}</span>
+      <span class="sc">${Number(x.relevance_score ?? 0).toFixed(4)}</span>
+      <div class="txt">${esc([...t].slice(0, 400).join(''))}<span class="rk"> · 文档 ${x.index}</span></div></div>`;
+  }).join('');
+  return {
+    query: `<div class="msg user"><div class="role">query</div>
+      ${clamp(`<div class="txt">${esc(req.query)}</div>`, statOf(req.query), {h: 84})}</div>`,
+    stat: `${results.length} / ${docs.length} 篇`,
+    rows: rows ? clamp(rows, `${results.length} 条`, {h: 240}) : '',
+  };
+}
+
 function detail(r){
   const req = r.request || {}, resp = r.response || {};
-  const msg = resp.choices?.[0]?.message;
-  const content = r.is_stream ? r.stream_content : (msg?.content || '');
-  const reasoning = r.is_stream ? r.stream_reasoning : (msg?.reasoning_content || '');
-  const tcs = (r.is_stream ? r.stream_tool_calls : msg?.tool_calls) || [];
+  const out = r.is_stream ? null : respOut(resp);
+  const content = r.is_stream ? r.stream_content : out.content;
+  const reasoning = r.is_stream ? r.stream_reasoning : out.reasoning;
+  const tcs = (r.is_stream ? r.stream_tool_calls : out.tcs) || [];
   // `all` adds a section-level 展开全部 / 收起全部 control
   const sec = (title, n, inner, all) => inner ?
     `<section><div class="st"><h3>${title}</h3>${n ? `<span class="n">${n}</span>` : ''}
       <span class="grow"></span>
       ${all ? '<span class="toggle" data-all="1">展开全部</span>' : ''}
      </div>${inner}</section>` : '';
-  const slim = {...req}; delete slim.messages; delete slim.tools;
+  const {msgs, tools, slim} = reqIn(req);
+  const rr = typeof req.query === 'string' && Array.isArray(req.documents)
+    ? rerankHtml(req, resp) : null;
+  if (rr) delete slim.query;
 
-  const msgs = req.messages || [];
   // total prompt size across all messages - the number that tells you whether
   // a request was bloated, without expanding every message to count
   const promptChars = msgs.reduce((n, m) => n + [...contentText(m.content)].length, 0);
@@ -743,16 +839,17 @@ function detail(r){
     <div style="grid-column:1/-1"><b>上游地址</b><span>${esc(r.upstream_url || '—')}</span></div>
   </div>
   ${sec('用量', '', usageHtml(r.usage))}
-  ${(req.tools || []).length ? sec('可用工具', '', card('Tools 定义',
-      `${req.tools.length} 个可用${r.called_tools?.length ? ` · 本次调用 ${r.called_tools.length}` : ''}`,
-      `<div class="tools-grid">${toolsHtml(req.tools, r.called_tools)}</div>`,
+  ${tools.length ? sec('可用工具', '', card('Tools 定义',
+      `${tools.length} 个可用${r.called_tools?.length ? ` · 本次调用 ${r.called_tools.length}` : ''}`,
+      `<div class="tools-grid">${toolsHtml(tools, r.called_tools)}</div>`,
       // closed by default: 20 tool schemas ahead of the conversation is the
       // main thing that buries the actual content
       {open: false, right: '<span class="toggle exp-all" data-all="1">展开全部</span>'})) : ''}
   ${msgs.length ? sec('会话',
       `${msgs.length} 条消息 · ${turns.length} 次调用 · ${promptChars.toLocaleString()} 字符`,
       convHtml, true) : ''}
-  ${sec('本次模型返回', content ? statOf(content) : '', content
+  ${rr ? sec('查询', '', rr.query) + sec('排序结果', rr.stat, rr.rows) :
+    sec('本次模型返回', content ? statOf(content) : '', content
       ? `<div class="msg assistant"><div class="role">assistant</div>
          ${clamp(`<div class="txt">${esc(content)}</div>`, statOf(content), {h: 84})}</div>`
       : (tcs.length ? '' : '<div class="msg assistant"><div class="role">assistant</div><div class="txt" style="color:var(--dim2)">（无文本内容）</div></div>'))}
