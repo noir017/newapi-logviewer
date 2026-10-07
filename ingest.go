@@ -187,8 +187,7 @@ func (i *ingester) flushFinished() {
 	var ready []*Record // push mode: finished, waiting for flushPush
 	for rid, rec := range i.pending {
 		done := rec.Status != nil && rec.TS != ""
-		if !done && rec.billingSeen && !rec.lastSeen.IsZero() &&
-			now.Sub(rec.lastSeen) >= i.settleAfter {
+		if !done && rec.billingSeen && i.settled(rec, now) {
 			// No GIN line, but billing arrived - the response was delivered and
 			// charged. gin's access logger writes to a different sink than the
 			// file New API logs to, so on this deployment the GIN line never
@@ -318,6 +317,31 @@ func (i *ingester) flushPush(ready []*Record, now time.Time) {
 		i.appendFails, i.lastErr = 0, ""
 		ready = ready[n:]
 	}
+}
+
+// settled reports whether a billed call has been quiet for settleAfter, and so
+// can be archived without its GIN line.
+//
+// Quiet by either clock. By read time alone, a call read on one tick could only
+// settle on the next: harmless at 2-second polling, but an hourly sender held
+// every call one extra hour, and after a restart re-read its whole spool and
+// shipped none of it for an hour. The log line's own timestamp says how long
+// ago New API wrote it, and every line written before this read was read in
+// it - so a last line already settleAfter old cannot be followed by a trailing
+// chunk this pass missed.
+//
+// Log time can only shorten the wait, never lengthen it: a viewer whose TZ
+// runs ahead of New API's sees lines in the future and falls back to read
+// time. One running behind would settle a just-billed call at once, risking
+// the few milliseconds of trailing chunks settleAfter exists for - which is why
+// this is not used for the stall deadline, where the same error would archive
+// a call that is still streaming.
+func (i *ingester) settled(rec *Record, now time.Time) bool {
+	if !rec.lastSeen.IsZero() && now.Sub(rec.lastSeen) >= i.settleAfter {
+		return true
+	}
+	t, err := time.ParseInLocation("2006/01/02 15:04:05", rec.lastTS, time.Local)
+	return err == nil && now.Sub(t) >= i.settleAfter
 }
 
 // worthArchiving keeps dashboard polling out of the permanent record.
