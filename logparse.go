@@ -22,11 +22,15 @@ import (
 //
 // Events for one call are interleaved with other calls, so we group by rid.
 // Lines whose id column is SYSTEM (background jobs) carry no rid and are skipped.
+//
+// An event is usually one line, but not always: a body logged pretty-printed
+// runs on over the lines below it - see scanEntries. Both patterns below are
+// (?s) so that the message group spans those lines too.
 
 var (
-	lineRE = regexp.MustCompile(`^\[([A-Z]+)\]\s+(\d{4}/\d{2}/\d{2})\s+-\s+(\d{2}:\d{2}:\d{2})\s+\|\s+(.*)$`)
+	lineRE = regexp.MustCompile(`(?s)^\[([A-Z]+)\]\s+(\d{4}/\d{2}/\d{2})\s+-\s+(\d{2}:\d{2}:\d{2})\s+\|\s+(.*)$`)
 	// a request id is 24+ alphanumerics; "SYSTEM"/"relay"/"api" are not ids
-	ridRE = regexp.MustCompile(`^([A-Za-z0-9]{24,})\s+\|\s+(.*)$`)
+	ridRE = regexp.MustCompile(`(?s)^([A-Za-z0-9]{24,})\s+\|\s+(.*)$`)
 	ginRE = regexp.MustCompile(`^(relay|api)\s+\|\s+([A-Za-z0-9]{24,})\s+\|\s+(\d{3})\s+\|\s+(\S+)\s+\|\s+(\S+)\s+\|\s+([A-Z]+)\s+(\S+)`)
 )
 
@@ -180,6 +184,10 @@ type Record struct {
 	// ingester to decide a call has stalled and will never complete.
 	lastSeen time.Time
 
+	// lastTS is the log timestamp of the newest line read for this call, as
+	// written ("2006/01/02 15:04:05"). See ingester.settled.
+	lastTS string
+
 	// anth accumulates Anthropic tool calls across chunk lines and across
 	// incremental read passes, since a tool's name and its arguments arrive on
 	// different lines that may land in different passes.
@@ -196,19 +204,77 @@ type Record struct {
 // ---- partial views over the raw bodies -------------------------------------
 
 type reqView struct {
-	Model    string `json:"model"`
-	Stream   bool   `json:"stream"`
-	Messages []struct {
-		Role    string          `json:"role"`
-		Content json.RawMessage `json:"content"`
-	} `json:"messages"`
-	Tools []struct {
+	Model    string       `json:"model"`
+	Stream   bool         `json:"stream"`
+	Messages []reqMessage `json:"messages"`
+	Tools    []struct {
 		Function struct {
 			Name string `json:"name"`
 		} `json:"function"`
 		Name string `json:"name"` // bare-schema tools (no "function" wrapper)
+		// Gemini groups every function under one tool entry.
+		FunctionDeclarations []struct {
+			Name string `json:"name"`
+		} `json:"functionDeclarations"`
 	} `json:"tools"`
+
+	// Gemini's native request, which every Google-family path logs in place of
+	// the client's: the conversation is `contents`, roles user/model, with text
+	// in parts. See fromGemini.
+	Contents []struct {
+		Role  string `json:"role"`
+		Parts []struct {
+			Text             string          `json:"text"`
+			Thought          bool            `json:"thought"`
+			FunctionResponse json.RawMessage `json:"functionResponse"`
+		} `json:"parts"`
+	} `json:"contents"`
+
+	// A rerank request: one query scored against many documents.
+	Query     string            `json:"query"`
+	Documents []json.RawMessage `json:"documents"`
 }
+
+type reqMessage struct {
+	Role    string          `json:"role"`
+	Content json.RawMessage `json:"content"`
+}
+
+// fromGemini fills Messages from Gemini's contents, so the message count, turns
+// and row preview derive as they do for every other format. Without it a
+// Gemini call listed with an empty preview and 0 messages - hindsight's
+// fact extraction, most of the Gemini traffic here, was unreadable from the
+// list. A content holding only functionResponse parts is the tool result it is
+// in OpenAI's terms, so it is not taken for the user's prompt.
+func (q *reqView) fromGemini() {
+	if len(q.Messages) > 0 || len(q.Contents) == 0 {
+		return
+	}
+	for _, c := range q.Contents {
+		var text []string
+		results := 0
+		for _, p := range c.Parts {
+			switch {
+			case len(p.FunctionResponse) > 0:
+				results++
+			case p.Text != "" && !p.Thought:
+				text = append(text, p.Text)
+			}
+		}
+		role := c.Role
+		switch {
+		case role == "model":
+			role = "assistant"
+		case len(text) == 0 && results > 0:
+			role = "tool"
+		}
+		b, _ := json.Marshal(strings.Join(text, " "))
+		q.Messages = append(q.Messages, reqMessage{Role: role, Content: b})
+	}
+}
+
+// isRerank reports whether the request is a rerank call.
+func (q *reqView) isRerank() bool { return q.Query != "" && len(q.Documents) > 0 }
 
 type respView struct {
 	Choices []struct {
@@ -217,6 +283,77 @@ type respView struct {
 		} `json:"message"`
 	} `json:"choices"`
 	Usage *Usage `json:"usage"`
+
+	// Gemini's native response, which every Google-family path logs as it was
+	// received, whatever API the client called. Tool calls are functionCall
+	// parts, and usage is the same usageMetadata its stream chunks carry.
+	Candidates []struct {
+		Content struct {
+			Parts []struct {
+				FunctionCall *struct {
+					Name string `json:"name"`
+				} `json:"functionCall"`
+			} `json:"parts"`
+		} `json:"content"`
+	} `json:"candidates"`
+	UsageMetadata *geminiUsage `json:"usageMetadata"`
+
+	// Anthropic's (/v1/messages): tool calls are tool_use content blocks. Its
+	// usage sits at the "usage" key too, with different members - see usage().
+	Type    string `json:"type"`
+	Content []struct {
+		Type string `json:"type"`
+		Name string `json:"name"`
+	} `json:"content"`
+}
+
+// usage normalises whichever usage block a non-streaming response carried.
+//
+// Anthropic's is tested first, from the raw body, for the reason spelled out on
+// streamChunk.usage: its "usage" key decodes into the OpenAI-shaped field as a
+// non-nil struct with every member nil, which would both blank the usage pane
+// and suppress the billing fallback in finalize.
+func (v *respView) usage(raw Raw) *Usage {
+	if v.Type == "message" {
+		var a struct {
+			Usage *anthropicUsage `json:"usage"`
+		}
+		if json.Unmarshal(raw, &a) == nil {
+			return a.Usage.toUsage()
+		}
+	}
+	if v.UsageMetadata != nil {
+		return v.UsageMetadata.toUsage()
+	}
+	return v.Usage
+}
+
+// toolCalls returns the calls a non-streaming response made. Only OpenAI's
+// carry arguments in this shape; the others are reduced to their names, which
+// is all the list row needs - the UI reads the full calls from the raw body.
+func (v *respView) toolCalls() []ToolCall {
+	if len(v.Choices) > 0 {
+		return v.Choices[0].Message.ToolCalls
+	}
+	var out []ToolCall
+	named := func(n string) {
+		var tc ToolCall
+		tc.Function.Name = n
+		out = append(out, tc)
+	}
+	if len(v.Candidates) > 0 {
+		for _, p := range v.Candidates[0].Content.Parts {
+			if p.FunctionCall != nil {
+				named(p.FunctionCall.Name)
+			}
+		}
+	}
+	for _, b := range v.Content {
+		if b.Type == "tool_use" {
+			named(b.Name)
+		}
+	}
+	return out
 }
 
 type billView struct {
@@ -272,16 +409,12 @@ type streamChunk struct {
 				Text string `json:"text"`
 				// Gemini marks chain-of-thought parts; they belong in the
 				// reasoning field, not mixed into the answer.
-				Thought bool `json:"thought"`
+				Thought      bool        `json:"thought"`
+				FunctionCall *geminiCall `json:"functionCall"`
 			} `json:"parts"`
 		} `json:"content"`
 	} `json:"candidates"`
-	UsageMetadata *struct {
-		PromptTokenCount     *int `json:"promptTokenCount"`
-		CandidatesTokenCount *int `json:"candidatesTokenCount"`
-		TotalTokenCount      *int `json:"totalTokenCount"`
-		ThoughtsTokenCount   *int `json:"thoughtsTokenCount"`
-	} `json:"usageMetadata"`
+	UsageMetadata *geminiUsage `json:"usageMetadata"`
 
 	// Anthropic's native streaming shape, logged verbatim for Claude-family
 	// channels on the /v1/messages path. Same lesson as Gemini above, learned
@@ -393,6 +526,83 @@ func (a *responsesUsage) toUsage() *Usage {
 		PromptDetails:     a.InputDetails,
 		CompletionDetails: a.OutputDetails,
 	}
+}
+
+// geminiCall is a Gemini functionCall part. Unlike every other format's, it
+// arrives whole - name and the complete args object in one part - so there is
+// nothing to join, and two calls to the same tool are two calls.
+type geminiCall struct {
+	ID   string          `json:"id"`
+	Name string          `json:"name"`
+	Args json.RawMessage `json:"args"`
+}
+
+// geminiCalls returns the function calls a Gemini chunk carried, in the
+// OpenAI shape the record stores. They are left out of text(): toolAcc joins
+// index-less fragments onto the call before them when the name repeats, which
+// is right for a stream of fragments and wrong for whole calls.
+func (ch *streamChunk) geminiCalls() []ToolCall {
+	var out []ToolCall
+	for _, cand := range ch.Candidates {
+		for _, p := range cand.Content.Parts {
+			if fc := p.FunctionCall; fc != nil {
+				tc := ToolCall{ID: fc.ID, Type: "function"}
+				tc.Function.Name = fc.Name
+				tc.Function.Arguments = string(fc.Args)
+				out = append(out, tc)
+			}
+		}
+	}
+	return out
+}
+
+// geminiUsage is Gemini's token accounting, the same in a stream chunk and in a
+// whole non-streaming response.
+type geminiUsage struct {
+	PromptTokenCount        *int `json:"promptTokenCount"`
+	ToolUsePromptTokenCount *int `json:"toolUsePromptTokenCount"`
+	CandidatesTokenCount    *int `json:"candidatesTokenCount"`
+	TotalTokenCount         *int `json:"totalTokenCount"`
+	ThoughtsTokenCount      *int `json:"thoughtsTokenCount"`
+	CachedContentTokenCount *int `json:"cachedContentTokenCount"`
+}
+
+// toUsage maps Gemini's counts the way new-api bills them (relayconvert's
+// UsageFromGeminiMetadata, rc.40). candidatesTokenCount excludes thinking, so
+// thoughts are added to the output and also surfaced as reasoning. Counting
+// candidates alone lost the whole output of a call that spent its budget
+// thinking: a production call stopped at MAX_TOKENS with 17 thought tokens and
+// no candidatesTokenCount at all, against a billing line charging 17.
+func (g *geminiUsage) toUsage() *Usage {
+	if g == nil {
+		return nil
+	}
+	n := func(p *int) int {
+		if p == nil {
+			return 0
+		}
+		return *p
+	}
+	u := &Usage{PromptTokens: g.PromptTokenCount, TotalTokens: g.TotalTokenCount}
+	if g.ToolUsePromptTokenCount != nil {
+		in := n(g.PromptTokenCount) + *g.ToolUsePromptTokenCount
+		u.PromptTokens = &in
+	}
+	if g.CandidatesTokenCount != nil || g.ThoughtsTokenCount != nil {
+		out := n(g.CandidatesTokenCount) + n(g.ThoughtsTokenCount)
+		u.CompletionTokens = &out
+	}
+	if g.ThoughtsTokenCount != nil {
+		u.CompletionDetails = &struct {
+			ReasoningTokens *int `json:"reasoning_tokens,omitempty"`
+		}{ReasoningTokens: g.ThoughtsTokenCount}
+	}
+	if g.CachedContentTokenCount != nil {
+		u.PromptDetails = &struct {
+			CachedTokens *int `json:"cached_tokens,omitempty"`
+		}{CachedTokens: g.CachedContentTokenCount}
+	}
+	return u
 }
 
 // anthropicUsage is Anthropic's token accounting. Cache reads and writes are
@@ -548,15 +758,7 @@ func (ch *streamChunk) usage() *Usage {
 	if ch.Usage != nil {
 		return ch.Usage
 	}
-	if ch.UsageMetadata == nil {
-		return nil
-	}
-	u := &Usage{
-		PromptTokens:     ch.UsageMetadata.PromptTokenCount,
-		CompletionTokens: ch.UsageMetadata.CandidatesTokenCount,
-		TotalTokens:      ch.UsageMetadata.TotalTokenCount,
-	}
-	return u
+	return ch.UsageMetadata.toUsage()
 }
 
 // hasPayload reports whether the chunk carried anything worth counting.
@@ -743,6 +945,19 @@ func (ta *toolAcc) calls() []ToolCall {
 	return out
 }
 
+// addWhole records a call that arrived complete under the next free index, so
+// it can never be merged into the call before it.
+func (ta *toolAcc) addWhole(tc ToolCall) {
+	next := 0
+	for idx := range ta.byIdx {
+		if idx >= next {
+			next = idx + 1
+		}
+	}
+	tc.Index = &next
+	ta.add(tc)
+}
+
 // ---- parsing ---------------------------------------------------------------
 
 func blank(rid string) *Record {
@@ -808,13 +1023,11 @@ func parseRange(path string, from int64, partial bool, calls map[string]*Record)
 	}
 
 	touched := map[string]bool{}
-	sc := bufio.NewScanner(br)
-	sc.Buffer(make([]byte, 0, 1<<16), 16<<20)
-	for sc.Scan() {
-		if rid := handleLine(sc.Text(), calls); rid != "" {
+	scanEntries(br, func(entry string) {
+		if rid := handleLine(entry, calls); rid != "" {
 			touched[rid] = true
 		}
-	}
+	})
 	now := time.Now()
 	for rid := range touched {
 		if rec := calls[rid]; rec != nil {
@@ -826,12 +1039,70 @@ func parseRange(path string, from int64, partial bool, calls map[string]*Record)
 }
 
 func scanLines(r io.Reader, calls map[string]*Record) {
+	scanEntries(r, func(entry string) { handleLine(entry, calls) })
+}
+
+// maxEntry bounds one log entry, a single line or a joined multi-line one.
+// Request bodies with long contexts routinely exceed bufio's 64KB default.
+const maxEntry = 16 << 20
+
+// scanEntries hands handle one log ENTRY at a time rather than one line.
+//
+// new-api formats each message with %s and writes it as-is, so a body that
+// arrives pretty-printed spans many physical lines and only the first carries
+// the "[LEVEL] date | rid |" prefix. Gemini's REST API pretty-prints every
+// non-streaming response. Read line by line, the record kept
+// `Gemini response body: {` and dropped the rest - so no non-streaming Gemini
+// call ever had its output archived (159 such bodies in one day's spool, about
+// 30 lines each).
+//
+// Lines are joined only onto an entry whose first line ends by opening a JSON
+// value, which is what the head of a pretty-printed body looks like and what no
+// single-line event does. A stray unprefixed line after, say, a billing line is
+// therefore never glued onto it, where it would invalidate the billing JSON.
+// The run ends at the next line that starts with '[': every event does, and an
+// indented body line never can.
+//
+// A body cut by the end of the read is passed on as far as it got; parseRaw
+// then rejects it, as it would a half-written single line.
+func scanEntries(r io.Reader, handle func(string)) {
 	sc := bufio.NewScanner(r)
-	// request bodies with long contexts routinely exceed the 64KB default
-	sc.Buffer(make([]byte, 0, 1<<16), 16<<20)
-	for sc.Scan() {
-		handleLine(sc.Text(), calls)
+	sc.Buffer(make([]byte, 0, 1<<16), maxEntry)
+
+	var head string
+	var more []string // continuation lines of head, when it opened a body
+	have, open, size := false, false, 0
+	flush := func() {
+		if !have {
+			return
+		}
+		if len(more) == 0 {
+			handle(head)
+		} else {
+			handle(head + "\n" + strings.Join(more, "\n"))
+		}
+		have, more = false, more[:0]
 	}
+	for sc.Scan() {
+		line := sc.Text()
+		if open && !strings.HasPrefix(line, "[") {
+			if size += len(line) + 1; size <= maxEntry {
+				more = append(more, line)
+			}
+			continue
+		}
+		flush()
+		head, have, size = line, true, len(line)
+		open = opensValue(line)
+	}
+	flush()
+}
+
+// opensValue reports whether a log line ends by opening a JSON object or array,
+// i.e. is the first line of a pretty-printed body.
+func opensValue(line string) bool {
+	t := strings.TrimRight(line, " \t\r")
+	return strings.HasSuffix(t, "{") || strings.HasSuffix(t, "[")
 }
 
 // handleLine merges one log line into calls and returns the request id it
@@ -858,6 +1129,7 @@ func handleLine(line string, calls map[string]*Record) string {
 		if rec.TS == "" {
 			rec.TS = ts
 		}
+		rec.lastTS = ts
 		return g[2]
 	}
 
@@ -870,20 +1142,17 @@ func handleLine(line string, calls map[string]*Record) string {
 	if rec.TS == "" {
 		rec.TS = ts
 	}
+	rec.lastTS = ts
 
-	switch {
-	case strings.HasPrefix(msg, "text request body:"):
-		rec.Request = parseRaw(strings.TrimSpace(msg[len("text request body:"):]))
-	// Anthropic-native relays log the request under a different marker. Missing
-	// it did more than blank the request pane: the body fell through to the
-	// error arm below, which matches any message containing "error" - and the
-	// Claude Code system prompt contains the word. Every claude-opus-5 prompt
-	// was being filed as an error. Both markers must be handled here, ahead of
-	// that catch-all.
-	case strings.HasPrefix(msg, "requestBody:"):
-		rec.Request = parseRaw(strings.TrimSpace(msg[len("requestBody:"):]))
-	case strings.HasPrefix(msg, "upstream response body:"):
-		rec.Response = parseRaw(strings.TrimSpace(msg[len("upstream response body:"):]))
+	switch req, resp := marker(msg, requestMarkers), marker(msg, responseMarkers); {
+	// Every body marker must be handled here, ahead of the error catch-all at the
+	// bottom, which matches any message containing "error". Anthropic's
+	// `requestBody:` was the first lesson: the Claude Code system prompt
+	// contains the word, so every claude-opus-5 prompt was filed as an error.
+	case req > 0:
+		rec.Request = parseRaw(strings.TrimSpace(msg[req:]))
+	case resp > 0:
+		rec.Response = parseRaw(strings.TrimSpace(msg[resp:]))
 	case strings.HasPrefix(msg, "stream scanner data:"):
 		ch, body, ok := streamChunkOf(msg[len("stream scanner data:"):])
 		switch {
@@ -965,6 +1234,42 @@ func get(calls map[string]*Record, rid string) *Record {
 	return r
 }
 
+// requestMarkers and responseMarkers are the prefixes new-api logs a request
+// body and a non-streaming response body under. Each relay path spells its
+// own. Only the OpenAI pair was handled at first: the rest fell through to the
+// error arm, where a body is filed as an error if it happens to contain the
+// word and dropped if not. Every non-streaming Gemini and Claude answer, and
+// every rerank call, was lost that way.
+//
+// Bodies are logged in the upstream's own format, which finalize and the UI
+// read in each shape - see reqView and respView. Verified against new-api
+// v1.0.0-rc.40.
+var requestMarkers = []string{
+	"text request body:",   // OpenAI-compatible (compatible_handler.go)
+	"requestBody:",         // Anthropic /v1/messages, /v1/responses
+	"Gemini request body:", // Gemini, native generateContent
+	"Rerank request body:", // rerank
+}
+
+var responseMarkers = []string{
+	"upstream response body:",         // OpenAI-compatible (relay-openai.go)
+	"Gemini response body:",           // Gemini, via /v1/chat/completions
+	"Gemini native response body:",    // Gemini, native generateContent
+	"Gemini responses response body:", // Gemini, via /v1/responses
+	"responseBody:",                   // Anthropic, /v1/messages
+	"reranker response body:",         // rerank
+}
+
+// marker returns the length of whichever of markers msg starts with, or 0.
+func marker(msg string, markers []string) int {
+	for _, m := range markers {
+		if strings.HasPrefix(msg, m) {
+			return len(m)
+		}
+	}
+	return 0
+}
+
 // streamChunkOf extracts a delta payload from one `stream scanner data:` line.
 // The raw body is returned alongside so a shape we do not understand can still
 // be preserved rather than silently dropped.
@@ -1042,6 +1347,7 @@ func (r *Record) finalize() {
 	var req reqView
 	if !r.Request.empty() {
 		json.Unmarshal(r.Request, &req)
+		req.fromGemini()
 	}
 	var resp respView
 	if !r.Response.empty() {
@@ -1055,6 +1361,13 @@ func (r *Record) finalize() {
 
 	r.Model = req.Model
 	if r.Model == "" {
+		r.Model = bill.ModelName
+	}
+	// A rerank request is logged after model mapping ("BAAI/bge-reranker-v2-m3"),
+	// while billing carries the name the client called. Rerank records were
+	// listed under the billing name for as long as their request went unparsed,
+	// so they keep it rather than splitting the model's history in two.
+	if req.isRerank() && bill.ModelName != "" {
 		r.Model = bill.ModelName
 	}
 	r.IsStream = req.Stream || len(r.chunks) > 0 || r.sawChunks
@@ -1079,6 +1392,9 @@ func (r *Record) finalize() {
 			for _, frag := range tools {
 				r.tacc.add(frag)
 			}
+			for _, tc := range ch.geminiCalls() {
+				r.tacc.addWhole(tc)
+			}
 			if u := ch.usage(); u != nil {
 				r.Usage = mergeUsage(r.Usage, u)
 			}
@@ -1087,7 +1403,7 @@ func (r *Record) finalize() {
 		r.StreamReasoning += reasoning.String()
 		r.sawChunks = true
 	} else if !r.sawChunks {
-		r.Usage = resp.Usage
+		r.Usage = resp.usage(r.Response)
 	}
 	// Both accumulators hold cumulative state keyed by call index, so their
 	// output is ASSIGNED rather than appended: finalize runs once per read pass,
@@ -1124,10 +1440,15 @@ func (r *Record) finalize() {
 		if n != "" {
 			r.ToolNames = append(r.ToolNames, n)
 		}
+		for _, d := range t.FunctionDeclarations {
+			if d.Name != "" {
+				r.ToolNames = append(r.ToolNames, d.Name)
+			}
+		}
 	}
 	called := r.StreamToolCalls
-	if !r.IsStream && len(resp.Choices) > 0 {
-		called = resp.Choices[0].Message.ToolCalls
+	if !r.IsStream {
+		called = resp.toolCalls()
 	}
 	r.CalledTools = []string{}
 	for _, tc := range called {
@@ -1154,12 +1475,17 @@ func (r *Record) finalize() {
 	}
 	r.Turns = turns
 
-	// Preview text for the collapsed row: last user message.
+	// Preview text for the collapsed row: last user message, or what a rerank
+	// call was ranking for.
+	r.Preview = ""
 	for i := len(req.Messages) - 1; i >= 0; i-- {
 		if req.Messages[i].Role == "user" {
 			r.Preview = clipRunes(contentText(req.Messages[i].Content), 200)
 			break
 		}
+	}
+	if r.Preview == "" && req.isRerank() {
+		r.Preview = clipRunes(req.Query, 200)
 	}
 	r.Incomplete = r.Request.empty() // truncated/rotated-out request line
 

@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -544,5 +546,330 @@ func TestChunkDeltaAcceptsStringAndObject(t *testing.T) {
 	}
 	if c, _, _ := ch.text(); c != "yo" {
 		t.Errorf("anthropic text = %q, want yo", c)
+	}
+}
+
+// Gemini's REST API pretty-prints every non-streaming response, and new-api
+// logs it as received, so the body runs on over ~30 unprefixed lines. Read line
+// by line, the record kept `Gemini response body: {` and nothing else - and the
+// marker was not handled either - so no non-streaming Gemini call ever had its
+// output archived. Layout copied from a production line (hindsight's
+// gemini-3-flash-lite fact extraction); the content is synthetic.
+//
+// The answer contains the word "error" on purpose: a body that reaches the
+// error catch-all instead of its own arm shows up as an entry in Errors.
+const geminiPrettyLog = `[DEBUG] 2026/10/07 - 01:33:57 | GeminiPrettyBodyAaaaBbbbCc | text request body: {"contents":[{"role":"user","parts":[{"text":"Return valid json only."}]}],"generationConfig":{"temperature":0.1,"responseMimeType":"application/json"}}
+[DEBUG] 2026/10/07 - 01:33:57 | GeminiPrettyBodyAaaaBbbbCc | fullRequestURL: https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent
+[DEBUG] 2026/10/07 - 01:34:15 | GeminiPrettyBodyAaaaBbbbCc | Gemini response body: {
+  "candidates": [
+    {
+      "content": {
+        "parts": [
+          {
+            "text": "{\n  \"facts\": [\"the CLI reports an error when .env is not sourced\"]\n}",
+            "thoughtSignature": "EmAKXgFpFH0TxS5t"
+          },
+          {
+            "functionCall": {
+              "name": "save_facts",
+              "args": {
+                "n": 1
+              }
+            }
+          }
+        ],
+        "role": "model"
+      },
+      "finishReason": "STOP",
+      "index": 0
+    }
+  ],
+  "usageMetadata": {
+    "promptTokenCount": 4753,
+    "candidatesTokenCount": 373,
+    "totalTokenCount": 5126,
+    "promptTokensDetails": [
+      {
+        "modality": "TEXT",
+        "tokenCount": 4753
+      }
+    ]
+  },
+  "modelVersion": "gemini-3.5-flash-lite",
+  "responseId": "a1b2c3"
+} 
+[GIN-debug] redirecting request 301: /api/log/ --> /api/log/?p=1
+[INFO] 2026/10/07 - 01:34:15 | GeminiPrettyBodyAaaaBbbbCc | record consume log: userId=1, params={"channel_id":4,"prompt_tokens":4753,"completion_tokens":373,"model_name":"gemini-3-flash-lite","token_name":"hindsight","quota":874}
+[GIN] 2026/10/07 - 01:34:15 | relay | GeminiPrettyBodyAaaaBbbbCc | 200 | 18.567020844s |      172.31.0.5 |    POST /v1/chat/completions
+`
+
+func TestGeminiPrettyPrintedResponse(t *testing.T) {
+	calls := map[string]*Record{}
+	scanLines(strings.NewReader(geminiPrettyLog), calls)
+	r := calls["GeminiPrettyBodyAaaaBbbbCc"]
+	if r == nil {
+		t.Fatal("record missing")
+	}
+	r.finalize()
+
+	t.Run("the whole body is kept, compacted", func(t *testing.T) {
+		if r.Response.empty() {
+			t.Fatal("response is empty - only the marker line was read")
+		}
+		if bytes.IndexByte(r.Response, '\n') >= 0 {
+			t.Errorf("response kept its indentation: %q", r.Response)
+		}
+		var v struct {
+			Candidates []struct {
+				Content struct {
+					Parts []struct {
+						Text string `json:"text"`
+					} `json:"parts"`
+				} `json:"content"`
+			} `json:"candidates"`
+		}
+		if err := json.Unmarshal(r.Response, &v); err != nil || len(v.Candidates) == 0 ||
+			!strings.Contains(v.Candidates[0].Content.Parts[0].Text, "facts") {
+			t.Errorf("response does not decode to the answer: %v %q", err, r.Response)
+		}
+	})
+
+	t.Run("the body is not filed as an error", func(t *testing.T) {
+		if len(r.Errors) != 0 {
+			t.Errorf("errors = %v, want none", r.Errors)
+		}
+		if r.Outcome != outcomeOK {
+			t.Errorf("outcome = %q, want ok", r.Outcome)
+		}
+	})
+
+	t.Run("the events after the body still parse", func(t *testing.T) {
+		// The GIN-debug line ends the run; billing and GIN are their own events.
+		if r.Quota == nil || *r.Quota != 874 {
+			t.Errorf("quota = %v, want 874 - the billing line was swallowed", r.Quota)
+		}
+		if r.Status == nil || *r.Status != 200 {
+			t.Errorf("status = %v, want 200", r.Status)
+		}
+	})
+
+	t.Run("usage and called tools come from the Gemini shape", func(t *testing.T) {
+		u := r.Usage
+		if u == nil || u.PromptTokens == nil || u.CompletionTokens == nil || u.TotalTokens == nil {
+			t.Fatalf("usage = %+v", u)
+		}
+		if *u.PromptTokens != 4753 || *u.CompletionTokens != 373 || *u.TotalTokens != 5126 {
+			t.Errorf("usage = %d/%d/%d, want 4753/373/5126", *u.PromptTokens, *u.CompletionTokens, *u.TotalTokens)
+		}
+		if len(r.CalledTools) != 1 || r.CalledTools[0] != "save_facts" {
+			t.Errorf("called_tools = %v, want [save_facts]", r.CalledTools)
+		}
+		if r.IsStream {
+			t.Error("is_stream = true for a generateContent call")
+		}
+	})
+}
+
+// Anthropic's non-streaming answer is logged as `responseBody:`, the response
+// twin of the `requestBody:` marker above, and was just as unhandled. Its usage
+// sits under the same "usage" key OpenAI uses, with different members: decoded
+// into the OpenAI-shaped field it is a non-nil struct of nils, which blanks the
+// usage pane and also suppresses the fall back to billing.
+func TestAnthropicNonStreamResponse(t *testing.T) {
+	const rid = "AnthropicNonStreamAaaaBbbb"
+	calls := map[string]*Record{}
+	scanLines(strings.NewReader(
+		`[DEBUG] 2026/10/07 - 09:00:00 | `+rid+` | requestBody: {"model":"claude-opus-5-5","max_tokens":1024,"messages":[{"role":"user","content":"title this"}]}
+[DEBUG] 2026/10/07 - 09:00:02 | `+rid+` | responseBody: {"id":"msg_1","type":"message","role":"assistant","model":"claude-opus-5-5","content":[{"type":"thinking","thinking":"short"},{"type":"text","text":"Fix the error banner"},{"type":"tool_use","id":"toolu_1","name":"set_title","input":{"t":"x"}}],"stop_reason":"tool_use","usage":{"input_tokens":12,"cache_read_input_tokens":3000,"output_tokens":40}} 
+[INFO] 2026/10/07 - 09:00:02 | `+rid+` | record consume log: userId=1, params={"channel_id":7,"prompt_tokens":3012,"completion_tokens":40,"model_name":"claude-opus-5-5","quota":90}
+`), calls)
+	r := calls[rid]
+	if r == nil {
+		t.Fatal("record missing")
+	}
+	r.finalize()
+
+	if r.Response.empty() {
+		t.Fatal("response is empty - responseBody: was not recognised")
+	}
+	if len(r.Errors) != 0 {
+		t.Errorf("errors = %v, want none - the body fell through to the error arm", r.Errors)
+	}
+	u := r.Usage
+	if u == nil || u.PromptTokens == nil || u.CompletionTokens == nil {
+		t.Fatalf("usage = %+v - Anthropic usage decoded into the OpenAI shape", u)
+	}
+	if *u.PromptTokens != 3012 || *u.CompletionTokens != 40 {
+		t.Errorf("usage = %d/%d, want 3012/40 (cache folded into prompt)", *u.PromptTokens, *u.CompletionTokens)
+	}
+	if len(r.CalledTools) != 1 || r.CalledTools[0] != "set_title" {
+		t.Errorf("called_tools = %v, want [set_title]", r.CalledTools)
+	}
+}
+
+// Every relay path's response marker lands in Response, single-line or not.
+func TestResponseMarkers(t *testing.T) {
+	for _, m := range responseMarkers {
+		calls := map[string]*Record{}
+		scanLines(strings.NewReader(`[DEBUG] 2026/10/07 - 09:00:00 | ResponseMarkerAaaaBbbbCccc | `+m+` {"candidates":[{"content":{"parts":[{"text":"error-free"}]}}]} `+"\n"), calls)
+		r := calls["ResponseMarkerAaaaBbbbCccc"]
+		if r == nil || r.Response.empty() {
+			t.Errorf("%q: response not captured", m)
+			continue
+		}
+		if len(r.Errors) != 0 {
+			t.Errorf("%q: filed as an error: %v", m, r.Errors)
+		}
+	}
+}
+
+// Compaction applies only to bodies that arrived on several lines. A
+// single-line body is stored byte-for-byte, spacing and all.
+func TestParseRawCompactsOnlyMultiLine(t *testing.T) {
+	if got := string(parseRaw(`{"a": 1, "b": [1, 2]}`)); got != `{"a": 1, "b": [1, 2]}` {
+		t.Errorf("single-line body changed: %q", got)
+	}
+	if got := string(parseRaw("{\n  \"a\": \"x y\",\n  \"b\": [\n    1\n  ]\n}")); got != `{"a":"x y","b":[1]}` {
+		t.Errorf("multi-line body = %q", got)
+	}
+	if parseRaw("{\n  \"a\": ") != nil {
+		t.Error("a body cut short must be rejected, not stored")
+	}
+}
+
+// Gemini's candidatesTokenCount excludes thinking. new-api bills thoughts as
+// output, so the viewer has to as well, or a call that spent its budget
+// thinking reports no output at all. Metadata copied from a production
+// gemini-3-flash-lite call that stopped at MAX_TOKENS mid-thought.
+func TestGeminiUsageCountsThoughts(t *testing.T) {
+	var g geminiUsage
+	if err := json.Unmarshal([]byte(`{"promptTokenCount":267,"totalTokenCount":284,"promptTokensDetails":[{"modality":"TEXT","tokenCount":9},{"modality":"IMAGE","tokenCount":258}],"thoughtsTokenCount":17,"serviceTier":"standard"}`), &g); err != nil {
+		t.Fatal(err)
+	}
+	u := g.toUsage()
+	if u.CompletionTokens == nil || *u.CompletionTokens != 17 {
+		t.Fatalf("completion_tokens = %v, want 17 (thoughts only)", u.CompletionTokens)
+	}
+	if u.CompletionDetails == nil || u.CompletionDetails.ReasoningTokens == nil || *u.CompletionDetails.ReasoningTokens != 17 {
+		t.Errorf("reasoning_tokens = %+v, want 17", u.CompletionDetails)
+	}
+	if *u.PromptTokens+*u.CompletionTokens != *u.TotalTokens {
+		t.Errorf("prompt %d + completion %d != total %d", *u.PromptTokens, *u.CompletionTokens, *u.TotalTokens)
+	}
+
+	// And a plain answer with no thinking keeps exactly candidatesTokenCount.
+	var plain geminiUsage
+	json.Unmarshal([]byte(`{"promptTokenCount":10,"candidatesTokenCount":5,"totalTokenCount":15}`), &plain)
+	if p := plain.toUsage(); *p.CompletionTokens != 5 || p.CompletionDetails != nil {
+		t.Errorf("plain = %+v", p)
+	}
+}
+
+// Gemini's request is logged in its native shape - contents with roles
+// user/model, text in parts, functions under functionDeclarations - and
+// nothing derived from it: every Gemini call listed with no preview, 0
+// messages and no tools. The native path's own marker, `Gemini request body:`,
+// was not handled at all.
+func TestGeminiRequestShape(t *testing.T) {
+	const rid = "GeminiRequestShapeAaaaBbbb"
+	calls := map[string]*Record{}
+	scanLines(strings.NewReader(`[DEBUG] 2026/10/07 - 09:00:00 | `+rid+` | Gemini request body: {"systemInstruction":{"parts":[{"text":"Report an error if unsure."}]},"contents":[{"role":"user","parts":[{"text":"weather in Paris?"}]},{"role":"model","parts":[{"functionCall":{"name":"get_weather","args":{"city":"Paris"}}}]},{"role":"user","parts":[{"functionResponse":{"name":"get_weather","response":{"c":21}}}]}],"tools":[{"functionDeclarations":[{"name":"get_weather","parameters":{"type":"OBJECT"}},{"name":"get_time"}]},{"googleSearch":{}}]}
+[DEBUG] 2026/10/07 - 09:00:02 | `+rid+` | Gemini native response body: {"candidates":[{"content":{"role":"model","parts":[{"text":"21C"}]}}],"usageMetadata":{"promptTokenCount":50,"candidatesTokenCount":2,"totalTokenCount":52}}
+[INFO] 2026/10/07 - 09:00:02 | `+rid+` | record consume log: userId=1, params={"channel_id":4,"prompt_tokens":50,"completion_tokens":2,"model_name":"gemini-3.5-flash","quota":3}
+`), calls)
+	r := calls[rid]
+	if r == nil {
+		t.Fatal("record missing")
+	}
+	r.finalize()
+
+	if r.Incomplete || r.Request.empty() {
+		t.Fatal("request missing - `Gemini request body:` was not recognised")
+	}
+	if len(r.Errors) != 0 {
+		t.Errorf("errors = %v - the request fell through to the error arm", r.Errors)
+	}
+	// The functionResponse-only content is a tool result, not the prompt.
+	if r.Preview != "weather in Paris?" {
+		t.Errorf("preview = %q, want the user's question", r.Preview)
+	}
+	if r.MsgCount != 3 || r.Turns != 1 {
+		t.Errorf("msg_count/turns = %d/%d, want 3/1", r.MsgCount, r.Turns)
+	}
+	if strings.Join(r.ToolNames, ",") != "get_weather,get_time" || !r.HasTools {
+		t.Errorf("tool_names = %v, has_tools = %v", r.ToolNames, r.HasTools)
+	}
+	if r.Model != "gemini-3.5-flash" {
+		t.Errorf("model = %q, want billing's - the native request names none", r.Model)
+	}
+}
+
+// Rerank calls logged both bodies under markers nothing handled, so every one
+// archived with no request - and so flagged 请求体不在当前日志文件中 - and no
+// result. The request is logged after model mapping, so the model name has to
+// keep coming from billing or the model's history splits in two.
+func TestRerankCall(t *testing.T) {
+	const rid = "RerankCallAaaaBbbbCcccDddd"
+	calls := map[string]*Record{}
+	scanLines(strings.NewReader(`[DEBUG] 2026/10/05 - 21:19:24 | `+rid+` | Rerank request body: {"documents":["the build failed with an error","sunny in Paris"],"model":"BAAI/bge-reranker-v2-m3","query":"why did the build fail","return_documents":false,"top_n":2}
+[DEBUG] 2026/10/05 - 21:19:25 | `+rid+` | reranker response body: {"id":"01a1","results":[{"index":0,"document":null,"relevance_score":0.91},{"index":1,"document":null,"relevance_score":0.02}],"meta":{"tokens":{"input_tokens":30,"output_tokens":0}}}
+[INFO] 2026/10/05 - 21:19:25 | `+rid+` | record consume log: userId=1, params={"channel_id":58,"prompt_tokens":30,"completion_tokens":0,"model_name":"bge-reranker-v2-m3","quota":1}
+`), calls)
+	r := calls[rid]
+	if r == nil {
+		t.Fatal("record missing")
+	}
+	r.finalize()
+
+	if r.Request.empty() || r.Incomplete {
+		t.Error("request missing - `Rerank request body:` was not recognised")
+	}
+	if r.Response.empty() {
+		t.Error("response missing - `reranker response body:` was not recognised")
+	}
+	if len(r.Errors) != 0 {
+		t.Errorf("errors = %v - a body containing \"error\" reached the catch-all", r.Errors)
+	}
+	if r.Model != "bge-reranker-v2-m3" {
+		t.Errorf("model = %q, want billing's bge-reranker-v2-m3", r.Model)
+	}
+	if r.Preview != "why did the build fail" {
+		t.Errorf("preview = %q, want the query", r.Preview)
+	}
+	if r.Usage == nil || r.Usage.PromptTokens == nil || *r.Usage.PromptTokens != 30 {
+		t.Errorf("usage = %+v, want billing's 30 prompt tokens", r.Usage)
+	}
+}
+
+// Gemini streams a function call whole, in one part. Fed through the fragment
+// joiner without an index, a second call to the same tool was glued onto the
+// first. Before that, they were not read at all.
+func TestGeminiStreamFunctionCalls(t *testing.T) {
+	const rid = "GeminiStreamCallsAaaaBbbb"
+	calls := map[string]*Record{}
+	data := func(body string) string {
+		return `[DEBUG] 2026/10/07 - 09:00:01 | ` + rid + ` | stream scanner data: data: ` + body + "\n"
+	}
+	scanLines(strings.NewReader(
+		`[DEBUG] 2026/10/07 - 09:00:00 | `+rid+` | text request body: {"contents":[{"role":"user","parts":[{"text":"read both"}]}]}`+"\n"+
+			data(`{"candidates":[{"content":{"role":"model","parts":[{"text":"Reading."}]}}]}`)+
+			data(`{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"read","args":{"p":"a"}}},{"functionCall":{"name":"read","args":{"p":"b"}}}]}}]}`)+
+			data(`{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"read","args":{"p":"c"}}}]}}],"usageMetadata":{"promptTokenCount":9,"candidatesTokenCount":20,"totalTokenCount":29}}`)), calls)
+	r := calls[rid]
+	r.finalize()
+
+	if len(r.StreamToolCalls) != 3 {
+		t.Fatalf("stream_tool_calls = %+v, want 3 separate calls", r.StreamToolCalls)
+	}
+	for i, want := range []string{`{"p":"a"}`, `{"p":"b"}`, `{"p":"c"}`} {
+		if got := r.StreamToolCalls[i].Function; got.Name != "read" || got.Arguments != want {
+			t.Errorf("call %d = %s %s, want read %s", i, got.Name, got.Arguments, want)
+		}
+	}
+	if r.StreamContent != "Reading." || r.UnknownCount != 0 {
+		t.Errorf("content = %q, unknown = %d", r.StreamContent, r.UnknownCount)
+	}
+	if strings.Join(r.CalledTools, ",") != "read" {
+		t.Errorf("called_tools = %v", r.CalledTools)
 	}
 }
