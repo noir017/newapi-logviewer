@@ -45,6 +45,10 @@ type ingester struct {
 	// without a GIN line. Short: it only has to outlast the few trailing chunks
 	// that can follow the billing line, not a whole inter-chunk gap.
 	settleAfter time.Duration
+	// every is the poll interval Run was started with, 0 if it never was. A
+	// call read on one tick is settled on the next at the earliest, so health
+	// has to allow a whole interval between appends - see health().
+	every time.Duration
 
 	mu       sync.Mutex
 	offsets  map[string]int64    // spool file -> bytes consumed
@@ -97,6 +101,9 @@ func (i *ingester) withPusher(p *pusher) *ingester {
 // handful of files on tmpfs, a stat every second costs nothing, and it keeps
 // the binary dependency-free and identical across platforms.
 func (i *ingester) Run(every time.Duration) {
+	i.mu.Lock()
+	i.every = every
+	i.mu.Unlock()
 	t := time.NewTicker(every)
 	defer t.Stop()
 	i.once()
@@ -171,14 +178,13 @@ func (i *ingester) once() {
 // it. Callers hold i.mu.
 //
 // In push mode the destination is another pod rather than the local archive, and
-// the finished calls are shipped as one batch after the walk instead of one at a
+// the finished calls are shipped in batches after the walk instead of one at a
 // time inside it: a WAN round trip per record would not keep up with a burst,
 // and a record is only forgotten once the receiver has acknowledged it either
 // way.
 func (i *ingester) flushFinished() {
 	now := time.Now()
-	var batch []*Record
-	var batchBytes int64
+	var ready []*Record // push mode: finished, waiting for flushPush
 	for rid, rec := range i.pending {
 		done := rec.Status != nil && rec.TS != ""
 		if !done && rec.billingSeen && !rec.lastSeen.IsZero() &&
@@ -223,14 +229,7 @@ func (i *ingester) flushFinished() {
 			continue
 		}
 		if i.push != nil {
-			// Collect; the batch goes out below. Whatever does not fit stays
-			// pending and leaves on the next pass, which is also what keeps one
-			// request bounded when a burst finishes at once.
-			if len(batch) >= pushMaxRecords || batchBytes >= pushMaxBytes {
-				continue
-			}
-			batch = append(batch, rec)
-			batchBytes += recordSize(rec)
+			ready = append(ready, rec) // shipped below, in bounded batches
 			continue
 		}
 		if err := i.arc.Append(rec); err != nil {
@@ -247,8 +246,8 @@ func (i *ingester) flushFinished() {
 		i.archived[rid] = struct{}{}
 		delete(i.pending, rid)
 	}
-	if len(batch) > 0 {
-		i.flushPush(batch, now)
+	if len(ready) > 0 {
+		i.flushPush(ready, now)
 	}
 	// Bound the dedup set. Ids are only revisited within one spool file's
 	// lifetime, so anything older than the retention window cannot recur.
@@ -257,41 +256,68 @@ func (i *ingester) flushFinished() {
 	}
 }
 
-// flushPush ships one batch and consumes the records only on an ACK.
+// flushPush ships every finished record, in batches of at most pushMaxRecords
+// records or pushMaxBytes of body, and consumes each batch only on its ACK.
 //
-// A failure leaves every record of the batch pending, which is what makes the
-// spool the buffer: nothing is deleted, nothing is truncated, and the next pass
-// retries the same records rather than reading more. The receiver deduplicates
-// on request id, so a batch that landed and lost its ACK is re-sent safely.
+// Every record, not one batch per pass. One batch per pass was the original
+// design, and it quietly capped the link at one batch per tick. On a sender
+// that ticks hourly - the oracle pod runs INGEST_EVERY_SEC=3600 to keep the WAN
+// quiet - that is 8MB an hour, which a few agent transcripts fill. Measured
+// 2026-10-07: two ticks shipped 24 records while 1,048 waited in memory, and
+// since the spool is truncated once read, those were the only copy.
+//
+// Oldest first, so a backlog drains in order and a run cut short leaves the
+// newest waiting. Map order would ship a different arbitrary subset each pass.
+//
+// A failure stops the run and leaves that batch and everything after it
+// pending, which is what makes the spool the buffer: nothing is deleted,
+// nothing is truncated, and the next pass retries the same records rather than
+// reading more. The receiver deduplicates on request id, so a batch that landed
+// and lost its ACK is re-sent safely.
 //
 // The write-side health counters are shared with the local append path: in push
 // mode the push IS the write, and /healthz has to go red for the same reason -
 // records are being folded and not stored anywhere.
-func (i *ingester) flushPush(batch []*Record, now time.Time) {
+func (i *ingester) flushPush(ready []*Record, now time.Time) {
 	if !i.push.ready(now) {
 		return // inside the backoff window; nothing is consumed
 	}
+	sort.Slice(ready, func(a, b int) bool {
+		if ready[a].Epoch != ready[b].Epoch {
+			return ready[a].Epoch < ready[b].Epoch
+		}
+		return ready[a].RequestID < ready[b].RequestID
+	})
 	if i.push.pod != "" {
-		for _, rec := range batch {
+		for _, rec := range ready {
 			rec.Pod = i.push.pod
 		}
 	}
-	if err := i.push.send(batch); err != nil {
-		i.push.failed(now, err)
-		log.Printf("push %d records to %s: %v (retry in %s; the spool is held until it succeeds)",
-			len(batch), i.push.url, err, time.Until(i.push.nextTry).Round(time.Second))
-		i.appendFails++
-		i.lastErr = err.Error()
-		return
+	for len(ready) > 0 {
+		n, size := 0, int64(0)
+		for n < len(ready) && n < pushMaxRecords && size < pushMaxBytes {
+			size += recordSize(ready[n])
+			n++
+		}
+		batch := ready[:n]
+		if err := i.push.send(batch); err != nil {
+			i.push.failed(now, err)
+			log.Printf("push %d records to %s: %v (retry in %s; %d held, and the spool with them, until it succeeds)",
+				len(batch), i.push.url, err, time.Until(i.push.nextTry).Round(time.Second), len(ready))
+			i.appendFails++
+			i.lastErr = err.Error()
+			return
+		}
+		i.push.succeeded(len(batch))
+		for _, rec := range batch {
+			i.archived[rec.RequestID] = struct{}{}
+			delete(i.pending, rec.RequestID)
+		}
+		i.appends += int64(len(batch))
+		i.lastAppend = now
+		i.appendFails, i.lastErr = 0, ""
+		ready = ready[n:]
 	}
-	i.push.succeeded(len(batch))
-	for _, rec := range batch {
-		i.archived[rec.RequestID] = struct{}{}
-		delete(i.pending, rec.RequestID)
-	}
-	i.appends += int64(len(batch))
-	i.lastAppend = now
-	i.appendFails, i.lastErr = 0, ""
 }
 
 // worthArchiving keeps dashboard polling out of the permanent record.
@@ -563,8 +589,14 @@ func (i *ingester) health() map[string]any {
 	// Work waiting and nothing written recently. The window is generous
 	// relative to stallAfter: below it, calls legitimately sit in pending while
 	// they stream, and every one of them is archived or dropped by the deadline.
+	//
+	// Plus one poll interval. A call read on one tick is settled on the next at
+	// the earliest, so an hourly sender always holds the last hour's calls and
+	// appends once an hour. Without it, that sender read red for 40 minutes of
+	// every hour - which got diagnosed as "ingest stops reading after a restart"
+	// when it was working as configured.
 	if len(i.pending) > 0 {
-		idle := 2 * i.stallAfter
+		idle := 2*i.stallAfter + i.every
 		if i.lastAppend.IsZero() || time.Since(i.lastAppend) > idle {
 			ok = false
 			why = append(why, "calls pending but nothing archived recently")

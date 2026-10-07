@@ -4,12 +4,15 @@ import (
 	"bytes"
 	"compress/gzip"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -610,5 +613,133 @@ func TestPushInflationIsBounded(t *testing.T) {
 	srv.ServeHTTP(w, req)
 	if w.Code == 200 {
 		t.Errorf("an over-long inflated batch was accepted: %s", w.Body.String())
+	}
+}
+
+// A backlog bigger than one batch must leave in a single pass. The sender
+// shipped one batch per tick, and on the hourly oracle pod that capped the link
+// at 8MB an hour: 1,048 records waited in memory while two ticks shipped 24.
+// The batches themselves stay bounded, go out oldest first, and a failure
+// part-way keeps everything not yet acknowledged.
+func TestPushDrainsBacklogInOnePass(t *testing.T) {
+	const total = 2*pushMaxRecords + 9 // three batches by the count cap
+
+	var mu sync.Mutex
+	var batches []int  // records per request, in arrival order
+	var order []string // request ids in arrival order
+	failOn := 0        // 1-based request number to refuse, 0 for none
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		if failOn != 0 && len(batches)+1 == failOn {
+			batches = append(batches, -1)
+			http.Error(w, "receiver down", 502)
+			return
+		}
+		zr, err := gzip.NewReader(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		dec, n := json.NewDecoder(zr), 0
+		for {
+			var rec Record
+			if err := dec.Decode(&rec); err == io.EOF {
+				break
+			} else if err != nil {
+				http.Error(w, err.Error(), 400)
+				return
+			}
+			order = append(order, rec.RequestID)
+			n++
+		}
+		batches = append(batches, n)
+		json.NewEncoder(w).Encode(pushAck{Success: true, Stored: n})
+	}))
+	defer ts.Close()
+
+	backlog := func() *ingester {
+		ing := newIngester(t.TempDir(), newArchive(t.TempDir()), time.Hour, 0).withPusher(newPusher(Config{
+			PushURL: pushEndpoint(ts.URL), PodName: "oracle", PushTimeout: 5 * time.Second,
+		}))
+		// Inserted newest first, so map order and insertion order both differ
+		// from the order the receiver should see.
+		for k := total - 1; k >= 0; k-- {
+			at := time.Date(2026, 10, 6, 22, 0, 0, 0, time.Local).Add(time.Duration(k) * time.Minute).Format("2006/01/02 15:04:05")
+			rec := pushRecord(fmt.Sprintf("BacklogRecord%011dAaaa", k), at, "claude-opus-5-5", 1)
+			ing.pending[rec.RequestID] = rec
+		}
+		return ing
+	}
+
+	t.Run("every finished record leaves in one pass", func(t *testing.T) {
+		mu.Lock()
+		batches, order, failOn = nil, nil, 0
+		mu.Unlock()
+		ing := backlog()
+		ing.once()
+
+		if len(ing.pending) != 0 {
+			t.Fatalf("%d records still pending after one pass, want 0 (batches: %v)", len(ing.pending), batches)
+		}
+		if ing.push.sent != total {
+			t.Errorf("sent = %d, want %d", ing.push.sent, total)
+		}
+		if len(batches) != 3 {
+			t.Errorf("batches = %v, want 3 requests of at most %d", batches, pushMaxRecords)
+		}
+		for _, n := range batches {
+			if n > pushMaxRecords {
+				t.Errorf("a batch carried %d records, over the %d cap", n, pushMaxRecords)
+			}
+		}
+		if !sort.StringsAreSorted(order) {
+			t.Errorf("records did not arrive oldest first: %v ...", order[:5])
+		}
+	})
+
+	t.Run("a failure part-way keeps the rest pending", func(t *testing.T) {
+		mu.Lock()
+		batches, order, failOn = nil, nil, 2
+		mu.Unlock()
+		ing := backlog()
+		ing.once()
+
+		if ing.push.fails != 1 {
+			t.Fatalf("fails = %d, want 1", ing.push.fails)
+		}
+		if ing.push.sent != pushMaxRecords {
+			t.Errorf("sent = %d, want only the first batch (%d)", ing.push.sent, pushMaxRecords)
+		}
+		if len(ing.pending) != total-pushMaxRecords {
+			t.Errorf("pending = %d, want %d - unacknowledged records were dropped", len(ing.pending), total-pushMaxRecords)
+		}
+		if len(batches) != 2 {
+			t.Errorf("requests = %v, want the run to stop at the failure", batches)
+		}
+		// What remains is the newer end of the backlog, not an arbitrary subset.
+		for _, rid := range order {
+			if _, still := ing.pending[rid]; still {
+				t.Errorf("%s was acknowledged but is still pending", rid)
+			}
+		}
+	})
+}
+
+// An hourly sender appends once an hour and always holds the last hour's calls,
+// so "pending and nothing written for 20 minutes" is its normal state. Health
+// must allow one interval on top, and still go red past it.
+func TestHealthAllowsOneIngestInterval(t *testing.T) {
+	ing := newIngester(t.TempDir(), newArchive(t.TempDir()), time.Hour, 0)
+	ing.every = time.Hour
+	ing.pending["HourlySenderAaaaBbbbCccc"] = blank("HourlySenderAaaaBbbbCccc")
+
+	ing.lastAppend = time.Now().Add(-40 * time.Minute)
+	if ok, _ := ing.health()["archive_ok"].(bool); !ok {
+		t.Errorf("unhealthy 40 minutes after an hourly sender's last push: %v", ing.health())
+	}
+	ing.lastAppend = time.Now().Add(-2 * time.Hour)
+	if ok, _ := ing.health()["archive_ok"].(bool); ok {
+		t.Error("still healthy two hours after the last push of an hourly sender")
 	}
 }
