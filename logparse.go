@@ -22,11 +22,15 @@ import (
 //
 // Events for one call are interleaved with other calls, so we group by rid.
 // Lines whose id column is SYSTEM (background jobs) carry no rid and are skipped.
+//
+// An event is usually one line, but not always: a body logged pretty-printed
+// runs on over the lines below it - see scanEntries. Both patterns below are
+// (?s) so that the message group spans those lines too.
 
 var (
-	lineRE = regexp.MustCompile(`^\[([A-Z]+)\]\s+(\d{4}/\d{2}/\d{2})\s+-\s+(\d{2}:\d{2}:\d{2})\s+\|\s+(.*)$`)
+	lineRE = regexp.MustCompile(`(?s)^\[([A-Z]+)\]\s+(\d{4}/\d{2}/\d{2})\s+-\s+(\d{2}:\d{2}:\d{2})\s+\|\s+(.*)$`)
 	// a request id is 24+ alphanumerics; "SYSTEM"/"relay"/"api" are not ids
-	ridRE = regexp.MustCompile(`^([A-Za-z0-9]{24,})\s+\|\s+(.*)$`)
+	ridRE = regexp.MustCompile(`(?s)^([A-Za-z0-9]{24,})\s+\|\s+(.*)$`)
 	ginRE = regexp.MustCompile(`^(relay|api)\s+\|\s+([A-Za-z0-9]{24,})\s+\|\s+(\d{3})\s+\|\s+(\S+)\s+\|\s+(\S+)\s+\|\s+([A-Z]+)\s+(\S+)`)
 )
 
@@ -217,6 +221,77 @@ type respView struct {
 		} `json:"message"`
 	} `json:"choices"`
 	Usage *Usage `json:"usage"`
+
+	// Gemini's native response, which every Google-family path logs as it was
+	// received, whatever API the client called. Tool calls are functionCall
+	// parts, and usage is the same usageMetadata its stream chunks carry.
+	Candidates []struct {
+		Content struct {
+			Parts []struct {
+				FunctionCall *struct {
+					Name string `json:"name"`
+				} `json:"functionCall"`
+			} `json:"parts"`
+		} `json:"content"`
+	} `json:"candidates"`
+	UsageMetadata *geminiUsage `json:"usageMetadata"`
+
+	// Anthropic's (/v1/messages): tool calls are tool_use content blocks. Its
+	// usage sits at the "usage" key too, with different members - see usage().
+	Type    string `json:"type"`
+	Content []struct {
+		Type string `json:"type"`
+		Name string `json:"name"`
+	} `json:"content"`
+}
+
+// usage normalises whichever usage block a non-streaming response carried.
+//
+// Anthropic's is tested first, from the raw body, for the reason spelled out on
+// streamChunk.usage: its "usage" key decodes into the OpenAI-shaped field as a
+// non-nil struct with every member nil, which would both blank the usage pane
+// and suppress the billing fallback in finalize.
+func (v *respView) usage(raw Raw) *Usage {
+	if v.Type == "message" {
+		var a struct {
+			Usage *anthropicUsage `json:"usage"`
+		}
+		if json.Unmarshal(raw, &a) == nil {
+			return a.Usage.toUsage()
+		}
+	}
+	if v.UsageMetadata != nil {
+		return v.UsageMetadata.toUsage()
+	}
+	return v.Usage
+}
+
+// toolCalls returns the calls a non-streaming response made. Only OpenAI's
+// carry arguments in this shape; the others are reduced to their names, which
+// is all the list row needs - the UI reads the full calls from the raw body.
+func (v *respView) toolCalls() []ToolCall {
+	if len(v.Choices) > 0 {
+		return v.Choices[0].Message.ToolCalls
+	}
+	var out []ToolCall
+	named := func(n string) {
+		var tc ToolCall
+		tc.Function.Name = n
+		out = append(out, tc)
+	}
+	if len(v.Candidates) > 0 {
+		for _, p := range v.Candidates[0].Content.Parts {
+			if p.FunctionCall != nil {
+				named(p.FunctionCall.Name)
+			}
+		}
+	}
+	for _, b := range v.Content {
+		if b.Type == "tool_use" {
+			named(b.Name)
+		}
+	}
+	return out
 }
 
 type billView struct {
@@ -276,12 +351,7 @@ type streamChunk struct {
 			} `json:"parts"`
 		} `json:"content"`
 	} `json:"candidates"`
-	UsageMetadata *struct {
-		PromptTokenCount     *int `json:"promptTokenCount"`
-		CandidatesTokenCount *int `json:"candidatesTokenCount"`
-		TotalTokenCount      *int `json:"totalTokenCount"`
-		ThoughtsTokenCount   *int `json:"thoughtsTokenCount"`
-	} `json:"usageMetadata"`
+	UsageMetadata *geminiUsage `json:"usageMetadata"`
 
 	// Anthropic's native streaming shape, logged verbatim for Claude-family
 	// channels on the /v1/messages path. Same lesson as Gemini above, learned
@@ -393,6 +463,55 @@ func (a *responsesUsage) toUsage() *Usage {
 		PromptDetails:     a.InputDetails,
 		CompletionDetails: a.OutputDetails,
 	}
+}
+
+// geminiUsage is Gemini's token accounting, the same in a stream chunk and in a
+// whole non-streaming response.
+type geminiUsage struct {
+	PromptTokenCount        *int `json:"promptTokenCount"`
+	ToolUsePromptTokenCount *int `json:"toolUsePromptTokenCount"`
+	CandidatesTokenCount    *int `json:"candidatesTokenCount"`
+	TotalTokenCount         *int `json:"totalTokenCount"`
+	ThoughtsTokenCount      *int `json:"thoughtsTokenCount"`
+	CachedContentTokenCount *int `json:"cachedContentTokenCount"`
+}
+
+// toUsage maps Gemini's counts the way new-api bills them (relayconvert's
+// UsageFromGeminiMetadata, rc.40). candidatesTokenCount excludes thinking, so
+// thoughts are added to the output and also surfaced as reasoning. Counting
+// candidates alone lost the whole output of a call that spent its budget
+// thinking: a production call stopped at MAX_TOKENS with 17 thought tokens and
+// no candidatesTokenCount at all, against a billing line charging 17.
+func (g *geminiUsage) toUsage() *Usage {
+	if g == nil {
+		return nil
+	}
+	n := func(p *int) int {
+		if p == nil {
+			return 0
+		}
+		return *p
+	}
+	u := &Usage{PromptTokens: g.PromptTokenCount, TotalTokens: g.TotalTokenCount}
+	if g.ToolUsePromptTokenCount != nil {
+		in := n(g.PromptTokenCount) + *g.ToolUsePromptTokenCount
+		u.PromptTokens = &in
+	}
+	if g.CandidatesTokenCount != nil || g.ThoughtsTokenCount != nil {
+		out := n(g.CandidatesTokenCount) + n(g.ThoughtsTokenCount)
+		u.CompletionTokens = &out
+	}
+	if g.ThoughtsTokenCount != nil {
+		u.CompletionDetails = &struct {
+			ReasoningTokens *int `json:"reasoning_tokens,omitempty"`
+		}{ReasoningTokens: g.ThoughtsTokenCount}
+	}
+	if g.CachedContentTokenCount != nil {
+		u.PromptDetails = &struct {
+			CachedTokens *int `json:"cached_tokens,omitempty"`
+		}{CachedTokens: g.CachedContentTokenCount}
+	}
+	return u
 }
 
 // anthropicUsage is Anthropic's token accounting. Cache reads and writes are
@@ -548,15 +667,7 @@ func (ch *streamChunk) usage() *Usage {
 	if ch.Usage != nil {
 		return ch.Usage
 	}
-	if ch.UsageMetadata == nil {
-		return nil
-	}
-	u := &Usage{
-		PromptTokens:     ch.UsageMetadata.PromptTokenCount,
-		CompletionTokens: ch.UsageMetadata.CandidatesTokenCount,
-		TotalTokens:      ch.UsageMetadata.TotalTokenCount,
-	}
-	return u
+	return ch.UsageMetadata.toUsage()
 }
 
 // hasPayload reports whether the chunk carried anything worth counting.
@@ -808,13 +919,11 @@ func parseRange(path string, from int64, partial bool, calls map[string]*Record)
 	}
 
 	touched := map[string]bool{}
-	sc := bufio.NewScanner(br)
-	sc.Buffer(make([]byte, 0, 1<<16), 16<<20)
-	for sc.Scan() {
-		if rid := handleLine(sc.Text(), calls); rid != "" {
+	scanEntries(br, func(entry string) {
+		if rid := handleLine(entry, calls); rid != "" {
 			touched[rid] = true
 		}
-	}
+	})
 	now := time.Now()
 	for rid := range touched {
 		if rec := calls[rid]; rec != nil {
@@ -826,12 +935,70 @@ func parseRange(path string, from int64, partial bool, calls map[string]*Record)
 }
 
 func scanLines(r io.Reader, calls map[string]*Record) {
+	scanEntries(r, func(entry string) { handleLine(entry, calls) })
+}
+
+// maxEntry bounds one log entry, a single line or a joined multi-line one.
+// Request bodies with long contexts routinely exceed bufio's 64KB default.
+const maxEntry = 16 << 20
+
+// scanEntries hands handle one log ENTRY at a time rather than one line.
+//
+// new-api formats each message with %s and writes it as-is, so a body that
+// arrives pretty-printed spans many physical lines and only the first carries
+// the "[LEVEL] date | rid |" prefix. Gemini's REST API pretty-prints every
+// non-streaming response. Read line by line, the record kept
+// `Gemini response body: {` and dropped the rest - so no non-streaming Gemini
+// call ever had its output archived (159 such bodies in one day's spool, about
+// 30 lines each).
+//
+// Lines are joined only onto an entry whose first line ends by opening a JSON
+// value, which is what the head of a pretty-printed body looks like and what no
+// single-line event does. A stray unprefixed line after, say, a billing line is
+// therefore never glued onto it, where it would invalidate the billing JSON.
+// The run ends at the next line that starts with '[': every event does, and an
+// indented body line never can.
+//
+// A body cut by the end of the read is passed on as far as it got; parseRaw
+// then rejects it, as it would a half-written single line.
+func scanEntries(r io.Reader, handle func(string)) {
 	sc := bufio.NewScanner(r)
-	// request bodies with long contexts routinely exceed the 64KB default
-	sc.Buffer(make([]byte, 0, 1<<16), 16<<20)
-	for sc.Scan() {
-		handleLine(sc.Text(), calls)
+	sc.Buffer(make([]byte, 0, 1<<16), maxEntry)
+
+	var head string
+	var more []string // continuation lines of head, when it opened a body
+	have, open, size := false, false, 0
+	flush := func() {
+		if !have {
+			return
+		}
+		if len(more) == 0 {
+			handle(head)
+		} else {
+			handle(head + "\n" + strings.Join(more, "\n"))
+		}
+		have, more = false, more[:0]
 	}
+	for sc.Scan() {
+		line := sc.Text()
+		if open && !strings.HasPrefix(line, "[") {
+			if size += len(line) + 1; size <= maxEntry {
+				more = append(more, line)
+			}
+			continue
+		}
+		flush()
+		head, have, size = line, true, len(line)
+		open = opensValue(line)
+	}
+	flush()
+}
+
+// opensValue reports whether a log line ends by opening a JSON object or array,
+// i.e. is the first line of a pretty-printed body.
+func opensValue(line string) bool {
+	t := strings.TrimRight(line, " \t\r")
+	return strings.HasSuffix(t, "{") || strings.HasSuffix(t, "[")
 }
 
 // handleLine merges one log line into calls and returns the request id it
@@ -871,7 +1038,7 @@ func handleLine(line string, calls map[string]*Record) string {
 		rec.TS = ts
 	}
 
-	switch {
+	switch n := responseMarker(msg); {
 	case strings.HasPrefix(msg, "text request body:"):
 		rec.Request = parseRaw(strings.TrimSpace(msg[len("text request body:"):]))
 	// Anthropic-native relays log the request under a different marker. Missing
@@ -882,8 +1049,8 @@ func handleLine(line string, calls map[string]*Record) string {
 	// that catch-all.
 	case strings.HasPrefix(msg, "requestBody:"):
 		rec.Request = parseRaw(strings.TrimSpace(msg[len("requestBody:"):]))
-	case strings.HasPrefix(msg, "upstream response body:"):
-		rec.Response = parseRaw(strings.TrimSpace(msg[len("upstream response body:"):]))
+	case n > 0:
+		rec.Response = parseRaw(strings.TrimSpace(msg[n:]))
 	case strings.HasPrefix(msg, "stream scanner data:"):
 		ch, body, ok := streamChunkOf(msg[len("stream scanner data:"):])
 		switch {
@@ -963,6 +1130,33 @@ func get(calls map[string]*Record, rid string) *Record {
 	r := blank(rid)
 	calls[rid] = r
 	return r
+}
+
+// responseMarkers are the prefixes new-api logs a non-streaming response body
+// under. Each relay path spells its own, and only the OpenAI one was handled:
+// the rest fell through to the error arm, where a body is filed as an error if
+// it happens to contain the word and dropped if not. Every non-streaming
+// Gemini and Claude answer was lost that way.
+//
+// Each logs the upstream's own format, which finalize and the UI read in all
+// three shapes - see respView. Verified against new-api v1.0.0-rc.40.
+var responseMarkers = []string{
+	"upstream response body:",         // OpenAI-compatible (relay-openai.go)
+	"Gemini response body:",           // Gemini, via /v1/chat/completions
+	"Gemini native response body:",    // Gemini, native generateContent
+	"Gemini responses response body:", // Gemini, via /v1/responses
+	"responseBody:",                   // Anthropic, /v1/messages
+}
+
+// responseMarker returns the length of the response-body marker msg starts
+// with, or 0 if it starts with none.
+func responseMarker(msg string) int {
+	for _, m := range responseMarkers {
+		if strings.HasPrefix(msg, m) {
+			return len(m)
+		}
+	}
+	return 0
 }
 
 // streamChunkOf extracts a delta payload from one `stream scanner data:` line.
@@ -1087,7 +1281,7 @@ func (r *Record) finalize() {
 		r.StreamReasoning += reasoning.String()
 		r.sawChunks = true
 	} else if !r.sawChunks {
-		r.Usage = resp.Usage
+		r.Usage = resp.usage(r.Response)
 	}
 	// Both accumulators hold cumulative state keyed by call index, so their
 	// output is ASSIGNED rather than appended: finalize runs once per read pass,
@@ -1126,8 +1320,8 @@ func (r *Record) finalize() {
 		}
 	}
 	called := r.StreamToolCalls
-	if !r.IsStream && len(resp.Choices) > 0 {
-		called = resp.Choices[0].Message.ToolCalls
+	if !r.IsStream {
+		called = resp.toolCalls()
 	}
 	r.CalledTools = []string{}
 	for _, tc := range called {

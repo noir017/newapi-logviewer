@@ -659,12 +659,38 @@ function usageHtml(u){
     ${cell('缓存', u.prompt_tokens_details?.cached_tokens)}</div>`;
 }
 
+// The output of a non-streaming call, from whichever wire format the upstream
+// answered in. new-api logs the response as the provider sent it: OpenAI's
+// choices, Gemini's candidates (every Google-family path, whatever API the
+// client called), or Anthropic's content blocks. Only the first was read, so a
+// Gemini or Claude answer showed （无文本内容） while it sat in 原始响应 JSON.
+// Tool calls come back in OpenAI's shape, which is what the renderer takes.
+function respOut(resp){
+  const msg = resp.choices?.[0]?.message;
+  if (msg) return {content: msg.content || '', reasoning: msg.reasoning_content || '',
+                   tcs: msg.tool_calls || []};
+  const out = {content: '', reasoning: '', tcs: []};
+  const call = (id, name, args) => out.tcs.push({id, type: 'function',
+    function: {name, arguments: JSON.stringify(args ?? {})}});
+  for (const p of resp.candidates?.[0]?.content?.parts || []){
+    if (p.functionCall) call(p.functionCall.id, p.functionCall.name, p.functionCall.args);
+    else if (p.thought) out.reasoning += p.text || '';
+    else out.content += p.text || '';
+  }
+  for (const b of Array.isArray(resp.content) ? resp.content : []){
+    if (b.type === 'text') out.content += b.text || '';
+    else if (b.type === 'thinking') out.reasoning += b.thinking || '';
+    else if (b.type === 'tool_use') call(b.id, b.name, b.input);
+  }
+  return out;
+}
+
 function detail(r){
   const req = r.request || {}, resp = r.response || {};
-  const msg = resp.choices?.[0]?.message;
-  const content = r.is_stream ? r.stream_content : (msg?.content || '');
-  const reasoning = r.is_stream ? r.stream_reasoning : (msg?.reasoning_content || '');
-  const tcs = (r.is_stream ? r.stream_tool_calls : msg?.tool_calls) || [];
+  const out = r.is_stream ? null : respOut(resp);
+  const content = r.is_stream ? r.stream_content : out.content;
+  const reasoning = r.is_stream ? r.stream_reasoning : out.reasoning;
+  const tcs = (r.is_stream ? r.stream_tool_calls : out.tcs) || [];
   // `all` adds a section-level 展开全部 / 收起全部 control
   const sec = (title, n, inner, all) => inner ?
     `<section><div class="st"><h3>${title}</h3>${n ? `<span class="n">${n}</span>` : ''}
