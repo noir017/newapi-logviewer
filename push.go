@@ -55,8 +55,8 @@ const (
 	// One push carries at most this many records, or this many bytes of
 	// uncompressed body, whichever comes first. The byte cap is the one that
 	// usually binds - a single agent record can be megabytes - and the count cap
-	// only matters for a burst of small ones. Whatever does not fit stays
-	// pending and goes out on the next tick.
+	// only matters for a burst of small ones. Whatever does not fit goes out in
+	// the next batch of the same pass (see flushPush).
 	pushMaxRecords = 64
 	pushMaxBytes   = 8 << 20
 
