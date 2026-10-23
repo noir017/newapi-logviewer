@@ -405,11 +405,59 @@ pre.j{background:#0d1017;border:1px solid var(--line);border-radius:7px;padding:
 .st .toggle{cursor:pointer;color:var(--dim2);font-size:11px;user-select:none;
   border:1px solid var(--line);border-radius:5px;padding:1px 7px}
 .st .toggle:hover{color:var(--acc);border-color:var(--acc)}
+/* Filter toggle and back bar exist for the narrow layout only. */
+#ftoggle,.mback{display:none}
+
+/* ---- narrow / portrait ----
+   A phone's header wraps to several lines, so the fixed --hdr budget no longer
+   holds: the panes sized from it got cut off at the top (the view switch and
+   refresh button were clipped out of reach) and overlapped below. Here the
+   header takes the height it needs and sticks, and the page scrolls as one
+   document instead of each pane inside a viewport-sized box. */
 @media(max-width:860px){
-  .split{flex-direction:column;height:auto;overflow:visible}
+  html,body{height:auto}
   body{overflow:auto}
-  .left{width:auto!important;max-width:none;border-right:none;border-bottom:1px solid var(--line);height:46vh}
+  header{height:auto;position:sticky;top:0;z-index:10;padding:8px 12px}
+  .split{flex-direction:column;height:auto;overflow:visible}
+  .stats{height:auto;overflow:visible}
+  .left{width:auto!important;max-width:none;border-right:none}
+  .list{overflow:visible}
   .drag{display:none}
+  .right{padding:12px 12px 32px}
+
+  /* List and detail take turns on the screen rather than splitting it: a
+     46vh list box over the detail was a scroller inside a scroller, and
+     opening a record left it below the fold. */
+  body.m-detail .left{display:none}
+  body:not(.m-detail) .right{display:none}
+  body.m-detail .mback{display:block;padding:10px 12px 0}
+
+  /* The filters fold behind 筛选; the range pills stay out as the one control
+     used every visit. A custom stats range keeps its date inputs visible —
+     picking 自定义 is asking for them. */
+  #ftoggle{display:inline-block}
+  header:not(.fopen) .filters>:not(.seg):not(#sfrom):not(#sarrow):not(#sto){display:none}
+  .filters>input,.filters>select{flex:1 1 calc(50% - 6px);min-width:0}
+  .filters>input[type=search],.filters>input[type=datetime-local]{flex-basis:100%}
+  .filters .sep,.filters .arr{display:none}
+  /* iOS zooms the page into any focused field under 16px. */
+  input,select,input[type=datetime-local]{font-size:16px}
+
+  .rid{word-break:break-all}
+
+  .swrap{padding:14px 12px 40px}
+  .kpis{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+  .kpis.heros{grid-template-columns:1fr}
+  .kpi{padding:12px 12px 11px}
+  .kpi.hero .vl{font-size:26px}
+  .kpi .spark{height:32px}
+  .card2{padding:14px 12px}
+}
+@media(max-width:520px){
+  h1,#who{display:none}
+  /* The unauthenticated warning gets a line of its own under the controls. */
+  #authnote{order:1;flex-basis:100%}
+  #authnote:empty{display:none}
 }
 </style></head><body>
 
@@ -424,6 +472,7 @@ pre.j{background:#0d1017;border:1px solid var(--line);border-radius:7px;padding:
     <span class="grow"></span>
     <label class="ck"><input type="checkbox" id="auto"> 自动刷新</label>
     <button id="refresh">刷新</button>
+    <button id="ftoggle">筛选</button>
   </div>
   <div class="filters" id="listfilters">
     <div class="seg" id="quick">
@@ -432,7 +481,7 @@ pre.j{background:#0d1017;border:1px solid var(--line);border-radius:7px;padding:
       <button data-h="168">7天</button><button data-h="" class="on">全部</button>
     </div>
     <input type="datetime-local" id="from" title="起始时间">
-    <span style="color:var(--dim2);font-size:12px">→</span>
+    <span class="arr" style="color:var(--dim2);font-size:12px">→</span>
     <input type="datetime-local" id="to" title="结束时间">
     <span class="sep"></span>
     <input type="search" id="q" placeholder="搜索提示词 / 返回 / request_id">
@@ -459,7 +508,7 @@ pre.j{background:#0d1017;border:1px solid var(--line);border-radius:7px;padding:
       <button data-r="custom">自定义</button>
     </div>
     <input type="datetime-local" id="sfrom" title="起始时间" style="display:none">
-    <span id="sarrow" style="color:var(--dim2);font-size:12px;display:none">→</span>
+    <span class="arr" id="sarrow" style="color:var(--dim2);font-size:12px;display:none">→</span>
     <input type="datetime-local" id="sto" title="结束时间" style="display:none">
     <span class="sep"></span>
     <select id="smodel"><option value="">全部模型</option></select>
@@ -480,6 +529,7 @@ pre.j{background:#0d1017;border:1px solid var(--line);border-radius:7px;padding:
     </div>
   </div>
   <div class="drag" id="drag"></div>
+  <div class="mback"><button id="mback">← 返回列表</button></div>
   <div class="right" id="detail"><div class="ph">← 从左侧选择一次调用查看详情</div></div>
 </div>
 
@@ -1002,6 +1052,7 @@ function fillSel(sel, values, label){
 }
 
 async function load(keepSel){
+  fbadge();
   let d;
   try {
     const res = await fetch('api/calls?' + params(), {credentials: 'same-origin'});
@@ -1055,10 +1106,36 @@ $('#list').addEventListener('click', async e => {
   selected = el.dataset.id;
   document.querySelectorAll('.item.sel').forEach(n => n.classList.remove('sel'));
   el.classList.add('sel');
+  openDetailPane();
   // The list only carries summaries - one agent record is ~1MB of bodies, so
   // shipping 30 of them per page made the list unusable. Fetch on demand.
   await showDetail(selected);
 });
+
+// Narrow layout: list and detail take turns on the screen (see the CSS).
+// Opening a record pushes a history entry so the phone's back gesture returns
+// to the list instead of leaving the page; the list's scroll position is
+// restored on the way back.
+const narrow = matchMedia('(max-width:860px)');
+let listY = 0;
+function openDetailPane(){
+  if (!narrow.matches || document.body.classList.contains('m-detail')) return;
+  listY = scrollY;
+  document.body.classList.add('m-detail');
+  history.pushState({lvDetail: 1}, '');
+  scrollTo(0, 0);
+}
+addEventListener('popstate', () => {
+  if (!document.body.classList.contains('m-detail')) return;
+  document.body.classList.remove('m-detail');
+  scrollTo(0, listY);
+});
+// Every in-page way back goes through history, so the entry pushed above is
+// consumed rather than left for the back gesture to trip over later.
+function backToList(){
+  if (document.body.classList.contains('m-detail')) history.back();
+}
+$('#mback').onclick = backToList;
 
 async function showDetail(rid){
   const pane = $('#detail');
@@ -1151,6 +1228,23 @@ $('#auto').onchange = e => {
   clearInterval(timer);
   if (e.target.checked) timer = setInterval(() => load(true), 5000);
 };
+
+// Narrow layout folds the filters behind 筛选 (see the CSS). A filter you
+// cannot see is one you forget is on, so the toggle counts the active ones.
+// The list's dates count only when no quick range explains them.
+$('#ftoggle').onclick = () =>
+  $('#ftoggle').classList.toggle('on', $('header').classList.toggle('fopen'));
+function fbadge(){
+  const stats = document.body.classList.contains('view-stats');
+  let n = (stats ? ['#smodel', '#stoken', '#sstream']
+                 : ['#q', '#model', '#tokensel', '#toolsel', '#status', '#stream'])
+    .filter(s => $(s).value).length;
+  if (!stats){
+    n += ['#tools', '#errors'].filter(s => $(s).checked).length;
+    if (!$('#quick .on') && ($('#from').value || $('#to').value)) n++;
+  }
+  $('#ftoggle').textContent = n ? `筛选 · ${n}` : '筛选';
+}
 
 // draggable splitter
 (function(){
@@ -1937,6 +2031,7 @@ function statsParams(){
 }
 
 async function loadStats(){
+  fbadge();
   if (statsBusy) return;
   statsBusy = true;
   const host = $('#stats');
@@ -1971,18 +2066,26 @@ async function loadStats(){
 }
 
 function setView(v){
+  // The two views share the page's one scroll position on a narrow screen;
+  // a switch starts the new view at its top, not wherever the old one was.
+  if (narrow.matches && document.body.classList.contains('view-stats') !== (v === 'stats'))
+    scrollTo(0, 0);
   document.body.classList.toggle('view-stats', v === 'stats');
   $('#listfilters').style.display = v === 'stats' ? 'none' : '';
   $('#statsfilters').style.display = v === 'stats' ? '' : 'none';
   document.querySelectorAll('#view button').forEach(b =>
     b.classList.toggle('on', b.dataset.v === v));
   localStorage.setItem('lv-view', v);
+  fbadge();
   if (v === 'stats' && !statsData) loadStats();
 }
 
 $('#view').addEventListener('click', e => {
   const b = e.target.closest('button');
-  if (b) setView(b.dataset.v);
+  if (!b) return;
+  // 调用列表 while already reading a record on the list view means "back".
+  if (b.dataset.v === 'list' && !document.body.classList.contains('view-stats')) backToList();
+  setView(b.dataset.v);
 });
 
 $('#srange').addEventListener('click', e => {
@@ -2044,6 +2147,9 @@ $('#stats').addEventListener('click', e => {
   };
   setSel('#model', tk ? $('#smodel').value : m);
   setSel('#tokensel', tk || $('#stoken').value);
+  // Land on the newly filtered list, not on a record left open on a phone —
+  // and at its top, since the old scroll position belonged to another filter.
+  listY = 0; backToList();
   setView('list');
   page = 1; load(true);
 });
